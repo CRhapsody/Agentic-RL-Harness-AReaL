@@ -36,18 +36,19 @@
 
 ## 0. 先划清当前证据边界
 
-截至 2026-08-02，本项目已经有四块不同层级的证据。它们不能互相替代。
+截至 2026-08-02，本项目已经有五块不同层级的证据。它们不能互相替代。
 
 | 层级 | 已经做到什么 | 仍缺什么 |
 | --- | --- | --- |
 | 真实 AReaL bridge | 真实 SGLang rollout、真实 token、真实 Harness prompt 决策、same-controller score 与完整版本绑定 | 上一轮正式 v5 概率门只通过 1/4，不能作为训练 batch |
 | C0/C1 概率机制筛查 | 固定模型与 Harness，只改变 SGLang 生成 log-prob 公式；结果为 2/4 通过，`mechanism_supported=false` | 该处理没有解锁 optimizer，也没有解锁预注册的 32 条校准与 32 条封存确认 |
+| C2 CUDA Graph 筛查 | commit `fdaa879`；配置门通过；C2a/C2b 在同一 GPU0 串行完整重启，runtime invariants 仅 `disable_cuda_graph: false -> true` | 四条输出 token 全部不同，配对估计量不可识别，`mechanism_supported=false`；不能判断修复或恶化 |
 | G1 synthetic 控制面 | 两类样本、两路 credit、toy 双更新、联合 checkpoint、lag0、原子发布和故障矩阵 | 输入是 synthetic trace，policy 与 Harness 都不是真实生产 optimizer |
 | AReaL/Hermes 上游 | AReaL 能对模型 actor 执行 PPO 并同步新权重；Hermes 能把真实 Agent LLM 调用路由进 AReaL 采集 | 上游 Hermes 没有学习 Harness controller 的第二个 optimizer，也没有联合二元组发布 |
 
-所以，本课主体不是完整联合训练结果报告，更不是在宣布联合更新已经完成。它是一份从可信数据面走到真实联合更新所需的数据契约和执行顺序说明；下面只追加与这条路径直接相关的 C0/C1 数据面结果。
+所以，本课主体不是完整联合训练结果报告，更不是在宣布联合更新已经完成。它是一份从可信数据面走到真实联合更新所需的数据契约和执行顺序说明；下面只追加与这条路径直接相关的 C0/C1 和 C2 数据面结果。
 
-## 2026-08-02 实验更新：C0/C1 没有支持预注册机制
+## 2026-08-02 实验更新：C0/C1 与 C2 都没有解锁训练
 
 C0/C1 pair 已经结束。四条配对轨迹中只有 `2/4` 通过原概率门，最终判定是：
 
@@ -76,11 +77,55 @@ C1 error = distance(s_{1,t}, q_t)
 
 common target 不是为了偏向 C0，而是为了固定被比较的坐标系。它让问题保持为一个可检验的单句：只替换生成端的 log-prob 公式，stored 值相对同一重算目标是否得到足以通过原门的改善？这次答案是否定的。
 
-### 为什么下一轮仍然必须是单变量实验
+### C2 已完成：单变量成立，但配对估计量不可识别
 
-如果一次同时改变 CUDA Graph、采样参数、数据位置和 server 配置，即使结果通过，也无法知道哪个改动有效。单变量实验要求除一个 treatment 外，其余条件保持冻结。这样，失败能排除一个具体机制，成功也只能支持一个具体机制，不会把多个改动捆成无法解释的“经验配方”。
+C2 运行在 commit `fdaa879`。它的配置门通过：C2a 和 C2b 在同一张 GPU0 上串行执行，每个 cell 都完整重启；两边 runtime invariants 相同，唯一 treatment 是：
 
-下一轮候选记为 C2，但它尚未运行。它计划只关闭普通 CUDA Graph，并使用预注册的未见 GSM8K `[64,68)`；模型、Harness、概率门和其他冻结条件不得随结果调整。C2 目前只有实验设计，没有观测值，更没有 optimizer、32 条校准或 32 条封存确认已经解锁的结论。
+```text
+C2a: disable_cuda_graph = false
+C2b: disable_cuda_graph = true
+```
+
+这说明实验配置确实遵守了单变量原则。可是，四条样本在 C2a 与 C2b 中生成的 output token 全部不同。最终比较状态是：
+
+```text
+generation_equal = false
+score_alignment = false
+common-target paired metrics = null
+mechanism_supported = false
+```
+
+各 cell 自己观察到的 stored-vs-rescored 指标如下。`mean/max` 都按原概率门判断，token 数是该 cell 实际生成的输出长度。
+
+| 轨迹 | C2a：CUDA Graph 开启 | C2b：普通 CUDA Graph 关闭 |
+| --- | --- | --- |
+| 1 | 61 tokens；`0.0174049 / 0.119537`；fail | 48 tokens；`0.0182898 / 0.132508`；fail |
+| 2 | 64 tokens；`0.0156684 / 0.218675`；fail | 64 tokens；`0.00920763 / 0.112976`；fail |
+| 3 | 54 tokens；`0.0181521 / 0.085154`；pass | 64 tokens；`0.0122906 / 0.126716`；fail |
+| 4 | 64 tokens；`0.0214181 / 0.157949`；fail | 64 tokens；`0.0217560 / 0.119170`；fail |
+
+这些是两组各自的 observed metrics，不是逐 token 配对的 treatment effect。第 2、4 条看起来是 C2b 的 max error 较低，第 1、3 条却较高，其中第 3 条还从 A 的 pass 变成了 B 的 fail。不能据此说关闭 CUDA Graph 修复了问题，也不能说它恶化了问题，因为两边已经不是同一串 token。
+
+### “影响生成轨迹”为什么不等于“解释概率偏差”
+
+stored-vs-rescored 偏差问的是：对同一个上下文 `x_t` 和同一个实际 token `a_t`，生成时保存的 log-prob 与随后重算的 log-prob 相差多少。可检验的对象是同一个二元组：
+
+```text
+(x_t, a_t)
+```
+
+C2 的 treatment 能让采样输出改变，说明普通 CUDA Graph 设置可能影响了生成轨迹。轨迹一变，后续每一步的上下文和被评分 token 也跟着变。此时 C2a 的 error 与 C2b 的 error 分别属于两个不同对象，不能相减成“关闭 CUDA Graph 对同一 token 偏差的影响”。
+
+因此，`generation_equal=false` 是一个真实观察，但它只支持“treatment 能影响本次生成路径”。它不支持“treatment 解释了 stored-vs-rescored 偏差”。后一个命题要求两边对齐到相同 prompt、相同上下文和相同 token；这次 `score_alignment=false`，所以 common-target paired metrics 必须是 `null`，而不是勉强计算一个看似完整的数字。
+
+### 下一课应先定义可识别的 estimand
+
+下一课不应先承诺 C3，而应先明确究竟要估计什么。`estimand` 是实验希望从数据中识别的那个量。这里至少有两个不同问题：
+
+1. 如果要估计 CUDA Graph 设置对“同一动作的 stored-vs-rescored 偏差”的影响，可以考虑确定性 replay：先冻结 prompt 和完整 output token ID，再让两个 runtime 对同一串 token 评分。这样比较对象始终是同一个 `(x_t,a_t)`。
+2. 如果要估计 CUDA Graph 设置对“生成分布或轨迹”的影响，就不能再要求逐 token 配对。需要把输出分布、重复运行和统计单位重新定义，不能用四条不同生成结果的 mean/max 直接代替。
+
+选择哪一个问题会决定实验数据、比较器和门槛的定义。在这个选择完成以前，不应给下一轮实验编号，更不应声称 C2 解锁了 32 条校准、32 条封存确认或 optimizer。
 
 ## 1. “冻结 batch”到底冻结了什么
 
@@ -718,7 +763,7 @@ R18 joint_version = (P8, H4)
 | 目标步骤 | 本项目对应位置 | AReaL/Hermes 对应位置 | 当前缺口 |
 | --- | --- | --- | --- |
 | 真实 Agent LLM 调用进入 rollout | `areal_joint_bridge_workflow.py` 的单轮 GSM8K bridge | `examples/hermes/hermes.py` 从 `areal_inference` metadata 取得 session upstream；DataProxy 按 session 采集 | 当前 bridge 还是 no-tools 单轮，不是完整 Hermes 多轮轨迹 |
-| policy 六字段 | `areal_trace_contract.py` 与 bridge record | AReaL inference controller 和 trajectory export | C0/C1 已得到 2/4、`mechanism_supported=false`；使用未见 `[64,68)` 的 C2 尚未运行 |
+| policy 六字段 | `areal_trace_contract.py` 与 bridge record | AReaL inference controller 和 trajectory export | C0/C1 未支持原公式机制；C2 输出不对齐，paired metrics 为 `null`，仍未识别 CUDA Graph 对同一 token 偏差的作用 |
 | policy advantage 与 PPO | 尚未接入真实 joint batch | `PPOTrainer.train()` 中 `compute_advantages()` 与 `actor.ppo_update()` | 需要把通过审计的 bridge 数据接回 AReaL 原生 batch |
 | Harness 动作概率 | `HarnessDecision`、`JointDecisionBatch`、`TabularHarnessController` | Hermes 内部有工具与循环控制，但上游示例不导出这些控制动作的行为概率 | 需要把可学习 Harness action 显式化，不能只保留工具调用摘要 |
 | Harness optimizer | tabular REINFORCE 与 G1 toy updater | Hermes 示例没有第二个 optimizer | 需要生产 Torch Harness controller 和 checkpoint |
@@ -776,7 +821,7 @@ dataset revision 与样本位置
 推理 server args、采样配置、GPU 和依赖版本
 ```
 
-当前 C0/C1 launcher 使用 clean `env -i` 入口、同一物理 GPU 串行执行，并把完整固定 runtime contract 与唯一 treatment 字段写入 manifest。真实 bridge 还会在 Harness 采样前保存 controller checkpoint。
+当前 C0/C1 launcher 使用 clean `env -i` 入口、同一物理 GPU 串行执行，并把完整固定 runtime contract 与唯一 treatment 字段写入 manifest。C2 也通过配置门，在同一 GPU0 上串行完整重启，除 `disable_cuda_graph` 从 `false` 变为 `true` 外 runtime invariants 相同。真实 bridge 还会在 Harness 采样前保存 controller checkpoint。
 
 这个边界阻止的错误包括：
 
@@ -833,7 +878,7 @@ expected_active_release_id 仍是准备 candidate 时的父版本
 
 发布前边界应由被优化系统不可写的评价证据控制。否则 policy 与 Harness 可以共同学会迎合自己的训练 evaluator，再用同一 evaluator 给自己放行。
 
-## 10. 为什么 C0/C1 只是数据面校准
+## 10. 为什么 C0/C1 与 C2 都只是数据面诊断
 
 C0/C1 的目标非常窄：判断 SGLang 生成端报告 log-prob 的公式是否导致 stored log-prob 与同 controller 重算值不一致。
 
@@ -887,13 +932,17 @@ joint publish        让完整 candidate 二元组变成活动版本
 
 当前 C0/C1 只执行第一类事件。
 
+C2 同样没有进入后两类事件。它还暴露了一个更早的问题：两边 output token 全部不同，导致 `score_alignment=false`，无法形成逐 token common-target paired metrics。配置门通过只能证明 treatment 控制正确，不能替代结果的可比性检查。
+
 ## 11. 从当前代码走到第一次真实联合更新，还差哪些最小步骤
 
 下面是按依赖顺序排列的最小闭环，不是已经完成的功能清单。
 
-### 步骤 1：让数据面先通过冻结门
+### 步骤 1：先让数据面的比较对象可识别
 
-C0/C1 已经以 `2/4` 和 `mechanism_supported=false` 结束，没有解锁 optimizer，也没有解锁预注册的 32 条校准与 32 条封存确认。下一候选 C2 尚未运行；它只计划关闭普通 CUDA Graph，并换用预注册的未见 GSM8K `[64,68)`。C2 仍须使用原有阈值和单变量纪律，不能根据结果修改旧门。
+C0/C1 已经以 `2/4` 和 `mechanism_supported=false` 结束。C2 也已完成，但四条 output token 全部不同，common-target paired metrics 为 `null`，同样是 `mechanism_supported=false`。两轮都没有解锁 optimizer，也没有解锁预注册的 32 条校准与 32 条封存确认。
+
+进入下一轮运行前，应先选择可识别的 estimand，并据此设计确定性 replay 或分布级实验。不能先决定运行 C3，再事后为已有输出寻找问题定义。
 
 ### 步骤 2：构造真实 `FrozenJointBatch`
 
@@ -997,7 +1046,7 @@ AReaL `actor.ppo_update()` 成功并把新模型权重同步给 rollout，但 Ha
 
 ### 题 8
 
-C0/C1 实际只有 2/4 通过，且 `mechanism_supported=false`。此时可以启动 policy 与 Harness optimizer，或者直接进入 32 条校准与 32 条封存确认吗？
+C2 的配置门通过，而且 C2b 在部分轨迹上的 observed max error 比 C2a 更低。为什么仍不能说关闭普通 CUDA Graph 修复了概率一致性？
 
 ### 题 9
 
@@ -1016,7 +1065,7 @@ C0/C1 实际只有 2/4 通过，且 `mechanism_supported=false`。此时可以�
 5. 继续使用旧完整版本 `(P7,H3)`。新 policy 权重只能作为未发布 candidate 保存。如果已经单独同步到活动 rollout，说明发布边界设计错误，应停止采样并恢复旧二元组。
 6. 不等。对象只是 candidate 内容。只有 manifest 校验通过且 `active` commit point 成功切换，才算发布。
 7. 因为“执行了 Harness 逻辑”不等于“把 Harness 动作表示成有行为概率、版本和 credit 的训练样本”。当前 Hermes 示例主要把 LLM 调用接给 AReaL 的模型 PPO，没有第二个 Harness optimizer。
-8. 都不能。2/4 没有达到预注册的 4/4 机制门，因此既不能解锁 optimizer，也不能解锁 32 条校准与 32 条封存确认。下一步只能先运行新的单变量诊断；当前候选 C2 还没有运行。
+8. 因为四条 output token 全部不同，`generation_equal=false`、`score_alignment=false`。两边的 observed error 属于不同上下文和不同 token，common-target paired metrics 只能是 `null`。配置门通过证明的是单变量控制成立，不证明 treatment effect 可识别，因此不能声称修复或恶化，也不能解锁 32 条校准、32 条封存确认或 optimizer。
 9. 如果写入动作本身会覆盖既有事实、泄漏凭据或越过允许路径，事后校验无法撤销副作用。正式 writer 应先验证内容和路径，再以独占方式写入。
 10. 拒绝为 stale。它内部自洽，只说明它是合法旧版本轨迹；lag0 还要求行为 `JointVersion` 等于当前活动版本。
 
@@ -1042,4 +1091,4 @@ C0/C1 实际只有 2/4 通过，且 `mechanism_supported=false`。此时可以�
 - 有两个真实 candidate，但没有联合发布：候选联合训练，不是活动版本更新。
 - 两个真实 optimizer、联合 checkpoint、独立发布门和原子切换全部完成：才是本项目所说的“真正同时更新 policy 与 Harness”。
 
-下一步最值得观察的不是某个 loss 数字，而是尚未运行的 C2 能否在新的未见数据上解释并消除 stored behavior log-prob 的不一致。没有可信的数据面，后面的 PPO ratio 即使能算，也没有可靠含义。
+下一步最重要的不是立即命名 C3，而是先把可识别的 estimand 写清楚：究竟要用确定性 replay 比较同一 token 的概率偏差，还是要研究 CUDA Graph 对生成分布的影响。没有对齐的比较对象，后面的 PPO ratio 即使能算，也没有可靠含义。
