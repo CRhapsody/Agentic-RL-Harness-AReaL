@@ -83,6 +83,16 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("require_within_configured_root(snapshot)", text)
         self.assertIn('require_within_configured_root(entry["filename"])', text)
 
+    def test_model_snapshot_validation_is_local_and_cuda_backed(self) -> None:
+        text = (SCRIPTS / "validate_hf_model_snapshot.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("local_files_only=True", text)
+        self.assertIn('require_within_configured_root(metadata["snapshot_path"])', text)
+        self.assertIn('model.generate(', text)
+        self.assertIn('torch.cuda.synchronize()', text)
+        self.assertIn('"peak_memory_bytes"', text)
+
     def test_real_trace_audit_rejects_scripted_and_accepts_valid_hf_metadata(self) -> None:
         result = run_calculator_smoke(
             model=MockStructuredModel(),
