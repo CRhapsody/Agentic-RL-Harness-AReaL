@@ -53,7 +53,7 @@ class RemoteScriptContractTests(unittest.TestCase):
 
     def test_areal_b0_is_bounded_and_does_not_max_workers(self) -> None:
         text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
-        self.assertIn("total_train_steps=1", text)
+        self.assertIn("+total_train_steps=1", text)
         self.assertIn("train_dataset.num_workers=2", text)
         self.assertIn("valid_dataset.num_workers=2", text)
         self.assertIn("rollout.max_concurrent_rollouts=8", text)

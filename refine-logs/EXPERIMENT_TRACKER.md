@@ -130,3 +130,4 @@ decision:
 | 2026-08-02 | JPH-B0-OFFICIAL-001 | `nvidia-nccl-cu12` 下载重试后超时 | SSH 反向 HTTP 隧道随交互连接中断；其余约 8.8GB uv cache 已保留 | infra/network | 代理与 bootstrap 分别放入目标根目录 socket 的 tmux session；代理只监听 loopback 且只允许 CONNECT 443 |
 | 2026-08-02 | JPH-B0-PREFETCH-001 | GSM8K 一次性 `python -c` 立即报 `NameError` | 多层 SSH/tmux/shell 引号剥离了数据集字符串的引号 | orchestration | 改为仓库内的可测试脚本，固定 dataset commit 并审计 materialized cache path |
 | 2026-08-02 | JPH-B0-OFFICIAL-001 | 显存门禁通过后立即 `Permission denied`，tmux exit=126 | `run_areal_official_b0.sh` 在 Git 中是 100644，waiter 直接将它当可执行文件调用 | orchestration/config | waiter 改用 `/bin/bash` 显式解释脚本；训练尚未启动，因此没有残留 GPU 进程 |
+| 2026-08-02 | JPH-B0-OFFICIAL-001 | Hydra 拒绝 `total_train_steps=1`，tmux exit=1 | 固定 YAML 没有该键，虽然 `GRPOConfig` 定义了字段；Hydra struct 模式要求 `+total_train_steps=1` | config | 用 `+` 显式追加字段；失败发生在 worker 启动前，只有 GPU 监控日志 |
