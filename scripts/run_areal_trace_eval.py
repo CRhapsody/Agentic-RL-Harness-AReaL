@@ -49,7 +49,9 @@ def main(args: list[str]) -> None:
 
     dataset = get_custom_dataset(
         split="test",
-        dataset_config=config.valid_dataset,
+        path=config.valid_dataset.path,
+        type=config.valid_dataset.type,
+        max_length=config.valid_dataset.max_length,
         tokenizer=tokenizer,
     )
     dataloader = create_dataloader(

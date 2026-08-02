@@ -87,6 +87,9 @@ class RemoteScriptContractTests(unittest.TestCase):
 
     def test_areal_trace_is_real_bounded_and_recomputed(self) -> None:
         launcher = (SCRIPTS / "run_areal_trace_b0.sh").read_text(encoding="utf-8")
+        eval_runner = (SCRIPTS / "run_areal_trace_eval.py").read_text(
+            encoding="utf-8"
+        )
         workflow = (PROJECT_ROOT / "jphrl" / "areal_trace_workflow.py").read_text(
             encoding="utf-8"
         )
@@ -95,6 +98,11 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("interaction.to_tensor_dict()", workflow)
         self.assertIn("return {request.rid: interaction}", workflow)
         self.assertIn("JPH_AREAL_TRACE_TASKS=1", launcher)
+        self.assertIn("path=config.valid_dataset.path", eval_runner)
+        self.assertNotIn(
+            'split="test",\n        dataset_config=config.valid_dataset',
+            eval_runner,
+        )
         self.assertIn("rollout.backend=sglang:d1p1t1", launcher)
         self.assertIn("sglang.mem_fraction_static=0.35", launcher)
         self.assertNotIn("rollout.agent=null", launcher)
