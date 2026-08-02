@@ -19,6 +19,32 @@ SCRIPTS = PROJECT_ROOT / "scripts"
 
 
 class RemoteScriptContractTests(unittest.TestCase):
+    def test_areal_joint_bridge_is_real_bounded_and_prompt_effective(self) -> None:
+        launcher = (SCRIPTS / "run_areal_joint_bridge.sh").read_text(
+            encoding="utf-8"
+        )
+        runner = (SCRIPTS / "run_areal_joint_bridge_eval.py").read_text(
+            encoding="utf-8"
+        )
+        verifier = (SCRIPTS / "verify_areal_joint_bridge.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("JPH_AREAL_JOINT_BRIDGE_TASKS=4", launcher)
+        self.assertIn("gconfig.max_new_tokens=64", launcher)
+        self.assertIn("rollout.max_concurrent_rollouts=1", launcher)
+        self.assertIn("sglang.mem_fraction_static=0.35", launcher)
+        self.assertIn("--expected-count 4", launcher)
+        self.assertIn("--expected-project-commit", launcher)
+        self.assertIn("status --porcelain", launcher)
+        self.assertIn("--dataset-report", launcher)
+        self.assertIn("verify_areal_joint_bridge.py", launcher)
+        self.assertIn("ArealJointBridgeWorkflow", runner)
+        self.assertIn("controller.wait(submitted, timeout=900.0)", runner)
+        self.assertIn("recompute_behavior_logprobs", verifier)
+        self.assertIn("_recompute_prompt_tokens", verifier)
+        self.assertIn("harness_decision_changed_prompt", verifier)
+        self.assertNotIn("optimizer.step", launcher + runner + verifier)
+
     def test_g1_launcher_is_private_external_and_verified(self) -> None:
         text = (SCRIPTS / "run_g1_integrity.sh").read_text(encoding="utf-8")
         self.assertIn("umask 077", text)
