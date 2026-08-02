@@ -32,6 +32,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn('export UV_PYTHON_BIN_DIR="${JPH_ROOT}/bin"', text)
         self.assertIn('export UV_PYTHON_PREFERENCE="only-managed"', text)
         self.assertNotIn("UV_MANAGED_PYTHON", text)
+        self.assertNotIn("UV_DEFAULT_INDEX", text)
 
     def test_areal_bootstrap_is_pinned_and_installs_flash_after_exact_sync(self) -> None:
         text = (SCRIPTS / "bootstrap_areal_v2.sh").read_text(encoding="utf-8")
@@ -46,6 +47,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("--no-deps", text)
         self.assertIn("--locked", text)
         self.assertIn("--extra cuda", text)
+        self.assertNotIn("--default-index", text)
         self.assertIn('"${UV_BIN}" pip freeze --python', text)
         self.assertIn("validate_areal_runtime.py", text)
 

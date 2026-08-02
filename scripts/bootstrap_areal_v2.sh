@@ -81,8 +81,7 @@ UV_PROJECT_ENVIRONMENT="${AREAL_VENV}" \
   "${UV_BIN}" sync \
   --python "${AREAL_VENV}/bin/python" \
   --locked \
-  --extra cuda \
-  --default-index "${PIP_INDEX_URL}"
+  --extra cuda
 
 # flash-attn is intentionally outside v2.0.0's exact uv lock. Install it after
 # sync with --no-deps; a later exact sync would otherwise remove it.
