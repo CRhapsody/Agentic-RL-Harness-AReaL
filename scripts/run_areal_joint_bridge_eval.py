@@ -12,6 +12,7 @@ from areal.api.cli_args import GRPOConfig, SGLangConfig, load_expr_config, vLLMC
 from areal.dataset import get_custom_dataset
 from areal.engine import RemotevLLMEngine
 from areal.infra import LocalScheduler, RayScheduler, SlurmScheduler
+from areal.infra.rpc.rtensor import RTensor
 from areal.utils import logging, seeding
 from areal.utils.dataloader import create_dataloader
 from areal.utils.hf_utils import load_hf_tokenizer
@@ -97,7 +98,7 @@ def _write_same_backend_scores(
         consumed_bridge_paths.add(bridge_path)
         request_id = str(bridge["request_id"])
         record: dict[str, object] = {
-            "schema_version": "jph.areal-same-backend-logprob.v3",
+            "schema_version": "jph.areal-same-backend-logprob.v4",
             "request_id": request_id,
             "bridge_record_sha256": bridge["record_sha256"],
             "trajectory_binding_sha256": binding_id,
@@ -106,6 +107,7 @@ def _write_same_backend_scores(
                 "controller_api_version": "v1",
                 "lifecycle": "same-controller-after-wait-before-destroy",
                 "score_parser": "jph-tail-before-conversion-v1",
+                "transport_localization": "RTensor.localize-before-score-and-write-v1",
                 "backend": scoring_backend,
                 "engine_version_before_score": engine_version_before_score,
                 "engine_version_after_score": engine_version_after_score,
@@ -249,8 +251,10 @@ def main(args: list[str]) -> None:
             raise RuntimeError(
                 f"AReaL returned {len(results)} results for {submitted} submitted tasks"
             )
+        results = RTensor.localize(results)
         engine_version_before_score = controller.get_version()
         rescored_logprobs = controller.compute_logp(results)
+        rescored_logprobs = RTensor.localize(rescored_logprobs)
         engine_version_after_score = controller.get_version()
         expected_policy_version = int(os.environ["JPH_EXPECTED_POLICY_VERSION"])
         if not (

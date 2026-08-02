@@ -42,6 +42,8 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("controller.wait(submitted, timeout=900.0)", runner)
         self.assertIn("controller.compute_logp(results)", runner)
         self.assertIn("JPHRemoteSGLangEngine", runner)
+        self.assertIn("results = RTensor.localize(results)", runner)
+        self.assertIn("rescored_logprobs = RTensor.localize(rescored_logprobs)", runner)
         self.assertIn('config.rollout._version != "v1"', runner)
         self.assertIn("engine_version_before_score = controller.get_version()", runner)
         self.assertIn("engine_version_after_score = controller.get_version()", runner)

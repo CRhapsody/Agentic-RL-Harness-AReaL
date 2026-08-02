@@ -51,7 +51,7 @@ class SameBackendScoreAuditTests(unittest.TestCase):
             record["areal_trace"]["tensor_dict"]
         )
         score = {
-            "schema_version": "jph.areal-same-backend-logprob.v3",
+            "schema_version": "jph.areal-same-backend-logprob.v4",
             "request_id": request_id,
             "bridge_record_sha256": bridge_record_sha256,
             "trajectory_binding_sha256": trajectory_binding_sha256,
@@ -60,6 +60,7 @@ class SameBackendScoreAuditTests(unittest.TestCase):
                 "controller_api_version": "v1",
                 "lifecycle": "same-controller-after-wait-before-destroy",
                 "score_parser": "jph-tail-before-conversion-v1",
+                "transport_localization": "RTensor.localize-before-score-and-write-v1",
                 "backend": "sglang:d1p1t1",
                 "engine_version_before_score": 0,
                 "engine_version_after_score": 0,
