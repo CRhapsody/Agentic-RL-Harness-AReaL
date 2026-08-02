@@ -47,7 +47,6 @@ class ArealTraceRLVRWorkflow(RLVRWorkflow):
         interaction = InteractionWithTokenLogpReward(
             model_response=response,
             reward=float(reward),
-            original_reward=float(reward),
         )
         interaction.interaction_id = request.rid
         tensor_dict = interaction.to_tensor_dict()

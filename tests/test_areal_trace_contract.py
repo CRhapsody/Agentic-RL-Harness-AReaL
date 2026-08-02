@@ -24,7 +24,6 @@ class ArealTraceContractTests(unittest.TestCase):
         )
         interaction = SimpleNamespace(
             reward=1.0,
-            original_reward=1.0,
             chat_template_type="hf",
         )
         tensor_dict = {
@@ -34,7 +33,6 @@ class ArealTraceContractTests(unittest.TestCase):
             "versions": [[-1, -1, 0, 0]],
             "attention_mask": [[True, True, True, True]],
             "rewards": [1.0],
-            "original_rewards": [1.0],
         }
         return build_areal_trace_record(
             task_id=7,

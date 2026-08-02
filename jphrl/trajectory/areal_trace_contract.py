@@ -17,7 +17,6 @@ REQUIRED_TENSOR_FIELDS = (
     "versions",
     "attention_mask",
     "rewards",
-    "original_rewards",
 )
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -95,7 +94,6 @@ def build_areal_trace_record(
         },
         "interaction": {
             "reward": float(interaction.reward),
-            "original_reward": float(interaction.original_reward),
             "chat_template_type": interaction.chat_template_type,
         },
         "tensor_dict": tensors,
@@ -191,9 +189,6 @@ def validate_areal_trace_record(
     versions = _single_batch_vector(tensor_dict, "versions")
     attention_mask = _single_batch_vector(tensor_dict, "attention_mask")
     rewards = _single_batch_vector(tensor_dict, "rewards", allow_scalar_batch=True)
-    original_rewards = _single_batch_vector(
-        tensor_dict, "original_rewards", allow_scalar_batch=True
-    )
 
     expected_ids = input_tokens + output_tokens
     prompt_len = len(input_tokens)
@@ -254,22 +249,12 @@ def validate_areal_trace_record(
         len(rewards) == 1 and _is_finite_number(rewards[0]),
         "rewards must contain one finite value",
     )
-    _require(
-        len(original_rewards) == 1 and _is_finite_number(original_rewards[0]),
-        "original_rewards must contain one finite value",
-    )
-
     interaction = record.get("interaction")
     _require(isinstance(interaction, dict), "interaction must be an object")
     _require(
         float(rewards[0]) == float(interaction.get("reward")),
         "tensor reward differs from interaction reward",
     )
-    _require(
-        float(original_rewards[0]) == float(interaction.get("original_reward")),
-        "tensor original_reward differs from interaction original_reward",
-    )
-
     unique_versions = sorted(set(output_versions))
     _require(len(unique_versions) == 1, "single-turn trace contains mixed output versions")
     if expected_policy_version is not None:
