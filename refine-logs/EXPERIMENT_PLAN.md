@@ -106,7 +106,7 @@ Harness 只是固定 prompt；同一个终局 reward 被无条件复制成两路
 
 ## Compute and Data Budget
 
-- 远端实测为 8×A100-SXM4-80GB；当前数据盘可用约 259GB，已经是硬约束。
+- 远端实测为 8×A100-SXM4-80GB；安装锁定环境后数据盘可用约 230GiB，已经是硬约束。
 - 只缓存一个 1.5B smoke 模型和一个固定 AReaL 环境；下载前记录预计大小，下载后记录
   实际大小。7B/8B 与 tau2 数据必须等 B0/B1 后再批准。
 - 代码目录：`/mnt/sdb/ljw/chizm/src/`；模型、数据、环境、缓存、checkpoint、trace、
@@ -115,8 +115,8 @@ Harness 只是固定 prompt；同一个终局 reward 被无条件复制成两路
 
 ## Risks and Mitigations
 
-- **远端 DNS 无上游**：不修改系统文件；当前会话用 SSH 反向 SOCKS 访问公网，并把网络
-  预检结果记为实验元数据。
+- **远端 DNS 无上游**：不修改系统文件；使用只监听 loopback、仅允许 CONNECT 443、
+  文件与 socket 均位于目标根目录的持久代理，并把网络预检结果记为实验元数据。
 - **磁盘 97% 已用**：单模型、单环境、下载前后审计；任何额外大文件先做预算。
 - **收益来自额外推理计算**：逐 episode 记录 token/tool/verifier/wall-clock，加入等预算随机
   controller。
@@ -130,6 +130,6 @@ Harness 只是固定 prompt；同一个终局 reward 被无条件复制成两路
 - [x] 核心 claim、反命题和退出条件已冻结
 - [x] 主实验与 nice-to-have 已分离
 - [ ] 官方 AReaL B0 通过
-- [ ] Harness-only 可学习性通过
+- [x] Harness-only 可学习性通过（3 seeds 的远端 CPU sanity；不等同于联合学习）
 - [ ] 同一 batch 的双候选更新与原子发布通过
 - [ ] 2×2 cross-play 和 matched-budget 完成

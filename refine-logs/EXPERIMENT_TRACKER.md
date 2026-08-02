@@ -19,14 +19,16 @@
 
 | Run ID | Block | 目的/Arm | Seed | Policy | Harness | 状态 | 结果/证据 | 产物位置 | 备注 |
 |---|---|---|---:|---|---|---|---|---|---|
-| JPH-M0-LOCAL-001 | B0 | 本地 contract smoke | 0 | scripted mock | fixed smoke | passed | 29/29 tests；13-event trace | 本地 tests | 不构成真实模型/AReaL 结果 |
-| JPH-M0-REMOTE-ENV-001 | B0 | SSH/GPU/磁盘预检 | 0 | N/A | N/A | passed | 8×A100 80GB；0/1/4–7 <500MiB；259GB 可用 | 会话日志，待写 profile | 系统 DNS 无上游；公网 IP 可达 |
-| JPH-M0-GITHUB-001 | B0 | 目标根目录内 GitHub 登录 | 0 | N/A | N/A | running | device auth 已启动 | `/mnt/sdb/ljw/chizm/config/github` | 认证等待用户确认 |
-| JPH-B0-OFFICIAL-001 | B0 | 官方 AReaL 1-step | 0 | base | fixed | planned |  | 外置 artifacts/logs | 必须先 clone、安装、路径审计 |
+| JPH-M0-LOCAL-001 | B0 | 本地 contract smoke | 0 | scripted mock | fixed smoke | passed | 33/33 tests；13-event trace | 本地 tests | 不构成真实模型/AReaL 结果 |
+| JPH-M0-REMOTE-ENV-001 | B0 | SSH/GPU/磁盘预检 | 0 | N/A | N/A | passed | 8×A100 80GB；0/1/4–7 <500MiB；安装后约 230GiB 可用 | `/mnt/sdb/ljw/chizm/artifacts/bootstrap/` | 系统 DNS 无上游；公网 IP 可达 |
+| JPH-M0-GITHUB-001 | B0 | 目标根目录内 GitHub 登录 | 0 | N/A | N/A | passed | `gh auth status`：账号 `CRhapsody`；项目经 push/pull 同步 | `/mnt/sdb/ljw/chizm/config/github` | Git 配置位于目标根目录的 runtime HOME |
+| JPH-M0-AREAL-ENV-001 | B0 | 固定 AReaL 环境安装与 CUDA 校验 | 0 | N/A | N/A | passed | 472 个锁定包；PyTorch 2.9.1+cu129；FlashAttention CUDA 运算通过；路径审计 `ok=true` | `/mnt/sdb/ljw/chizm/artifacts/bootstrap/areal-v2.0.0/` | `v2.0.0@fee938e...`；tmux exit=0 |
+| JPH-B0-PREFETCH-001 | B0 | 1.5B 模型与 GSM8K 预取 | 0 | base | fixed | running | Qwen snapshot 正在下载 | 外置 HF cache 与 bootstrap manifest | `jph-prefetch-model` tmux session |
+| JPH-B0-OFFICIAL-001 | B0 | 官方 AReaL 1-step | 0 | base | fixed | planned | GPU 2/3 各被其他用户进程占用约 902MiB | 外置 artifacts/logs | 不终止他人进程；8 卡全空闲后启动 |
 | JPH-B0-TRACE-001 | B0 | token/logprob/mask/version 复算 | 0 | base | fixed | planned |  | 外置 trace |  |
-| JPH-B1-HO-S0 | B1 | Harness-only contextual bandit | 0 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9875；随机基线 0.2；参数 delta L2 累计 8.4126 | `/tmp/jphrl-harness-bandit.json`（待远端复跑） | 400 steps |
-| JPH-B1-HO-S1 | B1 | Harness-only contextual bandit | 1 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9885；随机基线 0.2；参数 delta L2 累计 8.2224 | 同上 | 400 steps |
-| JPH-B1-HO-S2 | B1 | Harness-only contextual bandit | 2 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9877；随机基线 0.2；参数 delta L2 累计 8.3015 | 同上 | 400 steps |
+| JPH-B1-HO-S0 | B1 | Harness-only contextual bandit | 0 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9875；随机基线 0.2；参数 delta L2 累计 8.4126 | `/mnt/sdb/ljw/chizm/artifacts/harness-bandit/b1-three-seed.json` | 远端复跑，400 steps |
+| JPH-B1-HO-S1 | B1 | Harness-only contextual bandit | 1 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9885；随机基线 0.2；参数 delta L2 累计 8.2224 | 同上 | 远端复跑，400 steps |
+| JPH-B1-HO-S2 | B1 | Harness-only contextual bandit | 2 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9877；随机基线 0.2；参数 delta L2 累计 8.3015 | 同上 | 远端复跑，400 steps |
 | JPH-B2-FX-S0 | B2/B3 | fixed | 0 | frozen | frozen | planned |  | 外置 run dir | pilot |
 | JPH-B2-PO-S0 | B2/B3 | policy-only | 0 | trainable | frozen | planned |  | 外置 run dir | pilot |
 | JPH-B2-HO-S0 | B2/B3 | Harness-only | 0 | frozen | trainable | planned |  | 外置 run dir | pilot |
@@ -87,8 +89,8 @@ decision:
 
 ### G0：允许进入 Harness-only
 
-- [ ] 项目和 AReaL 均经 Git clone/pull 落到目标代码目录。
-- [ ] 依赖、模型、缓存和 artifact 路径审计没有逃出目标根目录。
+- [x] 项目和 AReaL 均经 Git clone/pull 落到目标代码目录。
+- [x] 已安装依赖、缓存和 artifact 的路径审计没有逃出目标根目录；模型/数据预取完成后再复审。
 - [ ] 官方 8-GPU 1-step、actor update、weight sync 通过。
 - [ ] 真实 token old log-prob、loss mask 和 policy version 可复算。
 
@@ -113,7 +115,8 @@ decision:
 |---|---|---|---|
 | 2026-08-02 | Hermes 只作为 policy 数据面参考，不视作 Harness learning | Hermes 捕获 LLM token/logprob 并训练 PPO，但无第二个 Harness optimizer/联合版本发布 | 保留上游固定 checkout，不修改 AReaL 主干 |
 | 2026-08-02 | 先通过 B0/B1，再实现 P3 | 当前 25 tests 只覆盖固定 controller 与 trace contract | 阶段门失败即停，不消耗大规模 GPU |
-| 2026-08-02 | 公网访问使用临时 SSH 反向 SOCKS，不修改服务器 DNS | 系统有公网路由但 systemd-resolved 无上游；代理下 TLS/ls-remote 成功 | 关闭 SSH tunnel 即完全移除 |
+| 2026-08-02 | 公网访问使用目标目录内的 loopback CONNECT 代理，不修改服务器 DNS | 系统有公网路由但 systemd-resolved 无上游；显式 DNS、TLS、GitHub 与依赖安装均通过 | 停止 `jph-net` tmux session 即完全移除 |
+| 2026-08-02 | 所有长任务使用目标目录内的显式 tmux socket | 默认 tmux socket 会写 `/tmp`；`/mnt/sdb/ljw/chizm/runtime/tmux/jph.sock` 在 SSH 重连后仍存活 | 停止相应 session；日志与 socket 均在目标根目录 |
 
 ## Failure Log
 
