@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
 from jphrl.trajectory.areal_joint_bridge import validate_areal_joint_bridge_record
@@ -19,6 +22,26 @@ SENSITIVE_KEY_PARTS = (
     "secret_key",
     "session_api_key",
 )
+SAME_BACKEND_SCHEMA_VERSION = "jph.areal-same-backend-logprob.v1"
+MAX_SAME_BACKEND_MEAN_IMPORTANCE_RATIO_ERROR = 0.02
+MAX_SAME_BACKEND_IMPORTANCE_RATIO_ERROR = 0.10
+_ADMIN_KEY_LINE = re.compile(
+    r'''(?ix)^\s*["']?admin_api_key["']?\s*:\s*(.*?)\s*,?\s*$'''
+)
+_ADMIN_KEY_INLINE = re.compile(
+    r'''(?ix)["']admin_api_key["']\s*:\s*("[^"]*"|'[^']*'|[^,}\s]+)'''
+)
+_SAFE_ADMIN_VALUES = {
+    "",
+    "null",
+    "none",
+    "''",
+    '""',
+    "<redacted-runtime-admin-key>",
+    "'<redacted-runtime-admin-key>'",
+    '"<redacted-runtime-admin-key>"',
+    "${oc.env:JPH_AREAL_ADMIN_API_KEY}",
+}
 
 
 def _require(condition: bool, message: str) -> None:
@@ -72,6 +95,160 @@ def _audit_modes(run_root: Path) -> dict[str, object]:
     }
 
 
+def _score_sha256(record: Mapping[str, object]) -> str:
+    unsigned = {key: value for key, value in record.items() if key != "record_sha256"}
+    payload = json.dumps(
+        unsigned,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _single_row(value: object, name: str) -> list[Any]:
+    _require(
+        isinstance(value, list)
+        and len(value) == 1
+        and isinstance(value[0], list),
+        f"{name} must have batch size one",
+    )
+    return value[0]
+
+
+def _verify_same_backend_scores(
+    score_dir: Path,
+    records: list[tuple[Path, dict[str, Any]]],
+) -> list[dict[str, object]]:
+    _require(score_dir.is_dir(), f"same-backend score directory is missing: {score_dir}")
+    paths = sorted(score_dir.glob("same-backend-score-*.json"))
+    _require(len(paths) == len(records), "same-backend score count mismatch")
+    scores_by_ids: dict[tuple[int, ...], tuple[Path, dict[str, Any]]] = {}
+    for path in paths:
+        score = json.loads(path.read_text(encoding="utf-8"))
+        _require(
+            score.get("schema_version") == SAME_BACKEND_SCHEMA_VERSION,
+            f"{path}: unknown score schema",
+        )
+        _require(
+            score.get("record_sha256") == _score_sha256(score),
+            f"{path}: score hash mismatch",
+        )
+        input_ids = _single_row(score.get("input_ids"), "score.input_ids")
+        identity = tuple(input_ids)
+        _require(identity not in scores_by_ids, "duplicate same-backend input sequence")
+        scores_by_ids[identity] = (path, score)
+
+    reports: list[dict[str, object]] = []
+    for bridge_path, record in records:
+        tensors = record["areal_trace"]["tensor_dict"]
+        expected_ids = tensors["input_ids"][0]
+        entry = scores_by_ids.get(tuple(expected_ids))
+        _require(entry is not None, f"{bridge_path}: no matching same-backend score")
+        score_path, score = entry
+        loss_mask = _single_row(score["loss_mask"], "score.loss_mask")
+        stored = _single_row(score["stored_logprobs"], "score.stored_logprobs")
+        rescored = _single_row(score["rescored_logprobs"], "score.rescored_logprobs")
+        versions = _single_row(score["versions"], "score.versions")
+        length = len(expected_ids)
+        _require(
+            len(loss_mask) == len(stored) == len(rescored) == len(versions) == length,
+            f"{score_path}: score vector lengths differ",
+        )
+        _require(loss_mask == tensors["loss_mask"][0], f"{score_path}: loss mask mismatch")
+        _require(versions == tensors["versions"][0], f"{score_path}: versions mismatch")
+        _require(
+            all(
+                math.isclose(float(left), float(right), rel_tol=0.0, abs_tol=1e-6)
+                for left, right in zip(stored, tensors["logprobs"][0])
+            ),
+            f"{score_path}: stored logprobs differ from bridge tensor",
+        )
+        active = [index for index, mask in enumerate(loss_mask) if mask == 1]
+        _require(bool(active), f"{score_path}: no trainable policy tokens")
+        logprob_errors = [
+            abs(float(rescored[index]) - float(stored[index])) for index in active
+        ]
+        ratio_errors = [
+            abs(math.exp(float(rescored[index]) - float(stored[index])) - 1.0)
+            for index in active
+        ]
+        mean_ratio_error = sum(ratio_errors) / len(ratio_errors)
+        max_ratio_error = max(ratio_errors)
+        passed = (
+            mean_ratio_error <= MAX_SAME_BACKEND_MEAN_IMPORTANCE_RATIO_ERROR
+            and max_ratio_error <= MAX_SAME_BACKEND_IMPORTANCE_RATIO_ERROR
+        )
+        reports.append(
+            {
+                "bridge_path": str(bridge_path),
+                "score_path": str(score_path),
+                "checked_tokens": len(active),
+                "mean_abs_logprob_error": sum(logprob_errors) / len(logprob_errors),
+                "max_abs_logprob_error": max(logprob_errors),
+                "mean_importance_ratio_error": mean_ratio_error,
+                "max_importance_ratio_error": max_ratio_error,
+                "thresholds": {
+                    "max_mean_importance_ratio_error": (
+                        MAX_SAME_BACKEND_MEAN_IMPORTANCE_RATIO_ERROR
+                    ),
+                    "max_importance_ratio_error": (
+                        MAX_SAME_BACKEND_IMPORTANCE_RATIO_ERROR
+                    ),
+                },
+                "passed": passed,
+            }
+        )
+    _require(
+        len(reports) == len(records) and all(report["passed"] for report in reports),
+        "same-backend policy logprob audit failed",
+    )
+    return reports
+
+
+def _audit_sensitive_artifacts(run_root: Path) -> dict[str, object]:
+    runtime_secret = os.environ.pop("JPH_AREAL_ADMIN_API_KEY", None)
+    unsafe_fields: list[dict[str, object]] = []
+    redacted_fields = 0
+    scanned_files = 0
+    for path in sorted(run_root.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if path.suffix.lower() not in {".json", ".jsonl", ".log", ".txt", ".yaml", ".yml"}:
+            continue
+        scanned_files += 1
+        text = path.read_text(encoding="utf-8", errors="replace")
+        _require(
+            not runtime_secret or runtime_secret not in text,
+            f"runtime admin key remains in artifact: {path}",
+        )
+        _require(
+            "areal-admin-key" not in text,
+            f"default AReaL admin key remains in artifact: {path}",
+        )
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            match = _ADMIN_KEY_LINE.match(line)
+            raw_values = (
+                [match.group(1)]
+                if match is not None
+                else [item.group(1) for item in _ADMIN_KEY_INLINE.finditer(line)]
+            )
+            for raw_value in raw_values:
+                normalized = raw_value.strip().removesuffix(",").strip()
+                if normalized in _SAFE_ADMIN_VALUES:
+                    redacted_fields += 1
+                else:
+                    unsafe_fields.append({"path": str(path), "line": line_number})
+    _require(not unsafe_fields, "unredacted admin_api_key fields remain in artifacts")
+    return {
+        "scanned_files": scanned_files,
+        "redacted_or_safe_admin_key_fields": redacted_fields,
+        "unsafe_fields": unsafe_fields,
+        "runtime_secret_matches": 0,
+        "default_key_matches": 0,
+    }
+
+
 def _recompute_prompt_tokens(
     records: list[tuple[Path, dict[str, Any]]],
     *,
@@ -121,6 +298,7 @@ def _recompute_prompt_tokens(
 
 def verify(
     bridge_dir: Path,
+    same_backend_score_dir: Path,
     *,
     model_report_path: Path,
     dataset_report_path: Path,
@@ -137,7 +315,13 @@ def verify(
     root = Path(os.environ["JPH_ROOT"]).resolve()
     _require(root.is_dir(), f"JPH_ROOT does not exist: {root}")
     _require(expected_count == 4, "v1 bridge contract requires exactly four records")
-    for path in (bridge_dir, model_report_path, dataset_report_path, output):
+    for path in (
+        bridge_dir,
+        same_backend_score_dir,
+        model_report_path,
+        dataset_report_path,
+        output,
+    ):
         _require_within(path, root)
     _require(bridge_dir.is_dir(), f"bridge directory does not exist: {bridge_dir}")
     paths = sorted(bridge_dir.glob("bridge-*.json"))
@@ -213,7 +397,11 @@ def verify(
 
     _require(len(joint_version_ids) == 1, "bridge records use multiple JointVersions")
     _require(not sensitive_keys, "sensitive-looking keys found in bridge records")
-    recompute_audits = recompute_behavior_logprobs(
+    same_backend_audits = _verify_same_backend_scores(
+        same_backend_score_dir,
+        raw_records,
+    )
+    cross_backend_audits = recompute_behavior_logprobs(
         nested_records,
         snapshot_path=snapshot_path,
         device=device,
@@ -221,6 +409,7 @@ def verify(
         max_traces=expected_count,
         max_abs_error=max_abs_error,
         max_mean_abs_error=max_mean_abs_error,
+        require_all_passed=False,
     )
     prompt_token_audits = _recompute_prompt_tokens(
         raw_records,
@@ -229,6 +418,7 @@ def verify(
     mode_audit = _audit_modes(bridge_dir.parent)
     _require(not mode_audit["mode_violations"], "artifact permissions are not private")
     _require(not mode_audit["symlinks"], "artifact tree contains symlinks")
+    sensitive_artifact_audit = _audit_sensitive_artifacts(bridge_dir.parent)
 
     report: dict[str, object] = {
         "ok": True,
@@ -242,7 +432,8 @@ def verify(
             "real_areal_rollout": True,
             "harness_decision_changed_prompt": True,
             "joint_interaction_sidecar": True,
-            "frozen_behavior_snapshot_recompute": True,
+            "same_backend_policy_logprob_recompute": True,
+            "frozen_hf_cross_backend_diagnostic": True,
             "policy_optimizer_update": False,
             "harness_optimizer_update": False,
             "joint_learning_claim": False,
@@ -256,11 +447,13 @@ def verify(
         "unique_request_ids": len(request_ids),
         "unique_harness_decision_ids": len(decision_ids),
         "bridge_audits": audits,
-        "behavior_logprob_recompute": recompute_audits,
+        "same_backend_policy_logprob_recompute": same_backend_audits,
+        "frozen_hf_cross_backend_diagnostic": cross_backend_audits,
         "prompt_token_recompute": prompt_token_audits,
         "all_paths_within_configured_root": True,
         "absolute_paths_checked": sorted(set(absolute_paths)),
         "sensitive_key_matches": sensitive_keys,
+        "sensitive_artifact_audit": sensitive_artifact_audit,
         "mode_audit": mode_audit,
     }
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -277,6 +470,7 @@ def main() -> None:
         description="Verify real AReaL rollout and Harness decision bridge records"
     )
     parser.add_argument("bridge_dir", type=Path)
+    parser.add_argument("--same-backend-score-dir", required=True, type=Path)
     parser.add_argument("--model-report", required=True, type=Path)
     parser.add_argument("--dataset-report", required=True, type=Path)
     parser.add_argument("--expected-areal-commit", required=True)
@@ -291,6 +485,7 @@ def main() -> None:
     args = parser.parse_args()
     report = verify(
         args.bridge_dir,
+        same_backend_score_dir=args.same_backend_score_dir,
         model_report_path=args.model_report,
         dataset_report_path=args.dataset_report,
         expected_areal_commit=args.expected_areal_commit,

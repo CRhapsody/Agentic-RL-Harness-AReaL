@@ -89,6 +89,7 @@ def recompute_behavior_logprobs(
     max_traces: int,
     max_abs_error: float,
     max_mean_abs_error: float,
+    require_all_passed: bool = True,
 ) -> list[dict[str, Any]]:
     import torch
     from transformers import AutoModelForCausalLM
@@ -193,10 +194,12 @@ def recompute_behavior_logprobs(
     finally:
         del model
         torch.cuda.empty_cache()
-    _require(
-        reports and all(report["passed"] for report in reports),
-        "logprob recomputation failed tolerance",
-    )
+    _require(bool(reports), "logprob recomputation produced no reports")
+    if require_all_passed:
+        _require(
+            all(report["passed"] for report in reports),
+            "logprob recomputation failed tolerance",
+        )
     return reports
 
 

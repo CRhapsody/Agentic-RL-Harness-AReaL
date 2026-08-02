@@ -41,6 +41,14 @@ Harness 只是固定 prompt；同一个终局 reward 被无条件复制成两路
 - **设置**：固定 AReaL commit `fee938eada49208a5aabdbc1095730a13076a349`；
   8×A100 80GB；AReaL 产物全部放仓库外。
 - **成功条件**：官方 actor 完成 1 次更新和权重同步；抽样 token 数据可复算；无混版本。
+- **真实 interaction bridge 的预注册概率门**：对每条轨迹，在生成所用的同一
+  AReaL/SGLang engine、同一权重版本上调用官方 `compute_logp`；所有可训练 token 的
+  `abs(exp(logp_rescored-logp_behavior)-1)` 必须满足每条均值不超过 `0.02`、每条最大值
+  不超过 `0.10`。冻结 Hugging Face BF16 前向的跨后端复算继续完整报告，但只作数值
+  诊断，不作为同分布门禁。阈值在看到新 run 的同后端结果前冻结，禁止事后放宽。
+- **bridge 安全门**：每个 run 使用独立随机 admin key，只通过环境变量传入；正式审计
+  前必须对整个 run tree 完成脱敏并扫描，默认 `areal-admin-key`、运行时随机 key 或未
+  脱敏 `admin_api_key` 字段任一残留都使 run 无效。
 - **失败解释**：数据面不可信，停止 Harness 改造，不产生科学结论。
 - **优先级**：MUST-RUN。
 

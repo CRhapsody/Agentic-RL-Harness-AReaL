@@ -31,6 +31,7 @@
 | JPH-B1-HO-S1 | B1 | Harness-only contextual bandit | 1 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9885；随机基线 0.2；参数 delta L2 累计 8.2224 | 同上 | 远端复跑，400 steps |
 | JPH-B1-HO-S2 | B1 | Harness-only contextual bandit | 2 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9877；随机基线 0.2；参数 delta L2 累计 8.3015 | 同上 | 远端复跑，400 steps |
 | JPH-G1-CTRL-001 | G1/B4 | 联合控制面完整性 | 0 | toy candidate | toy candidate | passed | commit `9ccd14f...`；53/53 tests；8/8 更新干预、10/10 负向 mutation、6/6 发布故障场景通过；1000 个确定性版本 fixture 中 mixed/half/stale-accepted 均为 0；toy checkpoint 下一步一致 | `/mnt/sdb/ljw/chizm/artifacts/g1/20260802T125741Z/` | CPU-only synthetic fixture；不是 AReaL rollout、真实 optimizer update 或联合学习结果 |
+| JPH-G1-BRIDGE-001 | G1/B0 | 真实 AReaL interaction 与 Harness sidecar | 0 | Qwen2.5-1.5B base | frozen tabular controller | invalid | commit `ab27606...`；真实 rollout、sidecar、prompt token 重算均为 4/4；冻结 HF 跨后端诊断仅 3/4 通过，且落盘配置含默认公开 admin key；正式 `audit.json` 未生成 | `/mnt/sdb/ljw/chizm/artifacts/areal-joint-bridge/20260802T131531Z/` | GPU 0；tmux exit=1；失败产物原样保留；无 policy/Harness optimizer update |
 | JPH-B2-FX-S0 | B2/B3 | fixed | 0 | frozen | frozen | planned |  | 外置 run dir | pilot |
 | JPH-B2-PO-S0 | B2/B3 | policy-only | 0 | trainable | frozen | planned |  | 外置 run dir | pilot |
 | JPH-B2-HO-S0 | B2/B3 | Harness-only | 0 | frozen | trainable | planned |  | 外置 run dir | pilot |
@@ -124,6 +125,7 @@ decision:
 | 2026-08-02 | B0 非回环 proxy 使用每次 run 独立的随机 admin key | AReaL 2.0.0 会拒绝非回环地址上的默认 key；run `20260802T072643Z` 的 proxy 与 proxy-eval 均成功初始化 | key 只经环境变量传入，argv 保留 OmegaConf 环境引用；产物权限 0600，配置写出后立即脱敏并在 EXIT 再审计 |
 | 2026-08-02 | G0 行为轨迹审计门通过，但不把跨后端容差通过写成精确复算 | run `20260802T104241Z` 的 AReaL `ModelResponse` 到正式六字段张量 roundtrip 最大误差为 0；冻结 HF BF16 前向对 64 个 action token 的 mean/p95/max abs 为 `0.01627/0.11498/0.18852`，全部低于 run 前已提交的 mean≤0.05、max≤0.25 门槛 | 若后续训练对 importance ratio 偏差更敏感，先冻结同后端重算或更严格阈值，再进入 joint pilot |
 | 2026-08-02 | G1 synthetic 控制面证据通过，但 joint pilot 门继续关闭 | `JPH-G1-CTRL-001` 证明两路 toy updater 的干预不变性、lag0 gate、原子 pair publish 与 toy replay；结果文件明确 `areal_policy_update=false`、`production_harness_update=false` | 下一步先做单卡真实 AReaL interaction bridge；不得把 1000 个 deterministic fixture 写成真实 rollout |
+| 2026-08-02 | 真实 bridge 的正式概率门改为同一 AReaL/SGLang 后端复算，冻结 HF 只保留诊断 | `JPH-G1-BRIDGE-001` 中 4 条真实轨迹均可生成，但 HF BF16 与 SGLang 在一条轨迹出现 importance-ratio 尾部差异；事后把旧 max 阈值从 0.25 放宽到 0.28 会污染预注册 | 新 run 预先固定每条轨迹 mean importance-ratio error≤0.02、max≤0.10；HF 仍完整报告但不阻断；任一同后端轨迹失败则不生成通过审计 |
 
 ## Failure Log
 
@@ -148,3 +150,4 @@ decision:
 | 2026-08-02 | JPH-B0-TRACE-001 / `20260802T103913Z` | 真实生成后 interaction 构造失败 | 固定 AReaL 提交的 `InteractionWithTokenLogpReward` 不定义 `original_reward` | schema/invalid | 删除错配字段，严格采用上游六字段 `to_tensor_dict()` 契约；AReaL 自行回收 worker，没有 trace |
 | 2026-08-02 | JPH-G1-CTRL-001 preflight | 下发的完整 commit hash 不存在 | 错误字符串与真实提交只共享短前缀；远端完整对象 ID 门禁拒绝继续 | orchestration/stopped | 不创建 tmux、不运行实验；之后只使用本地 `git rev-parse HEAD` 的 40 位结果 |
 | 2026-08-02 | JPH-G1-CTRL-001 preflight | launcher 默认解释器路径不存在 | 脚本写成 `areal-v2`，服务器固定环境为 `areal-v2.0.0`；路径门禁在 Git pull 前停止 | config/stopped | 修正默认路径并增加回归测试；正式 run 验证未设置 `JPH_PYTHON` 时仍可运行 |
+| 2026-08-02 | JPH-G1-BRIDGE-001 / `20260802T131531Z` | 4 条真实 rollout 完成后，正式 bridge 审计失败 | 第 4 条轨迹 HF/SGLang max abs logprob error=`0.277804`，超过预先固定的 `0.25`，对应 importance-ratio error=`0.242555`，因此仅 3/4 通过；同时四份 AReaL 配置含默认公开值 `areal-admin-key` | measurement/security/invalid | 保留失败 artifact；不放宽旧阈值。后续用官方 `controller.compute_logp` 做同后端正式复算，阈值在重跑前提交；每次生成随机 admin key，经环境变量传入并在审计前对整棵 run tree 脱敏 |

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sys
 from pathlib import Path
+from typing import Any, Mapping
 
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GRPOConfig, SGLangConfig, load_expr_config, vLLMConfig
@@ -16,6 +19,71 @@ from areal.utils.printing import tabulate_stats
 
 
 logger = logging.getLogger("JPHAReaLJointBridgeEval")
+
+
+def _plain(value: Any) -> Any:
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    return value
+
+
+def _canonical(value: Mapping[str, object]) -> bytes:
+    unsigned = {key: item for key, item in value.items() if key != "record_sha256"}
+    return json.dumps(
+        unsigned,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _write_same_backend_scores(
+    trajectories: list[dict[str, Any]],
+    rescored_logprobs: list[Any],
+) -> None:
+    if len(trajectories) != len(rescored_logprobs):
+        raise RuntimeError("same-backend score count differs from trajectory count")
+    root = Path(os.environ["JPH_ROOT"]).resolve()
+    score_dir = Path(os.environ["JPH_AREAL_SAME_BACKEND_SCORE_DIR"]).resolve()
+    if not score_dir.is_relative_to(root):
+        raise ValueError(f"same-backend score directory escapes JPH_ROOT: {score_dir}")
+    score_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for trajectory, rescored in zip(trajectories, rescored_logprobs):
+        record: dict[str, object] = {
+            "schema_version": "jph.areal-same-backend-logprob.v1",
+            "input_ids": _plain(trajectory["input_ids"]),
+            "loss_mask": _plain(trajectory["loss_mask"]),
+            "stored_logprobs": _plain(trajectory["logprobs"]),
+            "rescored_logprobs": _plain(rescored),
+            "versions": _plain(trajectory["versions"]),
+        }
+        record["record_sha256"] = hashlib.sha256(_canonical(record)).hexdigest()
+        identity = hashlib.sha256(
+            json.dumps(record["input_ids"], separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:20]
+        path = score_dir / f"same-backend-score-{identity}.json"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1
+                json.dump(
+                    record,
+                    handle,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    indent=2,
+                )
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
 
 
 def _task_limit() -> int:
@@ -118,6 +186,8 @@ def main(args: list[str]) -> None:
             raise RuntimeError(
                 f"AReaL returned {len(results)} results for {submitted} submitted tasks"
             )
+        rescored_logprobs = controller.compute_logp(results)
+        _write_same_backend_scores(results, rescored_logprobs)
         logger.info(
             "AReaL joint bridge evaluation: %s",
             tabulate_stats(controller.export_stats()),

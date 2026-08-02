@@ -40,9 +40,24 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("verify_areal_joint_bridge.py", launcher)
         self.assertIn("ArealJointBridgeWorkflow", runner)
         self.assertIn("controller.wait(submitted, timeout=900.0)", runner)
+        self.assertIn("controller.compute_logp(results)", runner)
+        self.assertIn("JPH_AREAL_SAME_BACKEND_SCORE_DIR", launcher + runner)
+        self.assertIn("same-backend-score-", runner)
         self.assertIn("recompute_behavior_logprobs", verifier)
+        self.assertIn("require_all_passed=False", verifier)
+        self.assertIn("_verify_same_backend_scores", verifier)
+        self.assertIn("MAX_SAME_BACKEND_MEAN_IMPORTANCE_RATIO_ERROR = 0.02", verifier)
+        self.assertIn("MAX_SAME_BACKEND_IMPORTANCE_RATIO_ERROR = 0.10", verifier)
         self.assertIn("_recompute_prompt_tokens", verifier)
         self.assertIn("harness_decision_changed_prompt", verifier)
+        self.assertIn("secrets.token_urlsafe(32)", launcher)
+        self.assertIn('JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}"', launcher)
+        self.assertIn(
+            "'+rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}'",
+            launcher,
+        )
+        self.assertIn("redact_runtime_admin_key.py", launcher)
+        self.assertIn("--same-backend-score-dir", launcher + verifier)
         self.assertNotIn("optimizer.step", launcher + runner + verifier)
 
     def test_g1_launcher_is_private_external_and_verified(self) -> None:

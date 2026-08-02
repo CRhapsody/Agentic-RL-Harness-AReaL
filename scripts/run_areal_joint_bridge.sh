@@ -107,15 +107,31 @@ fi
 RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ROOT="${JPH_ROOT}/artifacts/areal-joint-bridge/${RUN_STAMP}"
 BRIDGE_DIR="${RUN_ROOT}/bridge-records"
+SAME_BACKEND_SCORE_DIR="${RUN_ROOT}/same-backend-scores"
 AUDIT_PATH="${RUN_ROOT}/audit.json"
 NAME_RESOLVE_ROOT="${JPH_ROOT}/runtime/name_resolve/joint-bridge-${RUN_STAMP}"
 LOG_PATH="${RUN_ROOT}/run.log"
-mkdir -p -m 700 "${BRIDGE_DIR}" "${NAME_RESOLVE_ROOT}"
+RUN_ADMIN_API_KEY="$(
+  "${AREAL_VENV}/bin/python" -c \
+    'import secrets; print("jph-bridge-" + secrets.token_urlsafe(32))'
+)"
+mkdir -p -m 700 \
+  "${BRIDGE_DIR}" \
+  "${SAME_BACKEND_SCORE_DIR}" \
+  "${NAME_RESOLVE_ROOT}"
 touch "${LOG_PATH}"
 chmod 600 "${LOG_PATH}"
 
 GPU_MONITOR_PID=""
+SECRET_REDACTOR_PID=""
 cleanup() {
+  if [[ -n "${SECRET_REDACTOR_PID}" ]]; then
+    kill "${SECRET_REDACTOR_PID}" >/dev/null 2>&1 || true
+    wait "${SECRET_REDACTOR_PID}" >/dev/null 2>&1 || true
+  fi
+  JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
+    "${AREAL_VENV}/bin/python" "${SCRIPT_DIR}/redact_runtime_admin_key.py" \
+      "${RUN_ROOT}" >/dev/null 2>&1 || true
   if [[ -n "${GPU_MONITOR_PID}" ]]; then
     kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
     wait "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
@@ -124,17 +140,23 @@ cleanup() {
 trap cleanup EXIT
 nvidia-smi dmon -i "${GPU_ID}" -s pucm -d 5 -o TD > "${RUN_ROOT}/gpu-dmon.log" 2>&1 &
 GPU_MONITOR_PID="$!"
+JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
+  "${AREAL_VENV}/bin/python" "${SCRIPT_DIR}/redact_runtime_admin_key.py" \
+    --watch-seconds 1200 "${RUN_ROOT}" >/dev/null 2>&1 &
+SECRET_REDACTOR_PID="$!"
 
 echo "project=${PROJECT_COMMIT} AReaL=${ACTUAL_AREAL_COMMIT} physical_gpu=${GPU_ID} model_revision=${MODEL_REVISION} dataset_revision=${DATASET_REVISION}" | tee -a "${LOG_PATH}"
-echo "run_root=${RUN_ROOT} bridge_dir=${BRIDGE_DIR}" | tee -a "${LOG_PATH}"
+echo "run_root=${RUN_ROOT} bridge_dir=${BRIDGE_DIR} same_backend_score_dir=${SAME_BACKEND_SCORE_DIR}" | tee -a "${LOG_PATH}"
 
 cd "${AREAL_REPO}"
 CUDA_VISIBLE_DEVICES="${GPU_ID}" \
 HF_HUB_OFFLINE=1 \
 HF_DATASETS_OFFLINE=1 \
 TRANSFORMERS_OFFLINE=1 \
+JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
 JPH_AREAL_JOINT_BRIDGE_TASKS=4 \
 JPH_AREAL_JOINT_BRIDGE_DIR="${BRIDGE_DIR}" \
+JPH_AREAL_SAME_BACKEND_SCORE_DIR="${SAME_BACKEND_SCORE_DIR}" \
 JPH_AREAL_COMMIT="${ACTUAL_AREAL_COMMIT}" \
 JPH_PROJECT_COMMIT="${PROJECT_COMMIT}" \
 JPH_BEHAVIOR_SNAPSHOT="${MODEL_SNAPSHOT}" \
@@ -162,16 +184,28 @@ JPH_EXPECTED_POLICY_VERSION=0 \
   rollout.backend=sglang:d1p1t1 \
   rollout.max_concurrent_rollouts=1 \
   rollout.dump_to_file=false \
+  '+rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}' \
   sglang.mem_fraction_static=0.35 \
   sglang.context_length=1024 \
   sglang.max_running_requests=1 \
   2>&1 | tee -a "${LOG_PATH}"
 
+if [[ -n "${SECRET_REDACTOR_PID}" ]]; then
+  kill "${SECRET_REDACTOR_PID}" >/dev/null 2>&1 || true
+  wait "${SECRET_REDACTOR_PID}" >/dev/null 2>&1 || true
+  SECRET_REDACTOR_PID=""
+fi
+JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
+  "${AREAL_VENV}/bin/python" "${SCRIPT_DIR}/redact_runtime_admin_key.py" \
+    "${RUN_ROOT}"
+
 CUDA_VISIBLE_DEVICES="${GPU_ID}" \
 HF_HUB_OFFLINE=1 \
 TRANSFORMERS_OFFLINE=1 \
+JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
   "${AREAL_VENV}/bin/python" "${JPH_PROJECT_DIR}/scripts/verify_areal_joint_bridge.py" \
   "${BRIDGE_DIR}" \
+  --same-backend-score-dir "${SAME_BACKEND_SCORE_DIR}" \
   --model-report "${MODEL_REPORT}" \
   --dataset-report "${DATASET_REPORT}" \
   --expected-areal-commit "${EXPECTED_AREAL_COMMIT}" \
