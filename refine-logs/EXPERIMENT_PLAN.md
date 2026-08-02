@@ -129,7 +129,8 @@ Harness 只是固定 prompt；同一个终局 reward 被无条件复制成两路
 
 - [x] 核心 claim、反命题和退出条件已冻结
 - [x] 主实验与 nice-to-have 已分离
-- [ ] 官方 AReaL B0 通过
+- [x] 官方 AReaL B0 通过
 - [x] Harness-only 可学习性通过（3 seeds 的远端 CPU sanity；不等同于联合学习）
+- [x] synthetic CPU 控制面双流干预、lag0、原子发布与 toy replay 通过
 - [ ] 同一 batch 的双候选更新与原子发布通过
 - [ ] 2×2 cross-play 和 matched-budget 完成

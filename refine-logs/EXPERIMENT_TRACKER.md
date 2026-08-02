@@ -30,6 +30,7 @@
 | JPH-B1-HO-S0 | B1 | Harness-only contextual bandit | 0 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9875；随机基线 0.2；参数 delta L2 累计 8.4126 | `/mnt/sdb/ljw/chizm/artifacts/harness-bandit/b1-three-seed.json` | 远端复跑，400 steps |
 | JPH-B1-HO-S1 | B1 | Harness-only contextual bandit | 1 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9885；随机基线 0.2；参数 delta L2 累计 8.2224 | 同上 | 远端复跑，400 steps |
 | JPH-B1-HO-S2 | B1 | Harness-only contextual bandit | 2 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9877；随机基线 0.2；参数 delta L2 累计 8.3015 | 同上 | 远端复跑，400 steps |
+| JPH-G1-CTRL-001 | G1/B4 | 联合控制面完整性 | 0 | toy candidate | toy candidate | passed | commit `9ccd14f...`；53/53 tests；8/8 更新干预、10/10 负向 mutation、6/6 发布故障场景通过；1000 个确定性版本 fixture 中 mixed/half/stale-accepted 均为 0；toy checkpoint 下一步一致 | `/mnt/sdb/ljw/chizm/artifacts/g1/20260802T125741Z/` | CPU-only synthetic fixture；不是 AReaL rollout、真实 optimizer update 或联合学习结果 |
 | JPH-B2-FX-S0 | B2/B3 | fixed | 0 | frozen | frozen | planned |  | 外置 run dir | pilot |
 | JPH-B2-PO-S0 | B2/B3 | policy-only | 0 | trainable | frozen | planned |  | 外置 run dir | pilot |
 | JPH-B2-HO-S0 | B2/B3 | Harness-only | 0 | frozen | trainable | planned |  | 外置 run dir | pilot |
@@ -98,10 +99,11 @@ decision:
 ### G1：允许进入 joint pilot
 
 - [x] 3 seeds Harness-only 均学出任务条件动作偏好（本地 sanity；远端复跑仅用于留存 artifact）。
-- [ ] policy token 与 Harness action 的行为概率、mask、credit 分离。
-- [ ] 1000 episode mixed-version=0。
-- [ ] updater/publish 故障注入无半版本。
-- [ ] checkpoint 恢复后下一 joint step 一致。
+- [x] synthetic CPU fixture 中 policy token 与 Harness action 的行为概率、mask、credit 和 toy updater 依赖已分离。
+- [x] synthetic 本地 POSIX 控制面中 updater/publish 故障注入无半版本，toy checkpoint 恢复后下一步一致。
+- [ ] 真实 AReaL interaction 已绑定生效的 Harness decision sidecar 与同一 `JointVersion`。
+- [ ] 1000 条真实 episode mixed-version=0。
+- [ ] 真实 policy/Harness optimizer 与生产 checkpoint 的故障注入、整对发布和恢复通过。
 
 ### G2：允许完整 3-seed 矩阵
 
@@ -121,6 +123,7 @@ decision:
 | 2026-08-02 | B0 以显存余量代替 `<500MiB` 空闲判定 | SGLang `mem_fraction_static=0.8` 对 80GiB 卡静态预算为 64GiB；70GiB 最小空闲仍留 6GiB；actor 调度声明 32GiB | 默认要求 used≤10GiB 且 free≥70GiB；环境变量可收紧门禁，启动脚本再次检查 |
 | 2026-08-02 | B0 非回环 proxy 使用每次 run 独立的随机 admin key | AReaL 2.0.0 会拒绝非回环地址上的默认 key；run `20260802T072643Z` 的 proxy 与 proxy-eval 均成功初始化 | key 只经环境变量传入，argv 保留 OmegaConf 环境引用；产物权限 0600，配置写出后立即脱敏并在 EXIT 再审计 |
 | 2026-08-02 | G0 行为轨迹审计门通过，但不把跨后端容差通过写成精确复算 | run `20260802T104241Z` 的 AReaL `ModelResponse` 到正式六字段张量 roundtrip 最大误差为 0；冻结 HF BF16 前向对 64 个 action token 的 mean/p95/max abs 为 `0.01627/0.11498/0.18852`，全部低于 run 前已提交的 mean≤0.05、max≤0.25 门槛 | 若后续训练对 importance ratio 偏差更敏感，先冻结同后端重算或更严格阈值，再进入 joint pilot |
+| 2026-08-02 | G1 synthetic 控制面证据通过，但 joint pilot 门继续关闭 | `JPH-G1-CTRL-001` 证明两路 toy updater 的干预不变性、lag0 gate、原子 pair publish 与 toy replay；结果文件明确 `areal_policy_update=false`、`production_harness_update=false` | 下一步先做单卡真实 AReaL interaction bridge；不得把 1000 个 deterministic fixture 写成真实 rollout |
 
 ## Failure Log
 
@@ -143,3 +146,5 @@ decision:
 | 2026-08-02 | JPH-B0-TRACE-001 / `20260802T103414Z` | SGLang 子进程报 `runpy`/`NamespaceLoader` ImportError | worker 的裸 `python3` 命中系统解释器 | runtime/invalid | trace launcher 将固定 AReaL venv 放到 PATH 首位；仅清理本次自有进程，没有 trace |
 | 2026-08-02 | JPH-B0-TRACE-001 / `20260802T103626Z` | SGLang CUDA graph JIT 拒绝 C++20 | 默认 nvcc 来自 CUDA 11.8 | runtime/invalid | 固定只读 CUDA 12.6，并在启动前执行 C++20 preflight；仅清理本次自有进程，没有 trace |
 | 2026-08-02 | JPH-B0-TRACE-001 / `20260802T103913Z` | 真实生成后 interaction 构造失败 | 固定 AReaL 提交的 `InteractionWithTokenLogpReward` 不定义 `original_reward` | schema/invalid | 删除错配字段，严格采用上游六字段 `to_tensor_dict()` 契约；AReaL 自行回收 worker，没有 trace |
+| 2026-08-02 | JPH-G1-CTRL-001 preflight | 下发的完整 commit hash 不存在 | 错误字符串与真实提交只共享短前缀；远端完整对象 ID 门禁拒绝继续 | orchestration/stopped | 不创建 tmux、不运行实验；之后只使用本地 `git rev-parse HEAD` 的 40 位结果 |
+| 2026-08-02 | JPH-G1-CTRL-001 preflight | launcher 默认解释器路径不存在 | 脚本写成 `areal-v2`，服务器固定环境为 `areal-v2.0.0`；路径门禁在 Git pull 前停止 | config/stopped | 修正默认路径并增加回归测试；正式 run 验证未设置 `JPH_PYTHON` 时仍可运行 |
