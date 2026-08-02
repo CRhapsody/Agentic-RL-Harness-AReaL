@@ -41,6 +41,8 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("ArealJointBridgeWorkflow", runner)
         self.assertIn("controller.wait(submitted, timeout=900.0)", runner)
         self.assertIn("controller.compute_logp(results)", runner)
+        self.assertIn("JPHRemoteSGLangEngine", runner)
+        self.assertIn('config.rollout._version != "v1"', runner)
         self.assertIn("engine_version_before_score = controller.get_version()", runner)
         self.assertIn("engine_version_after_score = controller.get_version()", runner)
         self.assertIn("JPH_AREAL_SAME_BACKEND_SCORE_DIR", launcher + runner)
@@ -224,7 +226,16 @@ class RemoteScriptContractTests(unittest.TestCase):
             artifact = root / "run" / "config.yaml"
             artifact.parent.mkdir()
             secret = "jph-b0-test-secret"
-            artifact.write_text(f"admin_api_key: {secret}\n", encoding="utf-8")
+            artifact.write_text(
+                (
+                    "rollout:\n"
+                    f"  agent:\n    admin_api_key: {secret}\n"
+                    "actor:\n  agent:\n    admin_api_key: areal-admin-key\n"
+                    "evaluator:\n  agent:\n    admin_api_key: areal-admin-key\n"
+                    "proxy:\n  agent:\n    admin_api_key: areal-admin-key\n"
+                ),
+                encoding="utf-8",
+            )
             env = {
                 **os.environ,
                 "JPH_ROOT": str(root),
@@ -239,7 +250,25 @@ class RemoteScriptContractTests(unittest.TestCase):
             )
             result = artifact.read_text(encoding="utf-8")
             self.assertNotIn(secret, result)
+            self.assertNotIn("areal-admin-key", result)
             self.assertIn("<redacted-runtime-admin-key>", result)
+            self.assertIn("<redacted-default-admin-key>", result)
+
+            extensionless = root / "run" / "resolved-config"
+            extensionless.write_text(
+                f"admin_api_key={secret}\nfallback=areal-admin-key\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [sys.executable, str(redactor), str(extensionless)],
+                check=True,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            extensionless_result = extensionless.read_text(encoding="utf-8")
+            self.assertNotIn(secret, extensionless_result)
+            self.assertNotIn("areal-admin-key", extensionless_result)
 
             with self.assertRaises(subprocess.CalledProcessError):
                 subprocess.run(

@@ -22,7 +22,7 @@ SENSITIVE_KEY_PARTS = (
     "secret_key",
     "session_api_key",
 )
-SAME_BACKEND_SCHEMA_VERSION = "jph.areal-same-backend-logprob.v2"
+SAME_BACKEND_SCHEMA_VERSION = "jph.areal-same-backend-logprob.v3"
 MAX_SAME_BACKEND_MEAN_IMPORTANCE_RATIO_ERROR = 0.02
 MAX_SAME_BACKEND_IMPORTANCE_RATIO_ERROR = 0.10
 _SENSITIVE_FIELD_PATTERN = "|".join(re.escape(key) for key in SENSITIVE_KEY_PARTS)
@@ -185,7 +185,9 @@ def _verify_same_backend_scores(
         _require(isinstance(scoring_origin, dict), f"{score_path}: scoring origin missing")
         expected_origin = {
             "api": "RolloutController.compute_logp",
+            "controller_api_version": "v1",
             "lifecycle": "same-controller-after-wait-before-destroy",
+            "score_parser": "jph-tail-before-conversion-v1",
             "backend": "sglang:d1p1t1",
             "engine_version_before_score": record["policy_binding"][
                 "expected_inference_engine_version"

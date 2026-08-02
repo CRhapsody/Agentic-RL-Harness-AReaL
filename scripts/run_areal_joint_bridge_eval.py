@@ -10,12 +10,14 @@ from typing import Any, Mapping
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GRPOConfig, SGLangConfig, load_expr_config, vLLMConfig
 from areal.dataset import get_custom_dataset
-from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
+from areal.engine import RemotevLLMEngine
 from areal.infra import LocalScheduler, RayScheduler, SlurmScheduler
 from areal.utils import logging, seeding
 from areal.utils.dataloader import create_dataloader
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.printing import tabulate_stats
+
+from jphrl.areal_sglang_compat import JPHRemoteSGLangEngine
 
 
 logger = logging.getLogger("JPHAReaLJointBridgeEval")
@@ -95,13 +97,15 @@ def _write_same_backend_scores(
         consumed_bridge_paths.add(bridge_path)
         request_id = str(bridge["request_id"])
         record: dict[str, object] = {
-            "schema_version": "jph.areal-same-backend-logprob.v2",
+            "schema_version": "jph.areal-same-backend-logprob.v3",
             "request_id": request_id,
             "bridge_record_sha256": bridge["record_sha256"],
             "trajectory_binding_sha256": binding_id,
             "scoring_origin": {
                 "api": "RolloutController.compute_logp",
+                "controller_api_version": "v1",
                 "lifecycle": "same-controller-after-wait-before-destroy",
+                "score_parser": "jph-tail-before-conversion-v1",
                 "backend": scoring_backend,
                 "engine_version_before_score": engine_version_before_score,
                 "engine_version_after_score": engine_version_after_score,
@@ -160,6 +164,8 @@ def _task_limit() -> int:
 
 def main(args: list[str]) -> None:
     config, _ = load_expr_config(args, GRPOConfig)
+    if config.rollout._version != "v1":
+        raise RuntimeError("JPH score compatibility adapter requires rollout API v1")
     bridge_dir = Path(os.environ["JPH_AREAL_JOINT_BRIDGE_DIR"]).resolve()
     logging.setup_file_logging(str(bridge_dir.parent / "areal-bridge-eval.log"))
 
@@ -191,7 +197,7 @@ def main(args: list[str]) -> None:
     config.rollout.max_head_offpolicyness = int(1e12)
 
     if rollout_alloc.backend == "sglang":
-        engine_cls = RemoteSGLangEngine
+        engine_cls = JPHRemoteSGLangEngine
         server_args = SGLangConfig.build_args(
             sglang_config=config.sglang,
             tp_size=rollout_alloc.parallel.tp_size,

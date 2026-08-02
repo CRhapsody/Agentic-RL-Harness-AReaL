@@ -11,6 +11,8 @@ import time
 
 SECRET_ENV = "JPH_AREAL_ADMIN_API_KEY"
 REPLACEMENT = b"<redacted-runtime-admin-key>"
+DEFAULT_AREAL_ADMIN_KEY = b"areal-admin-key"
+DEFAULT_REPLACEMENT = b"<redacted-default-admin-key>"
 TEXT_SUFFIXES = {".json", ".jsonl", ".log", ".txt", ".yaml", ".yml"}
 
 
@@ -34,13 +36,20 @@ def _redact(targets: list[Path], secret: bytes) -> int:
         for candidate in _candidates(target):
             if candidate.is_symlink() or not candidate.is_file():
                 continue
-            if candidate.suffix.lower() not in TEXT_SUFFIXES:
-                continue
             data = candidate.read_bytes()
-            if secret not in data:
+            if (
+                candidate.suffix.lower() not in TEXT_SUFFIXES
+                and b"\x00" in data[:8192]
+            ):
+                continue
+            updated = data.replace(secret, REPLACEMENT).replace(
+                DEFAULT_AREAL_ADMIN_KEY,
+                DEFAULT_REPLACEMENT,
+            )
+            if updated == data:
                 continue
             mode = candidate.stat().st_mode
-            candidate.write_bytes(data.replace(secret, REPLACEMENT))
+            candidate.write_bytes(updated)
             candidate.chmod(mode)
             changed += 1
     return changed
@@ -66,7 +75,8 @@ def main() -> int:
     secret = secret_value.encode("utf-8")
     deadline = time.monotonic() + args.watch_seconds
     while True:
-        if _redact(targets, secret) > 0:
+        _redact(targets, secret)
+        if args.watch_seconds == 0:
             return 0
         if time.monotonic() >= deadline:
             return 0
