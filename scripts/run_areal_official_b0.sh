@@ -10,6 +10,7 @@ AREAL_VENV="${JPH_ROOT}/venvs/areal-v2.0.0"
 EXPECTED_COMMIT="fee938eada49208a5aabdbc1095730a13076a349"
 MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/qwen2.5-1.5b-snapshot.json"
 DATASET_REPORT="${JPH_ROOT}/artifacts/bootstrap/gsm8k-snapshot.json"
+CUDA_TOOLKIT_ROOT="${JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6}"
 MIN_FREE_MEMORY_MIB="${JPH_B0_MIN_FREE_MEMORY_MIB:-73728}"
 MAX_USED_MEMORY_MIB="${JPH_B0_MAX_USED_MEMORY_MIB:-8192}"
 
@@ -30,7 +31,15 @@ if [[ ! -x "${AREAL_VENV}/bin/python" ]]; then
   echo "Missing ${AREAL_VENV}; bootstrap the pinned AReaL environment first" >&2
   exit 2
 fi
-export PATH="${AREAL_VENV}/bin:${PATH}"
+if [[ ! -x "${CUDA_TOOLKIT_ROOT}/bin/nvcc" ]]; then
+  echo "Missing CUDA compiler: ${CUDA_TOOLKIT_ROOT}/bin/nvcc" >&2
+  exit 2
+fi
+export CUDA_HOME="${CUDA_TOOLKIT_ROOT}"
+export CUDACXX="${CUDA_HOME}/bin/nvcc"
+export PATH="${AREAL_VENV}/bin:${CUDA_HOME}/bin:${PATH}"
+"${CUDACXX}" -std=c++20 -x cu -c /dev/null \
+  -o "${JPH_ROOT}/tmp/nvcc-b0-preflight.o"
 for REPORT in "${MODEL_REPORT}" "${DATASET_REPORT}"; do
   if [[ ! -f "${REPORT}" ]]; then
     echo "Missing pinned Hugging Face snapshot report: ${REPORT}" >&2
