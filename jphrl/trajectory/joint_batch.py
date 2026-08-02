@@ -9,6 +9,23 @@ from typing import Mapping, Sequence
 from .schema import EpisodeTrace, JointVersion
 
 
+class StaleJointVersionError(ValueError):
+    pass
+
+
+def require_lag_zero_admission(
+    trace: EpisodeTrace,
+    active_joint_version: JointVersion,
+) -> None:
+    """Reject a valid old trace when the synchronous updater requires lag=(0, 0)."""
+
+    trace.validate()
+    if trace.joint_version != active_joint_version:
+        raise StaleJointVersionError(
+            "trace behavior JointVersion differs from the lag-zero active version"
+        )
+
+
 @dataclass(frozen=True)
 class DecisionCredit:
     """An explicit advantage and provenance for one trainable decision."""
@@ -41,7 +58,8 @@ class PolicyTokenSample:
     token_id: int
     old_policy_logprob: float
     policy_loss_mask: int
-    policy_behavior_version: str
+    policy_release_id: str
+    inference_engine_version: int
     advantage: float
     credit_source: str
 
@@ -73,8 +91,8 @@ def _harness_logprob(sample: HarnessActionSample) -> float:
 
 
 @dataclass(frozen=True)
-class JointTrainingBatch:
-    """A frozen batch with distinct policy-token and Harness-action streams."""
+class JointDecisionBatch:
+    """A decision/credit sidecar with distinct policy-token and Harness streams."""
 
     joint_version: JointVersion
     episode_ids: tuple[str, ...]
@@ -101,8 +119,13 @@ class JointTrainingBatch:
                 raise ValueError("policy loss mask must be integer 0 or 1")
             if not math.isfinite(sample.old_policy_logprob) or sample.old_policy_logprob > 0.0:
                 raise ValueError("old policy log-prob must be finite and non-positive")
-            if sample.policy_behavior_version != self.joint_version.policy:
-                raise ValueError("policy sample behavior version differs from the batch")
+            if sample.policy_release_id != self.joint_version.policy:
+                raise ValueError("policy sample release ID differs from the batch")
+            if (
+                type(sample.inference_engine_version) is not int
+                or sample.inference_engine_version < 0
+            ):
+                raise ValueError("inference engine version must be a non-negative integer")
             DecisionCredit(sample.advantage, sample.credit_source).validate()
 
         harness_keys: set[tuple[str, str]] = set()
@@ -123,6 +146,11 @@ class JointTrainingBatch:
                 == len(sample.pre_mask_logits)
             ):
                 raise ValueError("Harness action schema lengths differ")
+            if len(set(sample.action_ids)) != len(sample.action_ids) or not all(
+                isinstance(action_id, str) and action_id
+                for action_id in sample.action_ids
+            ):
+                raise ValueError("Harness action IDs must be unique non-empty strings")
             if not all(type(value) is bool for value in sample.action_mask) or not any(
                 sample.action_mask
             ):
@@ -160,7 +188,7 @@ class JointTrainingBatch:
     def summary(self) -> dict[str, object]:
         self.validate()
         return {
-            "episodes": len(self.episode_ids),
+            "synthetic_traces": len(self.episode_ids),
             "policy_tokens": len(self.policy_tokens),
             "trainable_policy_tokens": sum(
                 sample.policy_loss_mask for sample in self.policy_tokens
@@ -169,7 +197,10 @@ class JointTrainingBatch:
             "trainable_harness_actions": sum(
                 sample.harness_loss_mask for sample in self.harness_actions
             ),
-            "policy_behavior_version": self.joint_version.policy,
+            "policy_release_id": self.joint_version.policy,
+            "inference_engine_versions": sorted(
+                {sample.inference_engine_version for sample in self.policy_tokens}
+            ),
             "harness_behavior_version": self.joint_version.harness_controller,
             "policy_credit_sources": sorted(
                 {sample.credit_source for sample in self.policy_tokens}
@@ -181,10 +212,12 @@ class JointTrainingBatch:
         }
 
 
-def build_joint_training_batch(
+def build_joint_decision_batch(
     traces: Sequence[EpisodeTrace],
     credits: Mapping[str, EpisodeCredit],
-) -> JointTrainingBatch:
+    *,
+    allow_open_fixtures: bool = False,
+) -> JointDecisionBatch:
     if not traces:
         raise ValueError("joint batch requires at least one trace")
     joint_version = traces[0].joint_version
@@ -194,6 +227,13 @@ def build_joint_training_batch(
 
     for trace in traces:
         trace.validate()
+        if not allow_open_fixtures and (
+            trace.reward is None
+            or trace.success is None
+            or not trace.valid
+            or not any(event.kind == "episode_ended" for event in trace.events)
+        ):
+            raise ValueError("training decision batch requires a closed valid episode")
         if trace.joint_version != joint_version:
             raise ValueError("batch contains more than one joint behavior version")
         if trace.episode_id in episode_ids:
@@ -219,6 +259,18 @@ def build_joint_training_batch(
                     raise ValueError("trainable model call has no policy credit")
                 credit = episode_credit.policy_calls[call_id]
                 credit.validate()
+                policy_release_id = event.payload.get("policy_release_id")
+                output_versions = event.payload.get("output_versions")
+                if policy_release_id != joint_version.policy:
+                    raise ValueError(
+                        "model response policy release differs from the pinned episode"
+                    )
+                if not isinstance(output_versions, list) or len(output_versions) != len(
+                    event.payload["output_token_ids"]
+                ):
+                    raise ValueError(
+                        "model response inference versions do not align with output tokens"
+                    )
                 for position, (token_id, old_logprob, loss_mask) in enumerate(
                     zip(
                         event.payload["output_token_ids"],
@@ -234,7 +286,8 @@ def build_joint_training_batch(
                             token_id=token_id,
                             old_policy_logprob=float(old_logprob),
                             policy_loss_mask=loss_mask,
-                            policy_behavior_version=joint_version.policy,
+                            policy_release_id=policy_release_id,
+                            inference_engine_version=output_versions[position],
                             advantage=float(credit.advantage),
                             credit_source=credit.source,
                         )
@@ -271,7 +324,7 @@ def build_joint_training_batch(
         if unknown_policy or unknown_harness:
             raise ValueError("credit assignment refers to an absent decision")
 
-    batch = JointTrainingBatch(
+    batch = JointDecisionBatch(
         joint_version=joint_version,
         episode_ids=tuple(episode_ids),
         policy_tokens=tuple(policy_samples),
@@ -279,3 +332,21 @@ def build_joint_training_batch(
     )
     batch.validate()
     return batch
+
+
+JointTrainingBatch = JointDecisionBatch
+
+
+def build_joint_training_batch(
+    traces: Sequence[EpisodeTrace],
+    credits: Mapping[str, EpisodeCredit],
+    *,
+    allow_open_fixtures: bool = False,
+) -> JointDecisionBatch:
+    """Compatibility alias for callers that have not adopted the sidecar name."""
+
+    return build_joint_decision_batch(
+        traces,
+        credits,
+        allow_open_fixtures=allow_open_fixtures,
+    )

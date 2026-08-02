@@ -30,7 +30,7 @@ echo "project_commit=${project_commit}"
 echo "run_root=${run_root}"
 
 "${python_bin}" -m jphrl.experiments.g1_integrity \
-  --episodes 1000 \
+  --version-fixtures 1000 \
   --work-dir "${run_root}/work" \
   --output "${run_root}/result.json" \
   --project-commit "${project_commit}"

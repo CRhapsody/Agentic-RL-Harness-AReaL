@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -27,14 +28,17 @@ from ..paths import require_within_configured_root
 from ..trajectory.joint_batch import (
     DecisionCredit,
     EpisodeCredit,
-    build_joint_training_batch,
+    JointDecisionBatch,
+    StaleJointVersionError,
+    build_joint_decision_batch,
+    require_lag_zero_admission,
 )
 from ..trajectory.schema import EpisodeTrace, JointVersion, TraceEvent
 
 
 EXPERIMENT_NAME = "g1-joint-integrity-v1"
-POLICY_CREDIT_SOURCE = "policy-token-verifier-advantage-v1"
-HARNESS_CREDIT_SOURCE = "harness-action-counterfactual-advantage-v1"
+POLICY_CREDIT_SOURCE = "synthetic-policy-credit-fixture-v1"
+HARNESS_CREDIT_SOURCE = "synthetic-harness-credit-fixture-v1"
 
 
 def _joint_version() -> JointVersion:
@@ -98,6 +102,8 @@ def build_contract_episode(
             "output_token_ids": [200 + index % 37, 300 + index % 41],
             "output_token_logprobs": [-0.25 - index % 5 * 0.01, -0.5],
             "completion_loss_mask": [1, index % 2],
+            "policy_release_id": joint_version.policy,
+            "output_versions": [0, 0],
             "policy_kind": "causal_lm-contract-fixture",
             "token_metadata_status": "available",
         },
@@ -137,7 +143,7 @@ def _component_version(
 
 def initial_checkpoint() -> JointCheckpoint:
     version = _joint_version()
-    policy = ComponentCheckpoint(
+    policy = ComponentCheckpoint.create(
         component="policy",
         version=version.policy,
         parameters=(0.125, -0.25),
@@ -146,7 +152,7 @@ def initial_checkpoint() -> JointCheckpoint:
         rng_state=101,
         sample_count=0,
     )
-    harness = ComponentCheckpoint(
+    harness = ComponentCheckpoint.create(
         component="harness",
         version=version.harness_controller,
         parameters=(0.375, -0.5),
@@ -159,6 +165,7 @@ def initial_checkpoint() -> JointCheckpoint:
         version, policy, harness, parent_release_id=None
     )
     return JointCheckpoint(
+        schema_version="jph.joint-checkpoint.v1",
         joint_version=version,
         active_release_id=active_release_id,
         macro_step=0,
@@ -169,34 +176,52 @@ def initial_checkpoint() -> JointCheckpoint:
     )
 
 
-def deterministic_joint_step(
+def update_checkpoint_from_batch(
     checkpoint: JointCheckpoint,
     *,
-    batch_digest: str,
-    episode_count: int,
+    batch: JointDecisionBatch,
 ) -> JointCheckpoint:
     checkpoint.validate()
-    digest_term = int(batch_digest[:8], 16)
-    rng_state = (
-        1103515245 * checkpoint.rng_state + 12345 + digest_term
-    ) % (2**31)
-    policy_rng_state = (
-        1103515245 * checkpoint.policy.rng_state + 12345 + digest_term
-    ) % (2**31)
-    harness_rng_state = (
-        1103515245 * checkpoint.harness.rng_state + 12345 + digest_term
-    ) % (2**31)
-    jitter = (
-        ((rng_state ^ policy_rng_state ^ harness_rng_state) % 2001) - 1000
-    ) / 1_000_000.0
-    policy_gradient = (0.2 + jitter, -0.1 - jitter)
-    harness_gradient = (-0.15 + jitter, 0.3 - jitter)
+    batch.validate()
+    if batch.joint_version != checkpoint.joint_version:
+        raise ValueError("decision batch behavior version differs from checkpoint")
+
+    policy_gradient_sum = [0.0, 0.0]
+    active_policy_tokens = 0
+    for sample in batch.policy_tokens:
+        if sample.policy_loss_mask == 0:
+            continue
+        features = (
+            ((sample.token_id % 17) - 8) / 8.0,
+            ((sample.output_position % 3) - 1) / 2.0,
+        )
+        for index, feature in enumerate(features):
+            policy_gradient_sum[index] += sample.advantage * feature
+        active_policy_tokens += 1
+
+    harness_gradient_sum = [0.0, 0.0]
+    active_harness_actions = 0
+    for sample in batch.harness_actions:
+        if sample.harness_loss_mask == 0:
+            continue
+        action_index = sample.action_ids.index(sample.action)
+        midpoint = (len(sample.action_ids) - 1) / 2.0
+        features = (
+            (action_index - midpoint) / len(sample.action_ids),
+            1.0 if action_index % 2 == 0 else -1.0,
+        )
+        for index, feature in enumerate(features):
+            harness_gradient_sum[index] += sample.advantage * feature
+        active_harness_actions += 1
 
     def update(
         component: ComponentCheckpoint,
-        gradient: tuple[float, ...],
-        next_rng_state: int,
+        gradient_sum: list[float],
+        active_count: int,
     ) -> ComponentCheckpoint:
+        if active_count == 0:
+            return component
+        gradient = tuple(value / active_count for value in gradient_sum)
         momentum = tuple(
             0.9 * old_momentum + gradient_value
             for old_momentum, gradient_value in zip(
@@ -208,18 +233,28 @@ def deterministic_joint_step(
             for value, momentum_value in zip(component.parameters, momentum)
         )
         step = component.optimizer_step + 1
-        return ComponentCheckpoint(
+        return ComponentCheckpoint.create(
             component=component.component,
             version=_component_version(component.component, step, parameters, momentum),
             parameters=parameters,
             optimizer_momentum=momentum,
             optimizer_step=step,
-            rng_state=next_rng_state,
-            sample_count=component.sample_count + 1,
+            rng_state=component.rng_state,
+            sample_count=component.sample_count,
         )
 
-    policy = update(checkpoint.policy, policy_gradient, policy_rng_state)
-    harness = update(checkpoint.harness, harness_gradient, harness_rng_state)
+    policy = update(
+        checkpoint.policy,
+        policy_gradient_sum,
+        active_policy_tokens,
+    )
+    harness = update(
+        checkpoint.harness,
+        harness_gradient_sum,
+        active_harness_actions,
+    )
+    if policy is checkpoint.policy and harness is checkpoint.harness:
+        return checkpoint
     joint_version = replace(
         checkpoint.joint_version,
         policy=policy.version,
@@ -232,13 +267,14 @@ def deterministic_joint_step(
         parent_release_id=checkpoint.active_release_id,
     )
     candidate = JointCheckpoint(
+        schema_version=checkpoint.schema_version,
         joint_version=joint_version,
         active_release_id=active_release_id,
         macro_step=checkpoint.macro_step + 1,
         policy=policy,
         harness=harness,
-        rng_state=rng_state,
-        rollout_cursor=checkpoint.rollout_cursor + episode_count,
+        rng_state=checkpoint.rng_state,
+        rollout_cursor=checkpoint.rollout_cursor + len(batch.episode_ids),
     )
     candidate.validate()
     return candidate
@@ -272,6 +308,209 @@ def next_step_evidence(
     payload = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
     evidence["digest"] = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return evidence
+
+
+def _run_update_interventions(
+    initial: JointCheckpoint,
+    batch: JointDecisionBatch,
+) -> dict[str, object]:
+    baseline = update_checkpoint_from_batch(initial, batch=batch)
+    policy_credit_batch = replace(
+        batch,
+        policy_tokens=tuple(
+            replace(sample, advantage=sample.advantage + 0.75)
+            if sample.policy_loss_mask == 1
+            else sample
+            for sample in batch.policy_tokens
+        ),
+    )
+    policy_credit_candidate = update_checkpoint_from_batch(
+        initial, batch=policy_credit_batch
+    )
+    harness_credit_batch = replace(
+        batch,
+        harness_actions=tuple(
+            replace(sample, advantage=sample.advantage - 0.625)
+            if sample.harness_loss_mask == 1
+            else sample
+            for sample in batch.harness_actions
+        ),
+    )
+    harness_credit_candidate = update_checkpoint_from_batch(
+        initial, batch=harness_credit_batch
+    )
+    masked_policy_batch = replace(
+        batch,
+        policy_tokens=tuple(
+            replace(
+                sample,
+                token_id=sample.token_id + 5000,
+                advantage=sample.advantage + 100.0,
+            )
+            if sample.policy_loss_mask == 0
+            else sample
+            for sample in batch.policy_tokens
+        ),
+    )
+    masked_policy_candidate = update_checkpoint_from_batch(
+        initial, batch=masked_policy_batch
+    )
+    masked_harness_batch = replace(
+        batch,
+        harness_actions=tuple(
+            replace(sample, advantage=sample.advantage - 100.0)
+            if sample.harness_loss_mask == 0
+            else sample
+            for sample in batch.harness_actions
+        ),
+    )
+    masked_harness_candidate = update_checkpoint_from_batch(
+        initial, batch=masked_harness_batch
+    )
+
+    checks = {
+        "policy_credit_changes_policy": (
+            policy_credit_candidate.policy != baseline.policy
+        ),
+        "policy_credit_leaves_harness_unchanged": (
+            policy_credit_candidate.harness == baseline.harness
+        ),
+        "harness_credit_changes_harness": (
+            harness_credit_candidate.harness != baseline.harness
+        ),
+        "harness_credit_leaves_policy_unchanged": (
+            harness_credit_candidate.policy == baseline.policy
+        ),
+        "masked_policy_perturbation_leaves_policy_unchanged": (
+            masked_policy_candidate.policy == baseline.policy
+        ),
+        "masked_policy_perturbation_leaves_harness_unchanged": (
+            masked_policy_candidate.harness == baseline.harness
+        ),
+        "masked_harness_perturbation_leaves_harness_unchanged": (
+            masked_harness_candidate.harness == baseline.harness
+        ),
+        "masked_harness_perturbation_leaves_policy_unchanged": (
+            masked_harness_candidate.policy == baseline.policy
+        ),
+    }
+    return {
+        "checks": checks,
+        "passed": all(checks.values()),
+        "baseline_policy_version": baseline.policy.version,
+        "baseline_harness_version": baseline.harness.version,
+    }
+
+
+def _run_negative_mutations(
+    trace: EpisodeTrace,
+    credit: EpisodeCredit,
+) -> dict[str, object]:
+    def rejected(name: str, operation: object) -> tuple[str, bool]:
+        try:
+            operation()
+        except (KeyError, TypeError, ValueError):
+            return name, True
+        return name, False
+
+    def mutate_event(kind: str, field: str, value: object) -> EpisodeTrace:
+        candidate = copy.deepcopy(trace)
+        event = next(event for event in candidate.events if event.kind == kind)
+        event.payload[field] = value
+        return candidate
+
+    model_event = next(event for event in trace.events if event.kind == "model_response")
+    harness_event = next(
+        event for event in trace.events if event.kind == "harness_decision"
+    )
+    crossed_credit = EpisodeCredit(
+        policy_calls={
+            harness_event.payload["decision_id"]: DecisionCredit(
+                1.0, "crossed-policy-target"
+            )
+        },
+        harness_decisions={
+            model_event.payload["model_call_id"]: DecisionCredit(
+                1.0, "crossed-harness-target"
+            )
+        },
+    )
+    mixed = copy.deepcopy(trace)
+    mixed.events[0] = replace(
+        mixed.events[0], joint_version_id="injected-half-version"
+    )
+
+    cases = dict(
+        (
+            rejected(
+                "policy_logprob_length",
+                lambda: mutate_event(
+                    "model_response", "output_token_logprobs", [-0.1]
+                ).validate(),
+            ),
+            rejected(
+                "policy_non_binary_mask",
+                lambda: mutate_event(
+                    "model_response", "completion_loss_mask", [1, 2]
+                ).validate(),
+            ),
+            rejected(
+                "policy_release_mismatch",
+                lambda: build_joint_decision_batch(
+                    [mutate_event("model_response", "policy_release_id", "wrong")],
+                    {trace.episode_id: credit},
+                    allow_open_fixtures=True,
+                ),
+            ),
+            rejected(
+                "inference_version_length",
+                lambda: build_joint_decision_batch(
+                    [mutate_event("model_response", "output_versions", [0])],
+                    {trace.episode_id: credit},
+                    allow_open_fixtures=True,
+                ),
+            ),
+            rejected(
+                "harness_chosen_action_masked",
+                lambda: mutate_event(
+                    "harness_decision", "action_mask", [False] * len(HarnessAction)
+                ).validate(),
+            ),
+            rejected(
+                "harness_logprob_mismatch",
+                lambda: mutate_event(
+                    "harness_decision", "old_harness_logprob", 0.0
+                ).validate(),
+            ),
+            rejected(
+                "harness_version_mismatch",
+                lambda: mutate_event(
+                    "harness_decision", "controller_version", "wrong"
+                ).validate(),
+            ),
+            rejected(
+                "crossed_credit_targets",
+                lambda: build_joint_decision_batch(
+                    [copy.deepcopy(trace)],
+                    {trace.episode_id: crossed_credit},
+                    allow_open_fixtures=True,
+                ),
+            ),
+            rejected("mixed_event_version", mixed.validate),
+            rejected(
+                "open_trace_in_production_builder",
+                lambda: build_joint_decision_batch(
+                    [copy.deepcopy(trace)], {trace.episode_id: credit}
+                ),
+            ),
+        )
+    )
+    return {
+        "cases": cases,
+        "rejected": sum(cases.values()),
+        "total": len(cases),
+        "passed": len(cases) == 10 and all(cases.values()),
+    }
 
 
 def _artifact(component: ComponentCheckpoint) -> CandidateArtifact:
@@ -549,10 +788,13 @@ def _run_version_schedule(root: Path, episodes: int) -> dict[str, object]:
             ended += 1
             if is_straddled:
                 straddled += 1
-                if trace.joint_version.version_id == current.joint_version.version_id:
+                try:
+                    require_lag_zero_admission(trace, current.joint_version)
                     stale_accepted_at_lag_0 += 1
-                else:
+                except StaleJointVersionError:
                     stale_discarded_at_lag_0 += 1
+            else:
+                require_lag_zero_admission(trace, current.joint_version)
             observed = store.read_active()
             if observed is None:
                 unresolved_manifest_reads += 1
@@ -576,9 +818,10 @@ def _run_version_schedule(root: Path, episodes: int) -> dict[str, object]:
         )
     )
     return {
-        "episodes_started": started,
-        "episodes_ended": ended,
-        "internally_valid": internally_valid,
+        "fixture_kind": "deterministic-synthetic-version-trace",
+        "synthetic_fixtures_started": started,
+        "synthetic_fixtures_ended": ended,
+        "synthetic_fixtures_internally_valid": internally_valid,
         "joint_publishes": publish_count,
         "straddled_publish": straddled,
         "mixed_version_episodes": mixed_version_episodes,
@@ -622,14 +865,14 @@ def _run_tabular_harness_restore() -> dict[str, object]:
 
 def run_experiment(
     *,
-    episodes: int,
+    version_fixtures: int,
     work_dir: str | Path,
     output: str | Path,
     project_commit: str = "unrecorded-local",
 ) -> dict[str, object]:
-    if episodes < 1000 or episodes % 10 != 0:
+    if version_fixtures < 1000 or version_fixtures % 10 != 0:
         raise ValueError(
-            "G1 integrity experiment requires at least 1000 episodes divisible by 10"
+            "G1 integrity experiment requires at least 1000 version fixtures divisible by 10"
         )
     work = require_within_configured_root(work_dir)
     destination = require_within_configured_root(output)
@@ -645,8 +888,15 @@ def run_experiment(
         trace, episode_credit = build_contract_episode(index, version)
         traces.append(trace)
         credits[trace.episode_id] = episode_credit
-    batch = build_joint_training_batch(traces, credits)
+    batch = build_joint_decision_batch(
+        traces,
+        credits,
+        allow_open_fixtures=True,
+    )
     summary = batch.summary()
+    negative_mutations = _run_negative_mutations(
+        traces[0], credits[traces[0].episode_id]
+    )
 
     injected_events = list(traces[0].events)
     injected_events[0] = replace(
@@ -667,28 +917,45 @@ def run_experiment(
         injected_mixed_version_rejected = "mixed-version" in str(exc)
 
     initial = initial_checkpoint()
+    checkpoint_store = JointReleaseStore(work / "checkpoint-release-store")
+    initial_release = checkpoint_store.publish(
+        joint_version=initial.joint_version,
+        policy=_artifact(initial.policy),
+        harness=_artifact(initial.harness),
+        expected_active_release_id=None,
+    )
+    if initial_release.release_id != initial.active_release_id:
+        raise AssertionError("initial checkpoint release prediction differs from the store")
+    checkpoint_store.validate_checkpoint(initial)
     checkpoint_path = work / "checkpoint-step-000000.json"
     write_joint_checkpoint(checkpoint_path, initial)
-    continuous_next = deterministic_joint_step(
-        initial, batch_digest=batch.digest, episode_count=episodes
-    )
     restored = read_joint_checkpoint(checkpoint_path)
+    checkpoint_store.validate_checkpoint(restored)
+    continuous_next = update_checkpoint_from_batch(initial, batch=batch)
     continuous_evidence = next_step_evidence(initial, batch_digest=batch.digest)
     restored_evidence = next_step_evidence(restored, batch_digest=batch.digest)
-    restored_next = deterministic_joint_step(
-        restored, batch_digest=batch.digest, episode_count=episodes
-    )
+    restored_next = update_checkpoint_from_batch(restored, batch=batch)
     checkpoint_replay_equal = continuous_next.to_dict() == restored_next.to_dict()
     next_action_equal = continuous_evidence == restored_evidence
+    candidate_release = checkpoint_store.publish(
+        joint_version=continuous_next.joint_version,
+        policy=_artifact(continuous_next.policy),
+        harness=_artifact(continuous_next.harness),
+        expected_active_release_id=initial_release.release_id,
+    )
+    if candidate_release.release_id != continuous_next.active_release_id:
+        raise AssertionError("candidate checkpoint release prediction differs from the store")
+    checkpoint_store.validate_checkpoint(continuous_next)
     write_joint_checkpoint(work / "checkpoint-step-000001.json", continuous_next)
 
     publish_matrix = _run_publish_fault_matrix(work, initial, continuous_next)
-    version_schedule = _run_version_schedule(work, episodes)
+    version_schedule = _run_version_schedule(work, version_fixtures)
     tabular_harness_restore = _run_tabular_harness_restore()
+    update_interventions = _run_update_interventions(initial, batch)
     credit_sources_disjoint = set(summary["policy_credit_sources"]).isdisjoint(
         summary["harness_credit_sources"]
     )
-    all_credits_distinct = all(
+    fixture_advantages_distinct = all(
         credits[trace.episode_id].policy_calls[
             f"{trace.episode_id}:model:0"
         ].advantage
@@ -701,7 +968,8 @@ def run_experiment(
         (
             injected_mixed_version_rejected,
             credit_sources_disjoint,
-            all_credits_distinct,
+            update_interventions["passed"],
+            negative_mutations["passed"],
             checkpoint_replay_equal,
             next_action_equal,
             publish_matrix["passed"],
@@ -716,8 +984,9 @@ def run_experiment(
         "project_commit": project_commit,
         "python_version": sys.version.split()[0],
         "claim_boundary": (
-            "CPU control-plane integrity gate; it does not perform an AReaL policy "
-            "update or claim policy/Harness joint learning"
+            "Deterministic synthetic CPU control-plane fixtures, a local POSIX "
+            "commit-point crash matrix, and toy one-step replay. This run does not "
+            "perform an AReaL policy update or claim policy/Harness joint learning."
         ),
         "updates": {
             "areal_policy_update": False,
@@ -730,7 +999,9 @@ def run_experiment(
             "policy_source": POLICY_CREDIT_SOURCE,
             "harness_source": HARNESS_CREDIT_SOURCE,
             "sources_disjoint": credit_sources_disjoint,
-            "per_episode_advantages_distinct": all_credits_distinct,
+            "fixture_advantages_distinct": fixture_advantages_distinct,
+            "update_interventions": update_interventions,
+            "negative_mutations": negative_mutations,
         },
         "mixed_version": {
             **version_schedule,
@@ -740,6 +1011,7 @@ def run_experiment(
             "initial_digest": initial.digest,
             "initial_active_release_id": initial.active_release_id,
             "candidate_active_release_id": continuous_next.active_release_id,
+            "active_release_store_validation": True,
             "continuous_next_digest": continuous_next.digest,
             "restored_next_digest": restored_next.digest,
             "next_step_equal": checkpoint_replay_equal,
@@ -775,7 +1047,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the G1 joint trajectory, publish, and recovery integrity gate"
     )
-    parser.add_argument("--episodes", type=int, default=1000)
+    parser.add_argument(
+        "--version-fixtures",
+        "--episodes",
+        dest="version_fixtures",
+        type=int,
+        default=1000,
+    )
     parser.add_argument("--work-dir")
     parser.add_argument("--output")
     parser.add_argument("--publish-worker-config")
@@ -790,7 +1068,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.work_dir or not args.output:
         raise ValueError("--work-dir and --output are required for the main experiment")
     payload = run_experiment(
-        episodes=args.episodes,
+        version_fixtures=args.version_fixtures,
         work_dir=args.work_dir,
         output=args.output,
         project_commit=args.project_commit,

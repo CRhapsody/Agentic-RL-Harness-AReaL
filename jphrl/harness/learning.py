@@ -66,6 +66,7 @@ class HarnessUpdateStats:
     behavior_version: str
     candidate_version: str
     batch_size: int
+    effective_batch_size: int
     mean_advantage: float
     parameter_delta_l2: float
 
@@ -181,6 +182,7 @@ class TabularHarnessController:
 
         gradients: dict[str, list[float]] = {}
         advantage_sum = 0.0
+        effective_batch_size = 0
         for experience in experiences:
             decision = experience.decision
             if decision.controller_version != self.version:
@@ -210,6 +212,10 @@ class TabularHarnessController:
                 abs_tol=1e-12,
             ):
                 raise ValueError("recorded old log-prob differs from behavior snapshot")
+            if type(decision.harness_loss_mask) is not int or decision.harness_loss_mask not in (0, 1):
+                raise ValueError("Harness loss mask must be integer 0 or 1")
+            if decision.harness_loss_mask == 0:
+                continue
 
             state_gradient = gradients.setdefault(
                 state_key, [0.0] * len(_ACTION_IDS)
@@ -224,8 +230,19 @@ class TabularHarnessController:
                         indicator - probability
                     )
             advantage_sum += experience.advantage
+            effective_batch_size += 1
 
-        scale = learning_rate / len(experiences)
+        if effective_batch_size == 0:
+            return self, HarnessUpdateStats(
+                behavior_version=self.version,
+                candidate_version=self.version,
+                batch_size=len(experiences),
+                effective_batch_size=0,
+                mean_advantage=0.0,
+                parameter_delta_l2=0.0,
+            )
+
+        scale = learning_rate / effective_batch_size
         new_logits_by_state = dict(self._logits_by_state)
         squared_delta_sum = 0.0
         for state_key, gradient in gradients.items():
@@ -253,7 +270,8 @@ class TabularHarnessController:
             behavior_version=self.version,
             candidate_version=candidate.version,
             batch_size=len(experiences),
-            mean_advantage=advantage_sum / len(experiences),
+            effective_batch_size=effective_batch_size,
+            mean_advantage=advantage_sum / effective_batch_size,
             parameter_delta_l2=math.sqrt(squared_delta_sum),
         )
         return candidate, stats

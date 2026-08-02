@@ -65,6 +65,16 @@ def _response_contract_error(response: ModelResponse, trace: EpisodeTrace) -> st
         )
     except ValueError as exc:
         return str(exc)
+    if response.token_metadata_status == "available":
+        if len(response.output_versions) != len(response.output_token_ids):
+            return "output inference versions do not align with output tokens"
+        if not all(
+            type(version) is int and version >= 0
+            for version in response.output_versions
+        ):
+            return "output inference versions must be non-negative integers"
+    elif response.output_versions:
+        return "scripted policy must not fabricate output inference versions"
     return None
 
 
@@ -142,7 +152,9 @@ def _request_model(
             "input_token_ids": response.input_token_ids,
             "output_token_ids": response.output_token_ids,
             "output_token_logprobs": response.output_token_logprobs,
+            "output_versions": response.output_versions,
             "completion_loss_mask": response.completion_loss_mask,
+            "policy_release_id": response.policy_version,
             "policy_kind": response.policy_kind,
             "token_metadata_status": response.token_metadata_status,
         },

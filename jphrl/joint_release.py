@@ -62,6 +62,61 @@ class ComponentCheckpoint:
     optimizer_step: int
     rng_state: int
     sample_count: int
+    state_sha256: str
+
+    @staticmethod
+    def compute_state_sha256(
+        *,
+        component: str,
+        version: str,
+        parameters: tuple[float, ...],
+        optimizer_momentum: tuple[float, ...],
+        optimizer_step: int,
+        rng_state: int,
+        sample_count: int,
+    ) -> str:
+        return _sha256(
+            {
+                "component": component,
+                "version": version,
+                "parameters": parameters,
+                "optimizer_momentum": optimizer_momentum,
+                "optimizer_step": optimizer_step,
+                "rng_state": rng_state,
+                "sample_count": sample_count,
+            }
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        component: str,
+        version: str,
+        parameters: tuple[float, ...],
+        optimizer_momentum: tuple[float, ...],
+        optimizer_step: int,
+        rng_state: int,
+        sample_count: int,
+    ) -> ComponentCheckpoint:
+        return cls(
+            component=component,
+            version=version,
+            parameters=parameters,
+            optimizer_momentum=optimizer_momentum,
+            optimizer_step=optimizer_step,
+            rng_state=rng_state,
+            sample_count=sample_count,
+            state_sha256=cls.compute_state_sha256(
+                component=component,
+                version=version,
+                parameters=parameters,
+                optimizer_momentum=optimizer_momentum,
+                optimizer_step=optimizer_step,
+                rng_state=rng_state,
+                sample_count=sample_count,
+            ),
+        )
 
     def validate(self) -> None:
         if self.component not in {"policy", "harness"}:
@@ -78,6 +133,17 @@ class ComponentCheckpoint:
             raise ValueError("component RNG state must be a 31-bit non-negative integer")
         if type(self.sample_count) is not int or self.sample_count < 0:
             raise ValueError("component sample count must be a non-negative integer")
+        expected_state_sha256 = self.compute_state_sha256(
+            component=self.component,
+            version=self.version,
+            parameters=self.parameters,
+            optimizer_momentum=self.optimizer_momentum,
+            optimizer_step=self.optimizer_step,
+            rng_state=self.rng_state,
+            sample_count=self.sample_count,
+        )
+        if self.state_sha256 != expected_state_sha256:
+            raise ValueError("component checkpoint state hash does not match its contents")
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -95,6 +161,7 @@ class ComponentCheckpoint:
             optimizer_step=int(payload["optimizer_step"]),
             rng_state=int(payload["rng_state"]),
             sample_count=int(payload["sample_count"]),
+            state_sha256=str(payload["state_sha256"]),
         )
         checkpoint.validate()
         return checkpoint
@@ -102,6 +169,7 @@ class ComponentCheckpoint:
 
 @dataclass(frozen=True)
 class JointCheckpoint:
+    schema_version: str
     joint_version: JointVersion
     active_release_id: str
     macro_step: int
@@ -111,6 +179,8 @@ class JointCheckpoint:
     rollout_cursor: int
 
     def validate(self) -> None:
+        if self.schema_version != "jph.joint-checkpoint.v1":
+            raise ValueError("joint checkpoint schema version differs")
         self.policy.validate()
         self.harness.validate()
         if not isinstance(self.active_release_id, str) or not self.active_release_id:
@@ -123,10 +193,14 @@ class JointCheckpoint:
             raise ValueError("Harness checkpoint version differs from JointVersion")
         if type(self.macro_step) is not int or self.macro_step < 0:
             raise ValueError("macro step must be a non-negative integer")
-        if self.policy.optimizer_step != self.macro_step:
-            raise ValueError("policy optimizer step differs from joint macro step")
-        if self.harness.optimizer_step != self.macro_step:
-            raise ValueError("Harness optimizer step differs from joint macro step")
+        component_steps = (
+            self.policy.optimizer_step,
+            self.harness.optimizer_step,
+        )
+        if any(step > self.macro_step for step in component_steps):
+            raise ValueError("component optimizer step exceeds joint macro step")
+        if max(component_steps) != self.macro_step:
+            raise ValueError("joint macro step has no corresponding component update")
         if type(self.rng_state) is not int or not 0 <= self.rng_state < 2**31:
             raise ValueError("RNG state must be a 31-bit non-negative integer")
         if type(self.rollout_cursor) is not int or self.rollout_cursor < 0:
@@ -136,6 +210,7 @@ class JointCheckpoint:
         self.validate()
         return {
             "joint_version": asdict(self.joint_version),
+            "schema_version": self.schema_version,
             "active_release_id": self.active_release_id,
             "macro_step": self.macro_step,
             "policy": self.policy.to_dict(),
@@ -154,6 +229,7 @@ class JointCheckpoint:
         if not isinstance(version_payload, Mapping):
             raise ValueError("joint_version must be an object")
         checkpoint = cls(
+            schema_version=str(payload["schema_version"]),
             joint_version=JointVersion(**version_payload),
             active_release_id=str(payload["active_release_id"]),
             macro_step=int(payload["macro_step"]),
@@ -168,12 +244,28 @@ class JointCheckpoint:
 
 def write_joint_checkpoint(path: str | Path, checkpoint: JointCheckpoint) -> None:
     checkpoint.validate()
-    _write_atomic_json(Path(path).expanduser().resolve(), checkpoint.to_dict())
+    _write_atomic_json(
+        Path(path).expanduser().resolve(),
+        {
+            "envelope_schema": "jph.joint-checkpoint-envelope.v1",
+            "checkpoint": checkpoint.to_dict(),
+            "checkpoint_sha256": checkpoint.digest,
+        },
+    )
 
 
 def read_joint_checkpoint(path: str | Path) -> JointCheckpoint:
     source = require_within_configured_root(path)
-    return JointCheckpoint.from_dict(_read_json(source))
+    envelope = _read_json(source)
+    if envelope.get("envelope_schema") != "jph.joint-checkpoint-envelope.v1":
+        raise ValueError("joint checkpoint envelope schema differs")
+    checkpoint_payload = envelope.get("checkpoint")
+    if not isinstance(checkpoint_payload, Mapping):
+        raise ValueError("joint checkpoint envelope has no checkpoint object")
+    checkpoint = JointCheckpoint.from_dict(checkpoint_payload)
+    if envelope.get("checkpoint_sha256") != checkpoint.digest:
+        raise ValueError("joint checkpoint digest does not match its contents")
+    return checkpoint
 
 
 @dataclass(frozen=True)
@@ -339,6 +431,23 @@ class JointReleaseStore:
         manifest = ReleaseManifest.from_dict(_read_json(self.active_path))
         self._validate_manifest_objects(manifest)
         return manifest
+
+    def validate_checkpoint(self, checkpoint: JointCheckpoint) -> ReleaseManifest:
+        checkpoint.validate()
+        active = self.read_active()
+        if active is None:
+            raise ValueError("checkpoint release store has no active manifest")
+        if active.release_id != checkpoint.active_release_id:
+            raise ValueError("checkpoint active release ID differs from the store")
+        if active.joint_version != checkpoint.joint_version:
+            raise ValueError("checkpoint JointVersion differs from the active manifest")
+        policy = self._read_object(active.policy_object, "policy")
+        harness = self._read_object(active.harness_object, "harness")
+        if _canonical_json(policy.payload) != _canonical_json(checkpoint.policy.to_dict()):
+            raise ValueError("checkpoint policy state differs from the active object")
+        if _canonical_json(harness.payload) != _canonical_json(checkpoint.harness.to_dict()):
+            raise ValueError("checkpoint Harness state differs from the active object")
+        return active
 
     def publish(
         self,

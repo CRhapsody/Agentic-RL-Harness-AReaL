@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 import unittest
 
 from jphrl.harness.controller import HarnessState
@@ -89,6 +90,19 @@ class HarnessLearningTests(unittest.TestCase):
                         [HarnessExperience(state, decision, advantage=1.0)],
                         learning_rate=learning_rate,
                     )
+
+    def test_zero_harness_loss_mask_has_no_update_effect(self) -> None:
+        controller = TabularHarnessController(seed=23)
+        state = state_for("masked")
+        decision = replace(controller.choose(state), harness_loss_mask=0)
+        candidate, stats = controller.updated(
+            [HarnessExperience(state, decision, advantage=10.0)],
+            learning_rate=0.4,
+        )
+        self.assertIs(candidate, controller)
+        self.assertEqual(stats.behavior_version, stats.candidate_version)
+        self.assertEqual(stats.effective_batch_size, 0)
+        self.assertEqual(stats.parameter_delta_l2, 0.0)
 
 
 if __name__ == "__main__":

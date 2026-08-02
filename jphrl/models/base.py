@@ -10,6 +10,7 @@ class ModelResponse:
     input_token_ids: list[int]
     output_token_ids: list[int]
     output_token_logprobs: list[float]
+    output_versions: list[int]
     completion_loss_mask: list[int]
     policy_version: str
     tokenizer_version: str
@@ -56,6 +57,7 @@ class MockStructuredModel:
             input_token_ids=[],
             output_token_ids=[],
             output_token_logprobs=[],
+            output_versions=[],
             completion_loss_mask=[],
             policy_version=self.policy_version,
             tokenizer_version=self.tokenizer_version,

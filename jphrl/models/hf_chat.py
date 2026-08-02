@@ -94,6 +94,7 @@ class HuggingFaceChatModel:
             input_token_ids=input_ids[0].tolist(),
             output_token_ids=output_ids,
             output_token_logprobs=output_logprobs,
+            output_versions=[0] * len(output_ids),
             completion_loss_mask=[1] * len(output_ids),
             policy_version=self.policy_version,
             tokenizer_version=self.tokenizer_version,

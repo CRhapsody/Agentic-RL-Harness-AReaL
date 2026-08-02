@@ -66,7 +66,7 @@ def verify(result_path: str | Path, audit_path: str | Path) -> dict[str, object]
 
     batch = payload["batch"]
     if not (
-        batch["episodes"] == 32
+        batch["synthetic_traces"] == 32
         and batch["policy_tokens"] == 64
         and batch["trainable_policy_tokens"] == 48
         and batch["harness_actions"] == 32
@@ -76,9 +76,9 @@ def verify(result_path: str | Path, audit_path: str | Path) -> dict[str, object]
 
     version = payload["mixed_version"]
     expected_version_metrics = {
-        "episodes_started": 1000,
-        "episodes_ended": 1000,
-        "internally_valid": 1000,
+        "synthetic_fixtures_started": 1000,
+        "synthetic_fixtures_ended": 1000,
+        "synthetic_fixtures_internally_valid": 1000,
         "joint_publishes": 10,
         "straddled_publish": 100,
         "mixed_version_episodes": 0,
@@ -91,6 +91,18 @@ def verify(result_path: str | Path, audit_path: str | Path) -> dict[str, object]
         raise ValueError("G1 version schedule metrics differ from the frozen contract")
     if version.get("negative_control_rejected") is not True:
         raise ValueError("mixed-version negative control was not rejected")
+    if version.get("fixture_kind") != "deterministic-synthetic-version-trace":
+        raise ValueError("G1 version evidence is not labeled as synthetic fixtures")
+
+    separation = payload["credit_separation"]
+    if not (
+        separation["policy_source"] == "synthetic-policy-credit-fixture-v1"
+        and separation["harness_source"] == "synthetic-harness-credit-fixture-v1"
+        and separation["update_interventions"]["passed"] is True
+        and separation["negative_mutations"]["passed"] is True
+        and separation["negative_mutations"]["rejected"] == 10
+    ):
+        raise ValueError("two-stream update intervention checks did not pass")
 
     cases = payload["atomic_publish"]["cases"]
     if len(cases) != 6 or not all(case.get("passed") is True for case in cases):
@@ -113,6 +125,7 @@ def verify(result_path: str | Path, audit_path: str | Path) -> dict[str, object]
         and checkpoint["next_step_equal"] is True
         and checkpoint["next_action_equal"] is True
         and checkpoint["tabular_harness"]["exact_next_decision"] is True
+        and checkpoint["active_release_store_validation"] is True
     ):
         raise ValueError("checkpoint restore did not reproduce the next joint step")
 

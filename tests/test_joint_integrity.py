@@ -21,7 +21,7 @@ from jphrl.joint_release import (
 from jphrl.trajectory.joint_batch import (
     DecisionCredit,
     EpisodeCredit,
-    build_joint_training_batch,
+    build_joint_decision_batch,
 )
 from scripts.verify_g1_integrity import verify
 
@@ -43,14 +43,18 @@ class JointIntegrityTests(unittest.TestCase):
     def test_policy_and_harness_streams_are_separate(self) -> None:
         checkpoint = initial_checkpoint()
         trace, credits = build_contract_episode(1, checkpoint.joint_version)
-        batch = build_joint_training_batch([trace], {trace.episode_id: credits})
+        batch = build_joint_decision_batch(
+            [trace],
+            {trace.episode_id: credits},
+            allow_open_fixtures=True,
+        )
 
         self.assertEqual(len(batch.policy_tokens), 2)
         self.assertEqual(len(batch.harness_actions), 1)
         self.assertEqual(batch.policy_tokens[0].policy_loss_mask, 1)
         self.assertEqual(batch.harness_actions[0].harness_loss_mask, 1)
         self.assertEqual(
-            batch.policy_tokens[0].policy_behavior_version,
+            batch.policy_tokens[0].policy_release_id,
             checkpoint.joint_version.policy,
         )
         self.assertEqual(
@@ -61,6 +65,16 @@ class JointIntegrityTests(unittest.TestCase):
             batch.policy_tokens[0].credit_source,
             batch.harness_actions[0].credit_source,
         )
+        self.assertEqual(batch.policy_tokens[0].inference_engine_version, 0)
+
+    def test_open_fixture_is_rejected_by_production_batch_builder(self) -> None:
+        checkpoint = initial_checkpoint()
+        trace, credits = build_contract_episode(1, checkpoint.joint_version)
+        with self.assertRaisesRegex(ValueError, "closed valid episode"):
+            build_joint_decision_batch(
+                [trace],
+                {trace.episode_id: credits},
+            )
 
     def test_crossed_credit_targets_fail_closed(self) -> None:
         checkpoint = initial_checkpoint()
@@ -75,7 +89,11 @@ class JointIntegrityTests(unittest.TestCase):
             },
         )
         with self.assertRaisesRegex(ValueError, "no Harness credit"):
-            build_joint_training_batch([trace], {episode_id: crossed})
+            build_joint_decision_batch(
+                [trace],
+                {episode_id: crossed},
+                allow_open_fixtures=True,
+            )
 
     def test_batch_rejects_multiple_behavior_versions(self) -> None:
         checkpoint = initial_checkpoint()
@@ -87,12 +105,13 @@ class JointIntegrityTests(unittest.TestCase):
         )
         second, second_credit = build_contract_episode(4, second_version)
         with self.assertRaisesRegex(ValueError, "more than one joint behavior version"):
-            build_joint_training_batch(
+            build_joint_decision_batch(
                 [first, second],
                 {
                     first.episode_id: first_credit,
                     second.episode_id: second_credit,
                 },
+                allow_open_fixtures=True,
             )
 
     def test_frozen_and_trainable_harness_masks_differ(self) -> None:
@@ -118,6 +137,12 @@ class JointIntegrityTests(unittest.TestCase):
             checkpoint_path = root / "checkpoint.json"
             write_joint_checkpoint(checkpoint_path, checkpoint)
             self.assertEqual(read_joint_checkpoint(checkpoint_path), checkpoint)
+            corrupted_path = root / "corrupted-checkpoint.json"
+            corrupted = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            corrupted["checkpoint"]["policy"]["parameters"][0] = 999.0
+            corrupted_path.write_text(json.dumps(corrupted), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "state hash|digest"):
+                read_joint_checkpoint(corrupted_path)
 
             store = JointReleaseStore(root / "release")
             policy = CandidateArtifact(
@@ -145,7 +170,7 @@ class JointIntegrityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result = run_experiment(
-                episodes=1000,
+                version_fixtures=1000,
                 work_dir=root / "work",
                 output=root / "result.json",
             )
@@ -153,12 +178,18 @@ class JointIntegrityTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertTrue(audit["passed"])
         self.assertEqual(result["mixed_version"]["mixed_version_episodes"], 0)
+        self.assertEqual(
+            result["mixed_version"]["synthetic_fixtures_ended"], 1000
+        )
         self.assertEqual(result["mixed_version"]["straddled_publish"], 100)
         self.assertEqual(result["mixed_version"]["stale_accepted_at_lag_0"], 0)
         self.assertEqual(len(result["atomic_publish"]["cases"]), 6)
         self.assertTrue(result["checkpoint_replay"]["next_step_equal"])
         self.assertTrue(
             result["checkpoint_replay"]["tabular_harness"]["exact_next_decision"]
+        )
+        self.assertTrue(
+            result["credit_separation"]["update_interventions"]["passed"]
         )
 
 
