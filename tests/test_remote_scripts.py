@@ -31,6 +31,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn('export UV_PYTHON_INSTALL_DIR="${JPH_ROOT}/runtime/python"', text)
         self.assertIn('export UV_PYTHON_BIN_DIR="${JPH_ROOT}/bin"', text)
         self.assertIn('export UV_PYTHON_PREFERENCE="only-managed"', text)
+        self.assertIn('export AREAL_CACHE_DIR="${JPH_ROOT}/cache/areal"', text)
         self.assertNotIn("UV_MANAGED_PYTHON", text)
         self.assertNotIn("UV_DEFAULT_INDEX", text)
 

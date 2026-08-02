@@ -33,6 +33,7 @@ export TMP="${TMPDIR}"
 export TEMP="${TMPDIR}"
 export TRITON_CACHE_DIR="${JPH_ROOT}/cache/triton"
 export CUDA_CACHE_PATH="${JPH_ROOT}/cache/cuda"
+export AREAL_CACHE_DIR="${JPH_ROOT}/cache/areal"
 export SGLANG_CACHE_DIR="${JPH_ROOT}/cache/sglang"
 export VLLM_CACHE_ROOT="${JPH_ROOT}/cache/vllm"
 export FLASHINFER_WORKSPACE_BASE="${JPH_ROOT}/cache/flashinfer"
@@ -75,6 +76,7 @@ mkdir -p \
   "${TMPDIR}" \
   "${TRITON_CACHE_DIR}" \
   "${CUDA_CACHE_PATH}" \
+  "${AREAL_CACHE_DIR}" \
   "${SGLANG_CACHE_DIR}" \
   "${VLLM_CACHE_ROOT}" \
   "${FLASHINFER_WORKSPACE_BASE}" \
