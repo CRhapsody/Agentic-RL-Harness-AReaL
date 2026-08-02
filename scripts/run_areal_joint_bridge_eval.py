@@ -98,7 +98,7 @@ def _write_same_backend_scores(
         consumed_bridge_paths.add(bridge_path)
         request_id = str(bridge["request_id"])
         record: dict[str, object] = {
-            "schema_version": "jph.areal-same-backend-logprob.v4",
+            "schema_version": "jph.areal-same-backend-logprob.v5",
             "request_id": request_id,
             "bridge_record_sha256": bridge["record_sha256"],
             "trajectory_binding_sha256": binding_id,
@@ -107,6 +107,7 @@ def _write_same_backend_scores(
                 "controller_api_version": "v1",
                 "lifecycle": "same-controller-after-wait-before-destroy",
                 "score_parser": "jph-tail-before-conversion-v1",
+                "score_token_id_validation": "exact-requested-tail-v1",
                 "transport_localization": "RTensor.localize-before-score-and-write-v1",
                 "backend": scoring_backend,
                 "engine_version_before_score": engine_version_before_score,
