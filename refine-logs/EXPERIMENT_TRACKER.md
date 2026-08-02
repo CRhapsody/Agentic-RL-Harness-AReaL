@@ -122,3 +122,4 @@ decision:
 | 2026-08-02 | JPH-M0-GITHUB-001 | `Could not resolve host` | `resolvectl status` 所有 link `Current Scopes: none` | infra | 使用不改系统状态的临时反向 SOCKS；认证仍需设备确认 |
 | 2026-08-02 | JPH-B0-OFFICIAL-001 | `UV_MANAGED_PYTHON` cannot be used with `--python-preference` | uv 0.11.26 在 Python 下载前拒绝互斥环境开关 | infra/config | 删除冗余 `UV_MANAGED_PYTHON=1`，保留 `UV_PYTHON_PREFERENCE=only-managed`；加回归测试后从同一 bootstrap 继续 |
 | 2026-08-02 | JPH-B0-OFFICIAL-001 | lockfile needs update under `--locked` | 脚本用清华 `--default-index` 改变了官方 lock 中的来源 URL；去掉覆盖后 `uv lock --check` 1ms 通过 | infra/config | AReaL exact sync 保留官方 index/哈希并走 HTTPS 代理；普通 pip smoke 仍可用清华镜像 |
+| 2026-08-02 | JPH-B0-OFFICIAL-001 | `nvidia-nccl-cu12` 下载重试后超时 | SSH 反向 HTTP 隧道随交互连接中断；其余约 8.8GB uv cache 已保留 | infra/network | 代理与 bootstrap 分别放入目标根目录 socket 的 tmux session；代理只监听 loopback 且只允许 CONNECT 443 |
