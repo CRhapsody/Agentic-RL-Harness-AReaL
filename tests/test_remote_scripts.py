@@ -41,6 +41,8 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("ArealJointBridgeWorkflow", runner)
         self.assertIn("controller.wait(submitted, timeout=900.0)", runner)
         self.assertIn("controller.compute_logp(results)", runner)
+        self.assertIn("engine_version_before_score = controller.get_version()", runner)
+        self.assertIn("engine_version_after_score = controller.get_version()", runner)
         self.assertIn("JPH_AREAL_SAME_BACKEND_SCORE_DIR", launcher + runner)
         self.assertIn("same-backend-score-", runner)
         self.assertIn("recompute_behavior_logprobs", verifier)

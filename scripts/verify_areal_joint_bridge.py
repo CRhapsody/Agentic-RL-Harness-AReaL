@@ -22,26 +22,20 @@ SENSITIVE_KEY_PARTS = (
     "secret_key",
     "session_api_key",
 )
-SAME_BACKEND_SCHEMA_VERSION = "jph.areal-same-backend-logprob.v1"
+SAME_BACKEND_SCHEMA_VERSION = "jph.areal-same-backend-logprob.v2"
 MAX_SAME_BACKEND_MEAN_IMPORTANCE_RATIO_ERROR = 0.02
 MAX_SAME_BACKEND_IMPORTANCE_RATIO_ERROR = 0.10
-_ADMIN_KEY_LINE = re.compile(
-    r'''(?ix)^\s*["']?admin_api_key["']?\s*:\s*(.*?)\s*,?\s*$'''
+_SENSITIVE_FIELD_PATTERN = "|".join(re.escape(key) for key in SENSITIVE_KEY_PARTS)
+_SENSITIVE_KEY_LINE = re.compile(
+    rf'''(?ix)^\s*["']?({_SENSITIVE_FIELD_PATTERN})["']?\s*:\s*(.*?)\s*,?\s*$'''
 )
-_ADMIN_KEY_INLINE = re.compile(
-    r'''(?ix)["']admin_api_key["']\s*:\s*("[^"]*"|'[^']*'|[^,}\s]+)'''
+_SENSITIVE_KEY_INLINE = re.compile(
+    rf'''(?ix)["']({_SENSITIVE_FIELD_PATTERN})["']\s*:\s*("[^"]*"|'[^']*'|[^,}}\s]+)'''
 )
-_SAFE_ADMIN_VALUES = {
-    "",
-    "null",
-    "none",
-    "''",
-    '""',
-    "<redacted-runtime-admin-key>",
-    "'<redacted-runtime-admin-key>'",
-    '"<redacted-runtime-admin-key>"',
-    "${oc.env:JPH_AREAL_ADMIN_API_KEY}",
-}
+_SAFE_LITERAL_VALUES = {"", "null", "none"}
+_ENV_REFERENCE = re.compile(r"^\$\{(?:oc\.env:)?[A-Za-z_][A-Za-z0-9_]*\}$")
+_REDACTED_VALUE = re.compile(r"^<redacted(?:-[a-z0-9]+)*>$", re.IGNORECASE)
+_TEXT_SUFFIXES = {".json", ".jsonl", ".log", ".txt", ".yaml", ".yml"}
 
 
 def _require(condition: bool, message: str) -> None:
@@ -106,6 +100,21 @@ def _score_sha256(record: Mapping[str, object]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _trajectory_binding_sha256(value: Mapping[str, object]) -> str:
+    payload = {
+        key: value[key]
+        for key in (
+            "input_ids",
+            "loss_mask",
+            "logprobs",
+            "versions",
+            "attention_mask",
+            "rewards",
+        )
+    }
+    return _score_sha256(payload)
+
+
 def _single_row(value: object, name: str) -> list[Any]:
     _require(
         isinstance(value, list)
@@ -123,7 +132,7 @@ def _verify_same_backend_scores(
     _require(score_dir.is_dir(), f"same-backend score directory is missing: {score_dir}")
     paths = sorted(score_dir.glob("same-backend-score-*.json"))
     _require(len(paths) == len(records), "same-backend score count mismatch")
-    scores_by_ids: dict[tuple[int, ...], tuple[Path, dict[str, Any]]] = {}
+    scores_by_request: dict[str, tuple[Path, dict[str, Any]]] = {}
     for path in paths:
         score = json.loads(path.read_text(encoding="utf-8"))
         _require(
@@ -134,18 +143,61 @@ def _verify_same_backend_scores(
             score.get("record_sha256") == _score_sha256(score),
             f"{path}: score hash mismatch",
         )
-        input_ids = _single_row(score.get("input_ids"), "score.input_ids")
-        identity = tuple(input_ids)
-        _require(identity not in scores_by_ids, "duplicate same-backend input sequence")
-        scores_by_ids[identity] = (path, score)
+        request_id = score.get("request_id")
+        _require(
+            isinstance(request_id, str) and bool(request_id),
+            f"{path}: score request ID is missing",
+        )
+        _require(
+            request_id not in scores_by_request,
+            "duplicate same-backend score request ID",
+        )
+        scores_by_request[request_id] = (path, score)
 
     reports: list[dict[str, object]] = []
+    consumed_paths: set[Path] = set()
     for bridge_path, record in records:
         tensors = record["areal_trace"]["tensor_dict"]
         expected_ids = tensors["input_ids"][0]
-        entry = scores_by_ids.get(tuple(expected_ids))
+        request_id = record["request_id"]
+        entry = scores_by_request.get(request_id)
         _require(entry is not None, f"{bridge_path}: no matching same-backend score")
         score_path, score = entry
+        consumed_paths.add(score_path)
+        _require(
+            score.get("bridge_record_sha256") == record["record_sha256"],
+            f"{score_path}: bridge record hash mismatch",
+        )
+        _require(
+            score.get("trajectory_binding_sha256")
+            == _trajectory_binding_sha256(tensors),
+            f"{score_path}: trajectory binding hash mismatch",
+        )
+        scoring_origin = score.get("scoring_origin")
+        _require(isinstance(scoring_origin, dict), f"{score_path}: scoring origin missing")
+        expected_origin = {
+            "api": "RolloutController.compute_logp",
+            "lifecycle": "same-controller-after-wait-before-destroy",
+            "backend": "sglang:d1p1t1",
+            "engine_version_before_score": record["policy_binding"][
+                "expected_inference_engine_version"
+            ],
+            "engine_version_after_score": record["policy_binding"][
+                "expected_inference_engine_version"
+            ],
+            "policy_release_id": record["joint_version"]["policy"],
+            "behavior_revision": record["areal_trace"]["origin"][
+                "behavior_revision"
+            ],
+            "areal_commit": record["areal_trace"]["origin"]["areal_commit"],
+            "project_commit": record["origin"]["project_commit"],
+        }
+        _require(
+            scoring_origin == expected_origin,
+            f"{score_path}: scoring origin differs from bridge identity",
+        )
+        input_ids = _single_row(score["input_ids"], "score.input_ids")
+        _require(input_ids == expected_ids, f"{score_path}: input IDs mismatch")
         loss_mask = _single_row(score["loss_mask"], "score.loss_mask")
         stored = _single_row(score["stored_logprobs"], "score.stored_logprobs")
         rescored = _single_row(score["rescored_logprobs"], "score.rescored_logprobs")
@@ -203,6 +255,10 @@ def _verify_same_backend_scores(
         len(reports) == len(records) and all(report["passed"] for report in reports),
         "same-backend policy logprob audit failed",
     )
+    _require(
+        consumed_paths == set(paths),
+        "not every same-backend score file was consumed exactly once",
+    )
     return reports
 
 
@@ -211,38 +267,59 @@ def _audit_sensitive_artifacts(run_root: Path) -> dict[str, object]:
     unsafe_fields: list[dict[str, object]] = []
     redacted_fields = 0
     scanned_files = 0
+    scanned_text_files = 0
     for path in sorted(run_root.rglob("*")):
         if path.is_symlink() or not path.is_file():
             continue
-        if path.suffix.lower() not in {".json", ".jsonl", ".log", ".txt", ".yaml", ".yml"}:
-            continue
         scanned_files += 1
-        text = path.read_text(encoding="utf-8", errors="replace")
+        data = path.read_bytes()
         _require(
-            not runtime_secret or runtime_secret not in text,
+            not runtime_secret or runtime_secret.encode("utf-8") not in data,
             f"runtime admin key remains in artifact: {path}",
         )
         _require(
-            "areal-admin-key" not in text,
+            b"areal-admin-key" not in data,
             f"default AReaL admin key remains in artifact: {path}",
         )
+        text_like = path.suffix.lower() in _TEXT_SUFFIXES or b"\x00" not in data[:8192]
+        if not text_like:
+            continue
+        scanned_text_files += 1
+        text = data.decode("utf-8", errors="replace")
         for line_number, line in enumerate(text.splitlines(), start=1):
-            match = _ADMIN_KEY_LINE.match(line)
-            raw_values = (
-                [match.group(1)]
+            match = _SENSITIVE_KEY_LINE.match(line)
+            fields = (
+                [(match.group(1), match.group(2))]
                 if match is not None
-                else [item.group(1) for item in _ADMIN_KEY_INLINE.finditer(line)]
+                else [
+                    (item.group(1), item.group(2))
+                    for item in _SENSITIVE_KEY_INLINE.finditer(line)
+                ]
             )
-            for raw_value in raw_values:
+            for key, raw_value in fields:
                 normalized = raw_value.strip().removesuffix(",").strip()
-                if normalized in _SAFE_ADMIN_VALUES:
+                if (
+                    len(normalized) >= 2
+                    and normalized[0] == normalized[-1]
+                    and normalized[0] in {"'", '"'}
+                ):
+                    normalized = normalized[1:-1].strip()
+                safe = (
+                    normalized.lower() in _SAFE_LITERAL_VALUES
+                    or _REDACTED_VALUE.fullmatch(normalized) is not None
+                    or _ENV_REFERENCE.fullmatch(normalized) is not None
+                )
+                if safe:
                     redacted_fields += 1
                 else:
-                    unsafe_fields.append({"path": str(path), "line": line_number})
-    _require(not unsafe_fields, "unredacted admin_api_key fields remain in artifacts")
+                    unsafe_fields.append(
+                        {"path": str(path), "line": line_number, "key": key.lower()}
+                    )
+    _require(not unsafe_fields, "unredacted sensitive fields remain in artifacts")
     return {
         "scanned_files": scanned_files,
-        "redacted_or_safe_admin_key_fields": redacted_fields,
+        "scanned_text_files": scanned_text_files,
+        "redacted_or_safe_sensitive_fields": redacted_fields,
         "unsafe_fields": unsafe_fields,
         "runtime_secret_matches": 0,
         "default_key_matches": 0,

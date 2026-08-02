@@ -41,9 +41,32 @@ def _canonical(value: Mapping[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def _trajectory_binding(value: Mapping[str, Any]) -> dict[str, object]:
+    return {
+        key: _plain(value[key])
+        for key in (
+            "input_ids",
+            "loss_mask",
+            "logprobs",
+            "versions",
+            "attention_mask",
+            "rewards",
+        )
+    }
+
+
+def _binding_sha256(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical(_trajectory_binding(value))).hexdigest()
+
+
 def _write_same_backend_scores(
     trajectories: list[dict[str, Any]],
     rescored_logprobs: list[Any],
+    *,
+    bridge_dir: Path,
+    scoring_backend: str,
+    engine_version_before_score: int,
+    engine_version_after_score: int,
 ) -> None:
     if len(trajectories) != len(rescored_logprobs):
         raise RuntimeError("same-backend score count differs from trajectory count")
@@ -52,9 +75,41 @@ def _write_same_backend_scores(
     if not score_dir.is_relative_to(root):
         raise ValueError(f"same-backend score directory escapes JPH_ROOT: {score_dir}")
     score_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    bridge_paths = sorted(bridge_dir.glob("bridge-*.json"))
+    if len(bridge_paths) != len(trajectories):
+        raise RuntimeError("bridge record count differs from scored trajectory count")
+    bridges_by_binding: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
+    for bridge_path in bridge_paths:
+        bridge = json.loads(bridge_path.read_text(encoding="utf-8"))
+        binding_id = _binding_sha256(bridge["areal_trace"]["tensor_dict"])
+        bridges_by_binding.setdefault(binding_id, []).append((bridge_path, bridge))
+
+    consumed_bridge_paths: set[Path] = set()
     for trajectory, rescored in zip(trajectories, rescored_logprobs):
+        binding_id = _binding_sha256(trajectory)
+        candidates = bridges_by_binding.get(binding_id, [])
+        if not candidates:
+            raise RuntimeError("scored trajectory has no matching bridge record")
+        bridge_path, bridge = candidates.pop(0)
+        consumed_bridge_paths.add(bridge_path)
+        request_id = str(bridge["request_id"])
         record: dict[str, object] = {
-            "schema_version": "jph.areal-same-backend-logprob.v1",
+            "schema_version": "jph.areal-same-backend-logprob.v2",
+            "request_id": request_id,
+            "bridge_record_sha256": bridge["record_sha256"],
+            "trajectory_binding_sha256": binding_id,
+            "scoring_origin": {
+                "api": "RolloutController.compute_logp",
+                "lifecycle": "same-controller-after-wait-before-destroy",
+                "backend": scoring_backend,
+                "engine_version_before_score": engine_version_before_score,
+                "engine_version_after_score": engine_version_after_score,
+                "policy_release_id": bridge["joint_version"]["policy"],
+                "behavior_revision": os.environ["JPH_BEHAVIOR_REVISION"],
+                "areal_commit": os.environ["JPH_AREAL_COMMIT"],
+                "project_commit": os.environ["JPH_PROJECT_COMMIT"],
+            },
             "input_ids": _plain(trajectory["input_ids"]),
             "loss_mask": _plain(trajectory["loss_mask"]),
             "stored_logprobs": _plain(trajectory["logprobs"]),
@@ -63,7 +118,7 @@ def _write_same_backend_scores(
         }
         record["record_sha256"] = hashlib.sha256(_canonical(record)).hexdigest()
         identity = hashlib.sha256(
-            json.dumps(record["input_ids"], separators=(",", ":")).encode("utf-8")
+            request_id.encode("utf-8")
         ).hexdigest()[:20]
         path = score_dir / f"same-backend-score-{identity}.json"
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -84,6 +139,8 @@ def _write_same_backend_scores(
         finally:
             if fd >= 0:
                 os.close(fd)
+    if consumed_bridge_paths != set(bridge_paths):
+        raise RuntimeError("not every bridge record was consumed by same-backend scoring")
 
 
 def _task_limit() -> int:
@@ -186,8 +243,26 @@ def main(args: list[str]) -> None:
             raise RuntimeError(
                 f"AReaL returned {len(results)} results for {submitted} submitted tasks"
             )
+        engine_version_before_score = controller.get_version()
         rescored_logprobs = controller.compute_logp(results)
-        _write_same_backend_scores(results, rescored_logprobs)
+        engine_version_after_score = controller.get_version()
+        expected_policy_version = int(os.environ["JPH_EXPECTED_POLICY_VERSION"])
+        if not (
+            engine_version_before_score
+            == engine_version_after_score
+            == expected_policy_version
+        ):
+            raise RuntimeError(
+                "inference engine version changed across same-backend scoring"
+            )
+        _write_same_backend_scores(
+            results,
+            rescored_logprobs,
+            bridge_dir=bridge_dir,
+            scoring_backend=str(config.rollout.backend),
+            engine_version_before_score=engine_version_before_score,
+            engine_version_after_score=engine_version_after_score,
+        )
         logger.info(
             "AReaL joint bridge evaluation: %s",
             tabulate_stats(controller.export_stats()),
