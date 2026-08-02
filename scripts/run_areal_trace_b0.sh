@@ -29,6 +29,7 @@ for path in "${AREAL_REPO}/.git" "${AREAL_VENV}/bin/python" "${MODEL_REPORT}" "$
     exit 2
   fi
 done
+export PATH="${AREAL_VENV}/bin:${PATH}"
 ACTUAL_AREAL_COMMIT="$(git -C "${AREAL_REPO}" rev-parse HEAD)"
 if [[ "${ACTUAL_AREAL_COMMIT}" != "${EXPECTED_AREAL_COMMIT}" ]]; then
   echo "AReaL commit mismatch: ${ACTUAL_AREAL_COMMIT}" >&2

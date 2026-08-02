@@ -98,6 +98,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("interaction.to_tensor_dict()", workflow)
         self.assertIn("return {request.rid: interaction}", workflow)
         self.assertIn("JPH_AREAL_TRACE_TASKS=1", launcher)
+        self.assertIn('export PATH="${AREAL_VENV}/bin:${PATH}"', launcher)
         self.assertIn("path=config.valid_dataset.path", eval_runner)
         self.assertNotIn(
             'split="test",\n        dataset_config=config.valid_dataset',
