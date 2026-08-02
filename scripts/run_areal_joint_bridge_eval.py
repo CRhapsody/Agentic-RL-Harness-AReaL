@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+from importlib.metadata import version as distribution_version
 import json
+import math
 import os
+import platform
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -17,8 +20,12 @@ from areal.utils import logging, seeding
 from areal.utils.dataloader import create_dataloader
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.printing import tabulate_stats
+import torch
 
 from jphrl.areal_sglang_compat import JPHRemoteSGLangEngine
+from jphrl.trajectory.areal_joint_bridge import (
+    inference_runtime_contract_sha256,
+)
 
 
 logger = logging.getLogger("JPHAReaLJointBridgeEval")
@@ -62,6 +69,144 @@ def _binding_sha256(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical(_trajectory_binding(value))).hexdigest()
 
 
+def _json_value(value: Any) -> object:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("runtime contract contains a non-finite float")
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"runtime contract contains unsupported type: {type(value)!r}")
+
+
+def _selected_fields(value: Any, names: tuple[str, ...]) -> dict[str, object]:
+    return {name: _json_value(getattr(value, name)) for name in names}
+
+
+def _build_inference_runtime_contract(
+    config: Any,
+    server_args: Mapping[str, Any],
+    effective_generation_config: Any,
+) -> dict[str, object]:
+    generation_fields = (
+        "n_samples",
+        "max_new_tokens",
+        "min_new_tokens",
+        "max_tokens",
+        "greedy",
+        "top_p",
+        "top_k",
+        "temperature",
+        "stop_token_ids",
+        "ignore_eos",
+        "skip_special_tokens",
+        "stop",
+        "frequency_penalty",
+        "lora_name",
+        "use_beam_search",
+    )
+    rollout_fields = (
+        "backend",
+        "max_concurrent_rollouts",
+        "queue_size",
+        "consumer_batch_size",
+        "max_head_offpolicyness",
+        "enable_rollout_tracing",
+        "check_trajectory_format",
+        "dump_to_file",
+        "setup_timeout",
+        "workers_ready_timeout",
+        "request_timeout",
+        "request_retries",
+    )
+    mode = os.environ["JPH_SGLANG_LOGPROB_MODE"]
+    contract: dict[str, object] = {
+        "schema_version": "jph.sglang-inference-runtime.v1",
+        "identity": {
+            "run_id": os.environ["JPH_RUN_ID"],
+            "screen_pair_id": os.environ.get("JPH_SCREEN_PAIR_ID") or None,
+        },
+        "fixed": {
+            "areal_commit": os.environ["JPH_AREAL_COMMIT"],
+            "areal_version": distribution_version("areal"),
+            "behavior_revision": os.environ["JPH_BEHAVIOR_REVISION"],
+            "clean_environment_policy": os.environ[
+                "JPH_CLEAN_ENVIRONMENT_POLICY"
+            ],
+            "cuda_runtime_version": str(torch.version.cuda),
+            "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
+            "dataset_revision": os.environ["JPH_DATASET_REVISION"],
+            "dataset_selection": os.environ["JPH_DATASET_SELECTION"],
+            "driver_version": os.environ["JPH_GPU_DRIVER_VERSION"],
+            "generation": _selected_fields(
+                effective_generation_config,
+                generation_fields,
+            ),
+            "gpu_name": os.environ["JPH_GPU_NAME"],
+            "gpu_uuid": os.environ["JPH_GPU_UUID"],
+            "physical_gpu_id": int(os.environ["JPH_PHYSICAL_GPU_ID"]),
+            "python_version": platform.python_version(),
+            "project_commit": os.environ["JPH_PROJECT_COMMIT"],
+            "rollout": _selected_fields(config.rollout, rollout_fields),
+            "seed": int(config.seed),
+            "server_args": _json_value(server_args),
+            "sglang_environment": {
+                "SGLANG_CACHE_DIR": os.environ["SGLANG_CACHE_DIR"],
+            },
+            "sglang_version": os.environ["JPH_SGLANG_VERSION"],
+            "torch_version": distribution_version("torch"),
+            "transformers_version": distribution_version("transformers"),
+        },
+        "treatment": {
+            "generation_logprob_mode": mode,
+            "sglang_return_original_logprob": (
+                os.environ["SGLANG_RETURN_ORIGINAL_LOGPROB"] == "1"
+            ),
+        },
+    }
+    inference_runtime_contract_sha256(contract)
+    return contract
+
+
+def _write_launch_manifest(
+    bridge_dir: Path,
+    contract: Mapping[str, object],
+) -> None:
+    manifest: dict[str, object] = {
+        "schema_version": "jph.sglang-launch-manifest.v1",
+        "inference_runtime_contract": dict(contract),
+        "inference_runtime_contract_sha256": (
+            inference_runtime_contract_sha256(contract)
+        ),
+    }
+    manifest["record_sha256"] = hashlib.sha256(_canonical(manifest)).hexdigest()
+    path = bridge_dir.parent / "launch-manifest.json"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(
+                manifest,
+                handle,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                indent=2,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _write_same_backend_scores(
     trajectories: list[dict[str, Any]],
     rescored_logprobs: list[Any],
@@ -98,7 +243,7 @@ def _write_same_backend_scores(
         consumed_bridge_paths.add(bridge_path)
         request_id = str(bridge["request_id"])
         record: dict[str, object] = {
-            "schema_version": "jph.areal-same-backend-logprob.v5",
+            "schema_version": "jph.areal-same-backend-logprob.v6",
             "request_id": request_id,
             "bridge_record_sha256": bridge["record_sha256"],
             "trajectory_binding_sha256": binding_id,
@@ -116,6 +261,14 @@ def _write_same_backend_scores(
                 "behavior_revision": os.environ["JPH_BEHAVIOR_REVISION"],
                 "areal_commit": os.environ["JPH_AREAL_COMMIT"],
                 "project_commit": os.environ["JPH_PROJECT_COMMIT"],
+                "generation_logprob_mode": os.environ[
+                    "JPH_SGLANG_LOGPROB_MODE"
+                ],
+                "dataset_selection": os.environ["JPH_DATASET_SELECTION"],
+                "sglang_version": os.environ["JPH_SGLANG_VERSION"],
+                "inference_runtime_contract_sha256": os.environ[
+                    "JPH_INFERENCE_RUNTIME_CONTRACT_SHA256"
+                ],
             },
             "input_ids": _plain(trajectory["input_ids"]),
             "loss_mask": _plain(trajectory["loss_mask"]),
@@ -165,11 +318,30 @@ def _task_limit() -> int:
     return value
 
 
+def _task_offset() -> int:
+    raw = os.environ.get("JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET", "0")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET must be an integer: {raw}"
+        ) from exc
+    if value < 0 or value > 1024:
+        raise ValueError(
+            "JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET must be between 0 and 1024: "
+            f"{value}"
+        )
+    return value
+
+
 def main(args: list[str]) -> None:
     config, _ = load_expr_config(args, GRPOConfig)
     if config.rollout._version != "v1":
         raise RuntimeError("JPH score compatibility adapter requires rollout API v1")
+    configured_root = Path(os.environ["JPH_ROOT"]).resolve()
     bridge_dir = Path(os.environ["JPH_AREAL_JOINT_BRIDGE_DIR"]).resolve()
+    if not bridge_dir.is_relative_to(configured_root):
+        raise ValueError(f"bridge directory escapes JPH_ROOT: {bridge_dir}")
     logging.setup_file_logging(str(bridge_dir.parent / "areal-bridge-eval.log"))
 
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
@@ -216,6 +388,28 @@ def main(args: list[str]) -> None:
     else:
         raise ValueError(f"unsupported rollout backend: {rollout_alloc.backend}")
 
+    effective_generation_config = config.gconfig.new_with_stop_and_pad_token_ids(
+        tokenizer
+    ).new(n_samples=1)
+    inference_runtime_contract = _build_inference_runtime_contract(
+        config,
+        server_args,
+        effective_generation_config,
+    )
+    runtime_contract_sha256 = inference_runtime_contract_sha256(
+        inference_runtime_contract
+    )
+    os.environ["JPH_INFERENCE_RUNTIME_CONTRACT"] = json.dumps(
+        inference_runtime_contract,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    os.environ[
+        "JPH_INFERENCE_RUNTIME_CONTRACT_SHA256"
+    ] = runtime_contract_sha256
+    _write_launch_manifest(bridge_dir, inference_runtime_contract)
+
     controller = engine_cls.as_controller(config.rollout, scheduler)
     submitted = 0
     results = []
@@ -229,8 +423,13 @@ def main(args: list[str]) -> None:
             "harness_seed": config.seed,
         }
         limit = _task_limit()
+        offset = _task_offset()
+        visited = 0
         for batch in dataloader:
             for item in batch:
+                if visited < offset:
+                    visited += 1
+                    continue
                 controller.submit(
                     item,
                     workflow=(
@@ -241,6 +440,7 @@ def main(args: list[str]) -> None:
                     group_size=1,
                 )
                 submitted += 1
+                visited += 1
                 if submitted >= limit:
                     break
             if submitted >= limit:

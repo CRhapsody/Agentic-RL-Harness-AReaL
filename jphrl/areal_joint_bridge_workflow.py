@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import os
-import uuid
 from typing import Any
 
 from areal import workflow_context
@@ -15,6 +15,7 @@ from jphrl.harness.learning import TabularHarnessController
 from jphrl.trajectory.areal_joint_bridge import (
     build_areal_joint_bridge_record,
     build_joint_version,
+    deterministic_bridge_request_id,
     inject_harness_instruction,
     prompt_context_chars,
     write_areal_joint_bridge_record,
@@ -50,7 +51,12 @@ class ArealJointBridgeWorkflow(RLVRWorkflow):
             verifier_status="not-run",
             task_domain="gsm8k",
         )
-        request_id = uuid.uuid4().hex
+        task_id = workflow_context.get().task_id
+        request_id = deterministic_bridge_request_id(
+            task_id=task_id,
+            dataset_selection=os.environ["JPH_DATASET_SELECTION"],
+            base_messages=base_messages,
+        )
         controller_checkpoint = self.harness_controller.checkpoint()
         decision = replace(
             self.harness_controller.choose(state),
@@ -88,6 +94,13 @@ class ArealJointBridgeWorkflow(RLVRWorkflow):
 
         expected_policy_version = int(os.environ["JPH_EXPECTED_POLICY_VERSION"])
         behavior_revision = os.environ["JPH_BEHAVIOR_REVISION"]
+        generation_logprob_mode = os.environ["JPH_SGLANG_LOGPROB_MODE"]
+        inference_runtime_contract = json.loads(
+            os.environ["JPH_INFERENCE_RUNTIME_CONTRACT"]
+        )
+        inference_runtime_contract_sha256 = os.environ[
+            "JPH_INFERENCE_RUNTIME_CONTRACT_SHA256"
+        ]
         joint_version = build_joint_version(
             policy_release_id=(
                 f"areal-sglang@{behavior_revision}:engine-v{expected_policy_version}"
@@ -96,9 +109,15 @@ class ArealJointBridgeWorkflow(RLVRWorkflow):
             areal_commit=os.environ["JPH_AREAL_COMMIT"],
             behavior_revision=behavior_revision,
             dataset_revision=os.environ["JPH_DATASET_REVISION"],
+            dataset_selection=os.environ["JPH_DATASET_SELECTION"],
+            sglang_version=os.environ["JPH_SGLANG_VERSION"],
+            generation_logprob_mode=generation_logprob_mode,
+            inference_runtime_contract_sha256=(
+                inference_runtime_contract_sha256
+            ),
         )
         record = build_areal_joint_bridge_record(
-            task_id=workflow_context.get().task_id,
+            task_id=task_id,
             request_id=request_id,
             joint_version=joint_version,
             expected_policy_version=expected_policy_version,
@@ -116,6 +135,10 @@ class ArealJointBridgeWorkflow(RLVRWorkflow):
             areal_commit=os.environ["JPH_AREAL_COMMIT"],
             behavior_snapshot_path=os.environ["JPH_BEHAVIOR_SNAPSHOT"],
             behavior_revision=behavior_revision,
+            dataset_selection=os.environ["JPH_DATASET_SELECTION"],
+            sglang_version=os.environ["JPH_SGLANG_VERSION"],
+            generation_logprob_mode=generation_logprob_mode,
+            inference_runtime_contract=inference_runtime_contract,
         )
         write_areal_joint_bridge_record(
             record,

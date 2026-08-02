@@ -1,4 +1,5 @@
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,8 @@ from jphrl.trajectory.areal_joint_bridge import (
     ArealJointBridgeError,
     build_areal_joint_bridge_record,
     build_joint_version,
+    deterministic_bridge_request_id,
+    inference_runtime_contract_sha256,
     inject_harness_instruction,
     prompt_context_chars,
     validate_areal_joint_bridge_record,
@@ -21,6 +24,49 @@ from jphrl.trajectory.areal_joint_bridge import (
 
 
 class ArealJointBridgeTests(unittest.TestCase):
+    def _runtime_contract(self) -> dict[str, object]:
+        return {
+            "schema_version": "jph.sglang-inference-runtime.v1",
+            "identity": {"run_id": "test-run", "screen_pair_id": None},
+            "fixed": {
+                "areal_commit": "a" * 40,
+                "areal_version": "2.0.0",
+                "behavior_revision": "b" * 40,
+                "clean_environment_policy": "filtered-inherited-v1",
+                "cuda_runtime_version": "12.6",
+                "cuda_visible_devices": "0",
+                "dataset_revision": "c" * 40,
+                "dataset_selection": "sequential-offset0-count4-v1",
+                "driver_version": "test-driver",
+                "generation": {"temperature": 1.0},
+                "gpu_name": "test-gpu",
+                "gpu_uuid": "GPU-test",
+                "physical_gpu_id": 0,
+                "python_version": "3.11.0",
+                "project_commit": "d" * 40,
+                "rollout": {
+                    "backend": "sglang:d1p1t1",
+                    "max_concurrent_rollouts": 1,
+                },
+                "seed": 1,
+                "server_args": {
+                    "base_gpu_id": 0,
+                    "disable_cuda_graph": False,
+                    "model_path": "/allowed/model",
+                    "tokenizer_path": "/allowed/model",
+                    "tp_size": 1,
+                },
+                "sglang_environment": {"SGLANG_CACHE_DIR": "/allowed/cache"},
+                "sglang_version": "0.5.10.post1",
+                "torch_version": "2.8.0",
+                "transformers_version": "4.57.1",
+            },
+            "treatment": {
+                "generation_logprob_mode": "standard-log-of-softmax-v1",
+                "sglang_return_original_logprob": False,
+            },
+        }
+
     def _record(self) -> dict[str, object]:
         state = HarnessState(
             turn=0,
@@ -44,6 +90,12 @@ class ArealJointBridgeTests(unittest.TestCase):
         effective_messages, _ = inject_harness_instruction(
             base_messages, decision.action
         )
+        request_id = deterministic_bridge_request_id(
+            task_id=7,
+            dataset_selection="sequential-offset0-count4-v1",
+            base_messages=base_messages,
+        )
+        decision = replace(decision, decision_id=f"{request_id}:harness:0")
         response = SimpleNamespace(
             input_tokens=[9, 1, 2],
             output_tokens=[3, 4],
@@ -60,16 +112,23 @@ class ArealJointBridgeTests(unittest.TestCase):
             "attention_mask": [[True, True, True, True, True]],
             "rewards": [1.0],
         }
+        runtime_contract = self._runtime_contract()
         joint_version = build_joint_version(
             policy_release_id="areal-sglang@model-commit:engine-v0",
             harness_controller_version=controller.version,
             areal_commit="a" * 40,
             behavior_revision="b" * 40,
             dataset_revision="c" * 40,
+            dataset_selection="sequential-offset0-count4-v1",
+            sglang_version="0.5.10.post1",
+            generation_logprob_mode="standard-log-of-softmax-v1",
+            inference_runtime_contract_sha256=(
+                inference_runtime_contract_sha256(runtime_contract)
+            ),
         )
         return build_areal_joint_bridge_record(
             task_id=7,
-            request_id="request-1",
+            request_id=request_id,
             joint_version=joint_version,
             expected_policy_version=0,
             harness_state=state,
@@ -86,6 +145,10 @@ class ArealJointBridgeTests(unittest.TestCase):
             areal_commit="a" * 40,
             behavior_snapshot_path="/allowed/model",
             behavior_revision="b" * 40,
+            dataset_selection="sequential-offset0-count4-v1",
+            sglang_version="0.5.10.post1",
+            generation_logprob_mode="standard-log-of-softmax-v1",
+            inference_runtime_contract=runtime_contract,
         )
 
     def test_real_interaction_and_harness_prompt_are_bound(self) -> None:
@@ -103,6 +166,19 @@ class ArealJointBridgeTests(unittest.TestCase):
         )
         self.assertIsNone(record["credit_binding"]["policy_advantage"])
         self.assertIsNone(record["credit_binding"]["harness_advantage"])
+        self.assertEqual(
+            record["policy_binding"]["generation_logprob_mode"],
+            "standard-log-of-softmax-v1",
+        )
+        self.assertIn(
+            "selection=sequential-offset0-count4-v1",
+            record["joint_version"]["environment"],
+        )
+        self.assertEqual(record["policy_binding"]["sglang_version"], "0.5.10.post1")
+        self.assertEqual(
+            record["policy_binding"]["inference_runtime_contract_sha256"],
+            inference_runtime_contract_sha256(self._runtime_contract()),
+        )
         self.assertEqual(
             record["harness"]["controller_checkpoint_before_decision"]["sample_count"],
             0,
@@ -123,6 +199,33 @@ class ArealJointBridgeTests(unittest.TestCase):
         record["prompt_binding"]["effective_input_tokens"][0] = 999
         with self.assertRaisesRegex(ArealJointBridgeError, "hash"):
             validate_areal_joint_bridge_record(record, expected_policy_version=0)
+
+    def test_bridge_rejects_unbound_logprob_mode_or_dataset_selection(self) -> None:
+        for field, value, error in (
+            ("generation_logprob_mode", "unknown-mode", "unknown generation"),
+            ("dataset_selection", "other-selection", "fixed identity"),
+        ):
+            with self.subTest(field=field):
+                record = self._record()
+                record["policy_binding"][field] = value
+                unsigned = {
+                    key: item
+                    for key, item in record.items()
+                    if key != "record_sha256"
+                }
+                record["record_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        unsigned,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                with self.assertRaisesRegex(ArealJointBridgeError, error):
+                    validate_areal_joint_bridge_record(
+                        record, expected_policy_version=0
+                    )
 
     def test_bridge_writer_is_unique_private_and_root_bounded(self) -> None:
         record = self._record()

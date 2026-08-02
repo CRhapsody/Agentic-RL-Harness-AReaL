@@ -22,7 +22,7 @@ SENSITIVE_KEY_PARTS = (
     "secret_key",
     "session_api_key",
 )
-SAME_BACKEND_SCHEMA_VERSION = "jph.areal-same-backend-logprob.v5"
+SAME_BACKEND_SCHEMA_VERSION = "jph.areal-same-backend-logprob.v6"
 MAX_SAME_BACKEND_MEAN_IMPORTANCE_RATIO_ERROR = 0.02
 MAX_SAME_BACKEND_IMPORTANCE_RATIO_ERROR = 0.10
 _SENSITIVE_FIELD_PATTERN = "|".join(re.escape(key) for key in SENSITIVE_KEY_PARTS)
@@ -203,6 +203,14 @@ def _verify_same_backend_scores(
             ],
             "areal_commit": record["areal_trace"]["origin"]["areal_commit"],
             "project_commit": record["origin"]["project_commit"],
+            "generation_logprob_mode": record["policy_binding"][
+                "generation_logprob_mode"
+            ],
+            "dataset_selection": record["policy_binding"]["dataset_selection"],
+            "sglang_version": record["policy_binding"]["sglang_version"],
+            "inference_runtime_contract_sha256": record["policy_binding"][
+                "inference_runtime_contract_sha256"
+            ],
         }
         _require(
             scoring_origin == expected_origin,
@@ -391,6 +399,9 @@ def verify(
     expected_areal_commit: str,
     expected_project_commit: str,
     expected_policy_version: int,
+    expected_dataset_selection: str,
+    expected_generation_logprob_mode: str,
+    expected_sglang_version: str,
     expected_count: int,
     device: str,
     max_tokens_per_trace: int,
@@ -447,8 +458,20 @@ def verify(
         )
         _require(
             record["joint_version"]["environment"]
-            == f"gsm8k-test@{dataset_revision}",
+            == (
+                f"gsm8k-test@{dataset_revision}:selection="
+                f"{expected_dataset_selection}"
+            ),
             f"{path}: dataset revision differs from JointVersion environment",
+        )
+        _require(
+            audit["generation_logprob_mode"]
+            == expected_generation_logprob_mode,
+            f"{path}: generation log-prob mode mismatch",
+        )
+        _require(
+            audit["sglang_version"] == expected_sglang_version,
+            f"{path}: SGLang version mismatch",
         )
         origin = record["areal_trace"]["origin"]
         _require(
@@ -528,6 +551,9 @@ def verify(
         "project_commit": expected_project_commit,
         "areal_commit": expected_areal_commit,
         "dataset_revision": dataset_revision,
+        "dataset_selection": expected_dataset_selection,
+        "generation_logprob_mode": expected_generation_logprob_mode,
+        "sglang_version": expected_sglang_version,
         "dataset_snapshot_path": str(dataset_snapshot_path),
         "joint_version_ids": sorted(joint_version_ids),
         "unique_request_ids": len(request_ids),
@@ -562,6 +588,9 @@ def main() -> None:
     parser.add_argument("--expected-areal-commit", required=True)
     parser.add_argument("--expected-project-commit", required=True)
     parser.add_argument("--expected-policy-version", type=int, default=0)
+    parser.add_argument("--expected-dataset-selection", required=True)
+    parser.add_argument("--expected-generation-logprob-mode", required=True)
+    parser.add_argument("--expected-sglang-version", required=True)
     parser.add_argument("--expected-count", type=int, default=4)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-tokens-per-trace", type=int, default=64)
@@ -577,6 +606,9 @@ def main() -> None:
         expected_areal_commit=args.expected_areal_commit,
         expected_project_commit=args.expected_project_commit,
         expected_policy_version=args.expected_policy_version,
+        expected_dataset_selection=args.expected_dataset_selection,
+        expected_generation_logprob_mode=args.expected_generation_logprob_mode,
+        expected_sglang_version=args.expected_sglang_version,
         expected_count=args.expected_count,
         device=args.device,
         max_tokens_per_trace=args.max_tokens_per_trace,

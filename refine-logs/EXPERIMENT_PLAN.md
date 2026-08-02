@@ -49,6 +49,24 @@ Harness 只是固定 prompt；同一个终局 reward 被无条件复制成两路
 - **bridge 安全门**：每个 run 使用独立随机 admin key，只通过环境变量传入；正式审计
   前必须对整个 run tree 完成脱敏并扫描，默认 `areal-admin-key`、运行时随机 key 或未
   脱敏 `admin_api_key` 字段任一残留都使 run 无效。
+- **SGLang log-prob 公式机制筛查（在结果产生前冻结）**：固定 dataset snapshot、
+  `ValidDatasetConfig.shuffle=false` 和顺序位置 `[32,36)`，不使用已经暴露的 `[0,4)`。
+  C0 保持生成端 `log(softmax(logits))`；C1 只在整服启动前设置
+  `SGLANG_RETURN_ORIGINAL_LOGPROB=1`，使生成端报告 `log_softmax(logits)`。两 cell
+  其余 commit、模型、数据、seed、temperature、top-p/top-k、CUDA graph、FA3、Harness
+  与预算全部相同。两个 cell 必须由受控 `env -i` 入口在同一物理 GPU 上串行运行，
+  各自完整重启 SGLang；规范化 launch manifest 必须绑定 GPU UUID、驱动、完整 SGLang
+  server args、采样配置和上述版本，且 C0/C1 的固定字段逐项相等。C1 只有同时满足以下
+  条件才支持该机制：四条 deterministic request ID、effective prompt、完整 Harness
+  state/checkpoint/decision、stop reason 与 output token 逐项等于 C0；两边 active token 的
+  `rescored_logprobs` 最大绝对差不超过 `1e-6`；比较两边 ratio error 时统一使用
+  C0 的 `rescored_logprobs` 作为共同 target，禁止 C1 的 score 漂移制造改善；至少一个
+  active token 的 `stored_logprobs` 绝对差严格大于 `1e-8`；每条 mean/max ratio error
+  均不劣于 C0，至少一条发生 stored logprob 变化的轨迹严格改善；并且 C1 的 4/4
+  轨迹全部通过原有 mean≤0.02/max≤0.10 门。
+  筛查不允许修改阈值，也不允许解封 optimizer；通过后只允许
+  进入独立的 32 条校准集与 32 条封存确认集。C1 失败后才允许预注册 C2（仅关闭普通
+  CUDA graph），禁止同时改变多个开关。
 - **失败解释**：数据面不可信，停止 Harness 改造，不产生科学结论。
 - **优先级**：MUST-RUN。
 

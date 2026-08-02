@@ -20,9 +20,16 @@ from .areal_trace_contract import (
 from .schema import EpisodeTrace, JointVersion
 
 
-SCHEMA_VERSION = "jph.areal-joint-interaction-bridge.v1"
+SCHEMA_VERSION = "jph.areal-joint-interaction-bridge.v2"
+INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = "jph.sglang-inference-runtime.v1"
 CONTEXT_BUILDER_VERSION = "gsm8k-harness-prompt-v1"
 HARNESS_ARTIFACT_VERSION = "gsm8k-bounded-prompt-actions-v1"
+GENERATION_LOGPROB_MODES = frozenset(
+    {
+        "standard-log-of-softmax-v1",
+        "original-log-softmax-v1",
+    }
+)
 HARNESS_INSTRUCTIONS: dict[HarnessAction, str] = {
     HarnessAction.DIRECT: (
         "Solve the problem directly. Keep the reasoning focused and end with a clear "
@@ -70,10 +77,105 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+def inference_runtime_contract_sha256(
+    contract: Mapping[str, object],
+) -> str:
+    """Return the content identity of a normalized, non-secret launch contract."""
+
+    _require(
+        contract.get("schema_version")
+        == INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION,
+        "unknown inference runtime contract schema",
+    )
+    identity = contract.get("identity")
+    fixed = contract.get("fixed")
+    treatment = contract.get("treatment")
+    _require(
+        isinstance(identity, Mapping)
+        and isinstance(fixed, Mapping)
+        and isinstance(treatment, Mapping),
+        "inference runtime identity, fixed fields, and treatment must be objects",
+    )
+    _require(
+        isinstance(identity.get("run_id"), str) and bool(identity["run_id"]),
+        "inference runtime run ID cannot be empty",
+    )
+    _require(
+        identity.get("screen_pair_id") is None
+        or (
+            isinstance(identity.get("screen_pair_id"), str)
+            and bool(identity["screen_pair_id"])
+        ),
+        "screen pair ID must be null or a non-empty string",
+    )
+    required_fixed = {
+        "areal_commit",
+        "areal_version",
+        "behavior_revision",
+        "clean_environment_policy",
+        "cuda_runtime_version",
+        "cuda_visible_devices",
+        "dataset_revision",
+        "dataset_selection",
+        "driver_version",
+        "generation",
+        "gpu_name",
+        "gpu_uuid",
+        "physical_gpu_id",
+        "python_version",
+        "project_commit",
+        "rollout",
+        "seed",
+        "server_args",
+        "sglang_environment",
+        "sglang_version",
+        "torch_version",
+        "transformers_version",
+    }
+    _require(
+        set(fixed) == required_fixed,
+        "inference runtime fixed field set differs from contract",
+    )
+    _require(
+        set(treatment)
+        == {"generation_logprob_mode", "sglang_return_original_logprob"},
+        "inference runtime treatment field set differs from contract",
+    )
+    try:
+        payload = _canonical_json(dict(contract))
+    except (TypeError, ValueError) as exc:
+        raise ArealJointBridgeError(
+            "inference runtime contract is not finite canonical JSON"
+        ) from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
 def prompt_context_chars(messages: Sequence[Mapping[str, str]]) -> int:
     """Count the UTF-8 prompt representation used by the bridge state encoder."""
 
     return len(_canonical_json([dict(message) for message in messages]).decode("utf-8"))
+
+
+def deterministic_bridge_request_id(
+    *,
+    task_id: int,
+    dataset_selection: str,
+    base_messages: Sequence[Mapping[str, str]],
+) -> str:
+    """Keep request identity identical across paired, fully restarted cells."""
+
+    _require(type(task_id) is int and task_id >= 0, "task ID must be non-negative")
+    _require(
+        isinstance(dataset_selection, str) and bool(dataset_selection),
+        "dataset selection cannot be empty",
+    )
+    payload = {
+        "schema_version": "jph.areal-bridge-request-identity.v1",
+        "task_id": task_id,
+        "dataset_selection": dataset_selection,
+        "base_messages": [dict(message) for message in base_messages],
+    }
+    return f"jph-areal-{_sha256(payload)[:32]}"
 
 
 def harness_artifact_payload() -> dict[str, object]:
@@ -121,6 +223,10 @@ def build_joint_version(
     areal_commit: str,
     behavior_revision: str,
     dataset_revision: str,
+    dataset_selection: str,
+    sglang_version: str,
+    generation_logprob_mode: str,
+    inference_runtime_contract_sha256: str,
 ) -> JointVersion:
     for name, value in (
         ("policy_release_id", policy_release_id),
@@ -128,16 +234,41 @@ def build_joint_version(
         ("areal_commit", areal_commit),
         ("behavior_revision", behavior_revision),
         ("dataset_revision", dataset_revision),
+        ("dataset_selection", dataset_selection),
+        ("sglang_version", sglang_version),
+        ("generation_logprob_mode", generation_logprob_mode),
+        (
+            "inference_runtime_contract_sha256",
+            inference_runtime_contract_sha256,
+        ),
     ):
         _require(isinstance(value, str) and value, f"{name} cannot be empty")
+    _require(
+        generation_logprob_mode in GENERATION_LOGPROB_MODES,
+        "unknown generation log-prob mode",
+    )
+    _require(
+        len(inference_runtime_contract_sha256) == 64
+        and all(
+            character in "0123456789abcdef"
+            for character in inference_runtime_contract_sha256
+        ),
+        "inference runtime contract hash must be a lowercase SHA-256",
+    )
     artifact = harness_artifact_payload()
     return JointVersion(
-        policy=policy_release_id,
+        policy=(
+            f"{policy_release_id}:sglang={sglang_version}"
+            f":generation-logprob={generation_logprob_mode}"
+            f":runtime={inference_runtime_contract_sha256}"
+        ),
         harness_controller=harness_controller_version,
         harness_artifact=f"{HARNESS_ARTIFACT_VERSION}@{artifact['sha256']}",
         tool_schema="no-tools-single-turn-v1",
         parser=f"areal-gsm8k-reward@{areal_commit}",
-        environment=f"gsm8k-test@{dataset_revision}",
+        environment=(
+            f"gsm8k-test@{dataset_revision}:selection={dataset_selection}"
+        ),
         evaluator=f"areal-gsm8k-reward@{areal_commit}",
         tokenizer=f"hf-tokenizer@{behavior_revision}",
         context_builder=CONTEXT_BUILDER_VERSION,
@@ -223,6 +354,10 @@ def build_areal_joint_bridge_record(
     areal_commit: str,
     behavior_snapshot_path: str,
     behavior_revision: str,
+    dataset_selection: str,
+    sglang_version: str,
+    generation_logprob_mode: str,
+    inference_runtime_contract: Mapping[str, object],
 ) -> dict[str, object]:
     """Bind a real AReaL interaction and a prompt-effective Harness decision."""
 
@@ -237,10 +372,21 @@ def build_areal_joint_bridge_record(
         behavior_revision=behavior_revision,
     )
     instruction = HARNESS_INSTRUCTIONS[harness_decision.action]
+    runtime_contract = dict(inference_runtime_contract)
+    runtime_contract_sha256 = inference_runtime_contract_sha256(runtime_contract)
     _require(
         len(project_commit) == 40
         and all(character in "0123456789abcdef" for character in project_commit),
         "project commit must be a lowercase 40-character Git object ID",
+    )
+    _require(
+        request_id
+        == deterministic_bridge_request_id(
+            task_id=task_id,
+            dataset_selection=dataset_selection,
+            base_messages=base_messages,
+        ),
+        "request ID differs from deterministic prompt binding",
     )
     record: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -279,6 +425,11 @@ def build_areal_joint_bridge_record(
         "policy_binding": {
             "policy_release_id": joint_version.policy,
             "expected_inference_engine_version": expected_policy_version,
+            "dataset_selection": dataset_selection,
+            "sglang_version": sglang_version,
+            "generation_logprob_mode": generation_logprob_mode,
+            "inference_runtime_contract": runtime_contract,
+            "inference_runtime_contract_sha256": runtime_contract_sha256,
         },
         "credit_binding": {
             "status": "raw-terminal-outcome-only",
@@ -467,6 +618,107 @@ def validate_areal_joint_bridge_record(
         policy.get("policy_release_id") == joint_version.policy,
         "policy release ID differs from JointVersion",
     )
+    generation_logprob_mode = policy.get("generation_logprob_mode")
+    _require(
+        generation_logprob_mode in GENERATION_LOGPROB_MODES,
+        "unknown generation log-prob mode",
+    )
+    _require(
+        joint_version.policy.endswith(
+            f":generation-logprob={generation_logprob_mode}"
+            f":runtime={policy.get('inference_runtime_contract_sha256')}"
+        ),
+        "JointVersion policy does not bind generation mode and runtime contract",
+    )
+    sglang_version = policy.get("sglang_version")
+    _require(
+        isinstance(sglang_version, str) and bool(sglang_version),
+        "SGLang version must be a non-empty string",
+    )
+    _require(
+        f":sglang={sglang_version}:generation-logprob=" in joint_version.policy,
+        "JointVersion policy does not bind the SGLang version",
+    )
+    runtime_contract = policy.get("inference_runtime_contract")
+    _require(
+        isinstance(runtime_contract, Mapping),
+        "inference runtime contract must be an object",
+    )
+    runtime_contract_hash = inference_runtime_contract_sha256(runtime_contract)
+    _require(
+        policy.get("inference_runtime_contract_sha256") == runtime_contract_hash,
+        "inference runtime contract hash mismatch",
+    )
+    runtime_fixed = runtime_contract["fixed"]
+    runtime_treatment = runtime_contract["treatment"]
+    runtime_server_args = runtime_fixed["server_args"]
+    runtime_rollout = runtime_fixed["rollout"]
+    _require(
+        runtime_fixed["sglang_version"] == sglang_version
+        and runtime_fixed["dataset_selection"] == policy.get("dataset_selection")
+        and runtime_fixed["project_commit"] == project_commit
+        and runtime_fixed["areal_commit"] == areal_trace["origin"]["areal_commit"]
+        and runtime_fixed["behavior_revision"]
+        == areal_trace["origin"]["behavior_revision"],
+        "inference runtime fixed identity differs from bridge identity",
+    )
+    _require(
+        joint_version.environment
+        == (
+            f"gsm8k-test@{runtime_fixed['dataset_revision']}:selection="
+            f"{runtime_fixed['dataset_selection']}"
+        ),
+        "inference runtime dataset revision differs from JointVersion",
+    )
+    _require(
+        isinstance(runtime_server_args, Mapping)
+        and runtime_server_args.get("model_path")
+        == areal_trace["origin"]["behavior_snapshot_path"]
+        and runtime_server_args.get("tokenizer_path")
+        == areal_trace["origin"]["behavior_snapshot_path"]
+        and runtime_server_args.get("tp_size") == 1
+        and runtime_server_args.get("base_gpu_id") == 0,
+        "inference runtime server args differ from behavior snapshot or topology",
+    )
+    _require(
+        isinstance(runtime_rollout, Mapping)
+        and runtime_rollout.get("backend") == "sglang:d1p1t1"
+        and runtime_rollout.get("max_concurrent_rollouts") == 1,
+        "inference runtime rollout topology differs from bridge contract",
+    )
+    _require(
+        type(runtime_fixed["physical_gpu_id"]) is int
+        and runtime_fixed["physical_gpu_id"] >= 0
+        and runtime_fixed["cuda_visible_devices"]
+        == str(runtime_fixed["physical_gpu_id"])
+        and isinstance(runtime_fixed["gpu_uuid"], str)
+        and bool(runtime_fixed["gpu_uuid"]),
+        "inference runtime GPU identity is inconsistent",
+    )
+    _require(
+        runtime_treatment["generation_logprob_mode"] == generation_logprob_mode
+        and runtime_treatment["sglang_return_original_logprob"]
+        is (generation_logprob_mode == "original-log-softmax-v1"),
+        "inference runtime treatment differs from generation mode",
+    )
+    dataset_selection = policy.get("dataset_selection")
+    _require(
+        isinstance(dataset_selection, str) and bool(dataset_selection),
+        "dataset selection must be a non-empty string",
+    )
+    _require(
+        joint_version.environment.endswith(f":selection={dataset_selection}"),
+        "JointVersion environment does not bind the dataset selection",
+    )
+    _require(
+        record.get("request_id")
+        == deterministic_bridge_request_id(
+            task_id=record["task_id"],
+            dataset_selection=dataset_selection,
+            base_messages=base_messages,
+        ),
+        "request ID differs from deterministic prompt binding",
+    )
     recorded_engine_version = policy.get("expected_inference_engine_version")
     _require(
         type(recorded_engine_version) is int and recorded_engine_version >= 0,
@@ -505,6 +757,10 @@ def validate_areal_joint_bridge_record(
         "request_id": record["request_id"],
         "joint_version_id": joint_version.version_id,
         "policy_release_id": joint_version.policy,
+        "generation_logprob_mode": generation_logprob_mode,
+        "sglang_version": sglang_version,
+        "dataset_selection": dataset_selection,
+        "inference_runtime_contract_sha256": runtime_contract_hash,
         "inference_engine_versions": trace_audit["policy_versions"],
         "harness_controller_version": joint_version.harness_controller,
         "harness_action": action.value,

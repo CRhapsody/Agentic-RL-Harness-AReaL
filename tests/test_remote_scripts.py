@@ -29,11 +29,17 @@ class RemoteScriptContractTests(unittest.TestCase):
         verifier = (SCRIPTS / "verify_areal_joint_bridge.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("JPH_AREAL_JOINT_BRIDGE_TASKS=4", launcher)
+        self.assertIn('TASK_COUNT="${JPH_AREAL_JOINT_BRIDGE_TASKS:-4}"', launcher)
+        self.assertIn('TASK_OFFSET="${JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET:-0}"', launcher)
+        self.assertIn("formal-v1 requires count=4 offset=0", launcher)
         self.assertIn("gconfig.max_new_tokens=64", launcher)
         self.assertIn("rollout.max_concurrent_rollouts=1", launcher)
         self.assertIn("sglang.mem_fraction_static=0.35", launcher)
-        self.assertIn("--expected-count 4", launcher)
+        self.assertIn('--expected-count "${TASK_COUNT}"', launcher)
+        self.assertIn("--expected-dataset-selection", launcher)
+        self.assertIn("--expected-generation-logprob-mode", launcher)
+        self.assertIn("--expected-sglang-version", launcher)
+        self.assertIn('EXPECTED_SGLANG_VERSION="0.5.10.post1"', launcher)
         self.assertIn("--expected-project-commit", launcher)
         self.assertIn("status --porcelain", launcher)
         self.assertIn("--dataset-report", launcher)
@@ -65,6 +71,48 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("redact_runtime_admin_key.py", launcher)
         self.assertIn("--same-backend-score-dir", launcher + verifier)
         self.assertNotIn("optimizer.step", launcher + runner + verifier)
+
+    def test_sglang_logprob_screen_is_unseen_single_variable_and_bounded(self) -> None:
+        wrapper = (SCRIPTS / "run_sglang_logprob_screen.sh").read_text(
+            encoding="utf-8"
+        )
+        pair_runner = (
+            SCRIPTS / "run_sglang_logprob_screen_pair.sh"
+        ).read_text(encoding="utf-8")
+        launcher = (SCRIPTS / "run_areal_joint_bridge.sh").read_text(
+            encoding="utf-8"
+        )
+        runner = (SCRIPTS / "run_areal_joint_bridge_eval.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("JPH_AREAL_JOINT_BRIDGE_TASKS=4", wrapper)
+        self.assertIn("JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET=32", wrapper)
+        self.assertIn("standard-log-of-softmax-v1", wrapper)
+        self.assertIn("original-log-softmax-v1", wrapper)
+        self.assertIn("SGLANG_RETURN_ORIGINAL_LOGPROB_VALUE=0", launcher)
+        self.assertIn("SGLANG_RETURN_ORIGINAL_LOGPROB_VALUE=1", launcher)
+        self.assertIn("SGLANG_ENV_MODE_AUDIT", launcher)
+        self.assertIn("envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get()", launcher)
+        self.assertIn("logprob-mechanism-screen-v1", launcher + wrapper)
+        self.assertIn("exec /usr/bin/env -i", wrapper)
+        self.assertIn("JPH_CLEAN_ENVIRONMENT_POLICY=env-i-v1", wrapper)
+        self.assertIn("requires the env-i-v1 launch policy", launcher)
+        self.assertIn("GPU_UUID", launcher)
+        self.assertIn("launch-manifest.json", runner)
+        self.assertIn("audit_sglang_logprob_screen_cell.py", launcher)
+        self.assertIn("write_sglang_logprob_screen_pointer.py", launcher)
+        self.assertIn("server_args", runner)
+        self.assertIn("inference_runtime_contract_sha256", runner)
+        self.assertIn("controller.destroy()", runner)
+        c0_position = pair_runner.index('"${GPU_ID}" c0')
+        c1_position = pair_runner.index('"${GPU_ID}" c1')
+        compare_position = pair_runner.index("compare_sglang_logprob_screen.py")
+        self.assertLess(c0_position, c1_position)
+        self.assertLess(c1_position, compare_position)
+        self.assertIn('RUN_ID="${RUN_STAMP}-${SGLANG_LOGPROB_MODE}-${RUN_NONCE}"', launcher)
+        self.assertIn("joint-bridge-${RUN_ID}", launcher)
+        self.assertNotIn("disable_cuda_graph", wrapper)
+        self.assertNotIn("optimizer.step", wrapper + pair_runner)
 
     def test_g1_launcher_is_private_external_and_verified(self) -> None:
         text = (SCRIPTS / "run_g1_integrity.sh").read_text(encoding="utf-8")

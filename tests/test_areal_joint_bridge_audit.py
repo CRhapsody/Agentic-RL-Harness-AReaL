@@ -31,7 +31,13 @@ class SameBackendScoreAuditTests(unittest.TestCase):
             "record_sha256": bridge_record_sha256,
             "origin": {"project_commit": "c" * 40},
             "joint_version": {"policy": "policy-release-v0"},
-            "policy_binding": {"expected_inference_engine_version": 0},
+            "policy_binding": {
+                "expected_inference_engine_version": 0,
+                "generation_logprob_mode": "standard-log-of-softmax-v1",
+                "dataset_selection": "sequential-offset0-count4-v1",
+                "sglang_version": "0.5.10.post1",
+                "inference_runtime_contract_sha256": "f" * 64,
+            },
             "areal_trace": {
                 "origin": {
                     "behavior_revision": "d" * 40,
@@ -51,7 +57,7 @@ class SameBackendScoreAuditTests(unittest.TestCase):
             record["areal_trace"]["tensor_dict"]
         )
         score = {
-            "schema_version": "jph.areal-same-backend-logprob.v5",
+            "schema_version": "jph.areal-same-backend-logprob.v6",
             "request_id": request_id,
             "bridge_record_sha256": bridge_record_sha256,
             "trajectory_binding_sha256": trajectory_binding_sha256,
@@ -69,6 +75,10 @@ class SameBackendScoreAuditTests(unittest.TestCase):
                 "behavior_revision": "d" * 40,
                 "areal_commit": "e" * 40,
                 "project_commit": "c" * 40,
+                "generation_logprob_mode": "standard-log-of-softmax-v1",
+                "dataset_selection": "sequential-offset0-count4-v1",
+                "sglang_version": "0.5.10.post1",
+                "inference_runtime_contract_sha256": "f" * 64,
             },
             "input_ids": input_ids,
             "loss_mask": loss_mask,
