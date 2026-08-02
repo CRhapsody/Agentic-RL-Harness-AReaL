@@ -6,7 +6,7 @@ umask 077
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${project_root}/scripts/remote_env.sh"
 
-python_bin="${JPH_PYTHON:-/mnt/sdb/ljw/chizm/venvs/areal-v2/bin/python}"
+python_bin="${JPH_PYTHON:-/mnt/sdb/ljw/chizm/venvs/areal-v2.0.0/bin/python}"
 if [[ ! -x "${python_bin}" ]]; then
   echo "G1 Python interpreter is unavailable: ${python_bin}" >&2
   exit 2

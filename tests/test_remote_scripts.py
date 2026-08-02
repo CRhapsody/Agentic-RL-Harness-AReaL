@@ -23,6 +23,11 @@ class RemoteScriptContractTests(unittest.TestCase):
         text = (SCRIPTS / "run_g1_integrity.sh").read_text(encoding="utf-8")
         self.assertIn("umask 077", text)
         self.assertIn("/mnt/sdb/ljw/chizm/artifacts/g1/", text)
+        self.assertIn(
+            "/mnt/sdb/ljw/chizm/venvs/areal-v2.0.0/bin/python",
+            text,
+        )
+        self.assertNotIn("/mnt/sdb/ljw/chizm/venvs/areal-v2/bin/python", text)
         self.assertIn("--version-fixtures 1000", text)
         self.assertIn("--project-commit", text)
         self.assertIn("verify_g1_integrity.py", text)
