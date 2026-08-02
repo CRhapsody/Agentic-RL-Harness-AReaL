@@ -47,7 +47,7 @@ while ((SECONDS < DEADLINE)); do
 
   if ((${#BLOCKED_GPUS[@]} == 0)); then
     echo "$(date -Is) all eight GPUs passed the memory headroom gate (used<=${MAX_USED_MEMORY_MIB}MiB, free>=${MIN_FREE_MEMORY_MIB}MiB); launching B0"
-    exec "${SCRIPT_DIR}/run_areal_official_b0.sh"
+    exec /bin/bash "${SCRIPT_DIR}/run_areal_official_b0.sh"
   fi
 
   echo "$(date -Is) waiting for GPU headroom: ${BLOCKED_GPUS[*]}"

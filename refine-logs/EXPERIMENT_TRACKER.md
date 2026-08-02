@@ -129,3 +129,4 @@ decision:
 | 2026-08-02 | JPH-B0-OFFICIAL-001 | lockfile needs update under `--locked` | 脚本用清华 `--default-index` 改变了官方 lock 中的来源 URL；去掉覆盖后 `uv lock --check` 1ms 通过 | infra/config | AReaL exact sync 保留官方 index/哈希并走 HTTPS 代理；普通 pip smoke 仍可用清华镜像 |
 | 2026-08-02 | JPH-B0-OFFICIAL-001 | `nvidia-nccl-cu12` 下载重试后超时 | SSH 反向 HTTP 隧道随交互连接中断；其余约 8.8GB uv cache 已保留 | infra/network | 代理与 bootstrap 分别放入目标根目录 socket 的 tmux session；代理只监听 loopback 且只允许 CONNECT 443 |
 | 2026-08-02 | JPH-B0-PREFETCH-001 | GSM8K 一次性 `python -c` 立即报 `NameError` | 多层 SSH/tmux/shell 引号剥离了数据集字符串的引号 | orchestration | 改为仓库内的可测试脚本，固定 dataset commit 并审计 materialized cache path |
+| 2026-08-02 | JPH-B0-OFFICIAL-001 | 显存门禁通过后立即 `Permission denied`，tmux exit=126 | `run_areal_official_b0.sh` 在 Git 中是 100644，waiter 直接将它当可执行文件调用 | orchestration/config | waiter 改用 `/bin/bash` 显式解释脚本；训练尚未启动，因此没有残留 GPU 进程 |

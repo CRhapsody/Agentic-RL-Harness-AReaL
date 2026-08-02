@@ -101,7 +101,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn('JPH_B0_MAX_USED_MEMORY_MIB:-8192', text)
         self.assertIn('GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB', text)
         self.assertIn('GPU_MEMORY_USED > MAX_USED_MEMORY_MIB', text)
-        self.assertIn('run_areal_official_b0.sh', text)
+        self.assertIn('exec /bin/bash "${SCRIPT_DIR}/run_areal_official_b0.sh"', text)
         self.assertNotIn("pkill", text)
         self.assertNotIn("kill -", text)
 
