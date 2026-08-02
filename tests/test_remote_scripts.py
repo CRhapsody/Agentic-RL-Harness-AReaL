@@ -85,6 +85,26 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn('export PATH="${AREAL_VENV}/bin:${CUDA_HOME}/bin:${PATH}"', text)
         self.assertIn("-std=c++20", text)
 
+    def test_areal_trace_is_real_bounded_and_recomputed(self) -> None:
+        launcher = (SCRIPTS / "run_areal_trace_b0.sh").read_text(encoding="utf-8")
+        workflow = (PROJECT_ROOT / "jphrl" / "areal_trace_workflow.py").read_text(
+            encoding="utf-8"
+        )
+        verifier = (SCRIPTS / "verify_areal_trace.py").read_text(encoding="utf-8")
+        self.assertIn("InteractionWithTokenLogpReward", workflow)
+        self.assertIn("interaction.to_tensor_dict()", workflow)
+        self.assertIn("return {request.rid: interaction}", workflow)
+        self.assertIn("JPH_AREAL_TRACE_TASKS=1", launcher)
+        self.assertIn("rollout.backend=sglang:d1p1t1", launcher)
+        self.assertIn("sglang.mem_fraction_static=0.35", launcher)
+        self.assertIn("flock -n 9", launcher)
+        self.assertIn("HF_HUB_OFFLINE=1", launcher)
+        self.assertIn("AutoModelForCausalLM.from_pretrained", verifier)
+        self.assertIn("local_files_only=True", verifier)
+        self.assertIn("max_abs_error", verifier)
+        self.assertIn('"policy_update": False', verifier)
+        self.assertIn('"harness_update": False', verifier)
+
     def test_real_smoke_requires_an_on_disk_trace_audit(self) -> None:
         text = (SCRIPTS / "run_remote_smoke.sh").read_text(encoding="utf-8")
         self.assertIn("Qwen/Qwen2.5-1.5B-Instruct", text)
