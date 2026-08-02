@@ -67,6 +67,18 @@ Harness 只是固定 prompt；同一个终局 reward 被无条件复制成两路
   筛查不允许修改阈值，也不允许解封 optimizer；通过后只允许
   进入独立的 32 条校准集与 32 条封存确认集。C1 失败后才允许预注册 C2（仅关闭普通
   CUDA graph），禁止同时改变多个开关。
+- **C2 CUDA Graph 机制筛查（C1 失败后、结果产生前冻结）**：使用此前未暴露的
+  GSM8K test 顺序位置 `[64,68)`、seed 1 和 standard `log(softmax)`。C2a 保持
+  `disable_cuda_graph=false`，C2b 只改为 `disable_cuda_graph=true`；模型、数据、
+  commit、Harness、生成参数、FA3、radix cache、并发数、物理 GPU 和 clean `env -i`
+  启动策略均保持相同。两组在同一物理 GPU 上串行完整重启服务。比较时必须使用 C2a
+  的 rescored log-prob 作为共同 target；每条 request ID、effective prompt、完整 Harness
+  state/checkpoint/decision、stop reason 与 output token 必须相同；两边 active token 的
+  rescored log-prob 最大绝对差不得超过 `1e-6`；至少一个 active stored log-prob 的绝对
+  差严格大于 `1e-8`。C2b 必须在每条轨迹上 mean/max 均不劣于 C2a、至少一条严格改善，
+  且 `4/4` 通过原 mean≤`0.02`/max≤`0.10` 门，才支持“普通 CUDA Graph 是主要机制”这
+  一窄结论。输出 token 改变、运行时不变量改变或向量无法逐 token 配对均直接判为不支持，
+  不能删除负结果。无论通过与否都不解封 optimizer；通过后也只允许另行预注册 32+32。
 - **失败解释**：数据面不可信，停止 Harness 改造，不产生科学结论。
 - **优先级**：MUST-RUN。
 

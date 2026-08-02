@@ -41,11 +41,46 @@
 | 层级 | 已经做到什么 | 仍缺什么 |
 | --- | --- | --- |
 | 真实 AReaL bridge | 真实 SGLang rollout、真实 token、真实 Harness prompt 决策、same-controller score 与完整版本绑定 | 上一轮正式 v5 概率门只通过 1/4，不能作为训练 batch |
-| C0/C1 概率机制筛查 | 固定模型与 Harness，只改变 SGLang 生成 log-prob 公式，检查数据面是否能通过原门 | 远端 pair 已启动，但本课写作时没有可用结果；代码明确不调用 optimizer |
+| C0/C1 概率机制筛查 | 固定模型与 Harness，只改变 SGLang 生成 log-prob 公式；结果为 2/4 通过，`mechanism_supported=false` | 该处理没有解锁 optimizer，也没有解锁预注册的 32 条校准与 32 条封存确认 |
 | G1 synthetic 控制面 | 两类样本、两路 credit、toy 双更新、联合 checkpoint、lag0、原子发布和故障矩阵 | 输入是 synthetic trace，policy 与 Harness 都不是真实生产 optimizer |
 | AReaL/Hermes 上游 | AReaL 能对模型 actor 执行 PPO 并同步新权重；Hermes 能把真实 Agent LLM 调用路由进 AReaL 采集 | 上游 Hermes 没有学习 Harness controller 的第二个 optimizer，也没有联合二元组发布 |
 
-所以，本课既不是实验结果报告，也不是在宣布联合更新已经完成。它是一份从可信数据面走到真实联合更新所需的数据契约和执行顺序说明。
+所以，本课主体不是完整联合训练结果报告，更不是在宣布联合更新已经完成。它是一份从可信数据面走到真实联合更新所需的数据契约和执行顺序说明；下面只追加与这条路径直接相关的 C0/C1 数据面结果。
+
+## 2026-08-02 实验更新：C0/C1 没有支持预注册机制
+
+C0/C1 pair 已经结束。四条配对轨迹中只有 `2/4` 通过原概率门，最终判定是：
+
+```text
+mechanism_supported = false
+```
+
+观测到的关键数值是：
+
+- C1 的 stored log-prob 相对 C0 确实发生了变化，但逐轨迹变化量只在 `1.19e-7` 到 `4.77e-7` 之间。
+- 两条失败轨迹的 max error 分别是 `0.12716` 和 `0.11109`，仍高于预注册的 `0.10` 上限。
+- 因为没有达到 `4/4` 通过，所以结果不能解锁 optimizer，也不能解锁后续的 32 条校准与 32 条封存确认。
+
+这里要注意，“C1 改了 stored log-prob”与“这个改动解释了原失败”是两个不同命题。前者只要求数值不完全相同；后者要求变化足够大，而且能让所有预注册样本通过原门。现在看到的变化只有约 `1e-7`，而失败轨迹仍有约 `1e-1` 的 max error。两者相差大约六个数量级，因此这组证据不支持“切换到 original log-softmax 就能修复概率不一致”这一机制解释。
+
+### 为什么必须使用 common rescored target
+
+对第 `t` 条配对轨迹，记共同的 C0 rescored log-prob 为 `q_t`，两种生成设置保存的值分别为 `s_{0,t}` 和 `s_{1,t}`。比较器实际关心的是：
+
+```text
+C0 error = distance(s_{0,t}, q_t)
+C1 error = distance(s_{1,t}, q_t)
+```
+
+两边使用同一个 `q_t`，变化量才只来自 stored log-prob 的生成公式。如果让 C0 对自己的 rescored target 评分、C1 再对另一个 target 评分，那么 error 的变化会同时混入“stored 值变了”和“评分目标变了”两件事。即使 C1 看起来更好，我们也无法判断是哪一件事造成的。
+
+common target 不是为了偏向 C0，而是为了固定被比较的坐标系。它让问题保持为一个可检验的单句：只替换生成端的 log-prob 公式，stored 值相对同一重算目标是否得到足以通过原门的改善？这次答案是否定的。
+
+### 为什么下一轮仍然必须是单变量实验
+
+如果一次同时改变 CUDA Graph、采样参数、数据位置和 server 配置，即使结果通过，也无法知道哪个改动有效。单变量实验要求除一个 treatment 外，其余条件保持冻结。这样，失败能排除一个具体机制，成功也只能支持一个具体机制，不会把多个改动捆成无法解释的“经验配方”。
+
+下一轮候选记为 C2，但它尚未运行。它计划只关闭普通 CUDA Graph，并使用预注册的未见 GSM8K `[64,68)`；模型、Harness、概率门和其他冻结条件不得随结果调整。C2 目前只有实验设计，没有观测值，更没有 optimizer、32 条校准或 32 条封存确认已经解锁的结论。
 
 ## 1. “冻结 batch”到底冻结了什么
 
@@ -306,7 +341,7 @@ DecisionCredit = {
 
 ## 4. 数值例子一：一条冻结轨迹怎样产生两组概率比
 
-下面的数值只用于演示计算，不是正在运行的 C0/C1 结果。
+下面的数值只用于演示计算，不是 C0/C1 的实验产物。
 
 ### 第一步：冻结 AReaL 六字段
 
@@ -683,7 +718,7 @@ R18 joint_version = (P8, H4)
 | 目标步骤 | 本项目对应位置 | AReaL/Hermes 对应位置 | 当前缺口 |
 | --- | --- | --- | --- |
 | 真实 Agent LLM 调用进入 rollout | `areal_joint_bridge_workflow.py` 的单轮 GSM8K bridge | `examples/hermes/hermes.py` 从 `areal_inference` metadata 取得 session upstream；DataProxy 按 session 采集 | 当前 bridge 还是 no-tools 单轮，不是完整 Hermes 多轮轨迹 |
-| policy 六字段 | `areal_trace_contract.py` 与 bridge record | AReaL inference controller 和 trajectory export | C0/C1 数据面尚未得出最终结果 |
+| policy 六字段 | `areal_trace_contract.py` 与 bridge record | AReaL inference controller 和 trajectory export | C0/C1 已得到 2/4、`mechanism_supported=false`；使用未见 `[64,68)` 的 C2 尚未运行 |
 | policy advantage 与 PPO | 尚未接入真实 joint batch | `PPOTrainer.train()` 中 `compute_advantages()` 与 `actor.ppo_update()` | 需要把通过审计的 bridge 数据接回 AReaL 原生 batch |
 | Harness 动作概率 | `HarnessDecision`、`JointDecisionBatch`、`TabularHarnessController` | Hermes 内部有工具与循环控制，但上游示例不导出这些控制动作的行为概率 | 需要把可学习 Harness action 显式化，不能只保留工具调用摘要 |
 | Harness optimizer | tabular REINFORCE 与 G1 toy updater | Hermes 示例没有第二个 optimizer | 需要生产 Torch Harness controller 和 checkpoint |
@@ -828,7 +863,7 @@ C1: SGLANG_RETURN_ORIGINAL_LOGPROB=1, 使用 original log_softmax(logits)
 4. C1 stored log-prob 确实发生变化。
 5. C1 每条轨迹不劣于 C0，至少一条发生真实改善，并且 4/4 通过原门。
 
-无论 C1 最后通过还是失败，这个实验都没有完成以下任何一步：
+C0/C1 的实际结果是 `2/4` 通过，C1 stored log-prob 的变化量只有 `1.19e-7` 到 `4.77e-7`，两条失败轨迹的 max error 仍为 `0.12716` 和 `0.11109`。因此 `mechanism_supported=false`。这个实验没有完成以下任何一步：
 
 ```text
 没有计算 policy advantage
@@ -858,7 +893,7 @@ joint publish        让完整 candidate 二元组变成活动版本
 
 ### 步骤 1：让数据面先通过冻结门
 
-等待 C0/C1 的真实结果。若 C1 通过，也只能解锁预注册的 32 条校准与 32 条封存确认，不能直接解锁 optimizer。若失败，应按计划预注册下一单变量实验，不能事后修改旧阈值。
+C0/C1 已经以 `2/4` 和 `mechanism_supported=false` 结束，没有解锁 optimizer，也没有解锁预注册的 32 条校准与 32 条封存确认。下一候选 C2 尚未运行；它只计划关闭普通 CUDA Graph，并换用预注册的未见 GSM8K `[64,68)`。C2 仍须使用原有阈值和单变量纪律，不能根据结果修改旧门。
 
 ### 步骤 2：构造真实 `FrozenJointBatch`
 
@@ -962,7 +997,7 @@ AReaL `actor.ppo_update()` 成功并把新模型权重同步给 rollout，但 Ha
 
 ### 题 8
 
-C1 若 4/4 通过原概率门，可以立即启动 policy 与 Harness optimizer 吗？
+C0/C1 实际只有 2/4 通过，且 `mechanism_supported=false`。此时可以启动 policy 与 Harness optimizer，或者直接进入 32 条校准与 32 条封存确认吗？
 
 ### 题 9
 
@@ -981,7 +1016,7 @@ C1 若 4/4 通过原概率门，可以立即启动 policy 与 Harness optimizer 
 5. 继续使用旧完整版本 `(P7,H3)`。新 policy 权重只能作为未发布 candidate 保存。如果已经单独同步到活动 rollout，说明发布边界设计错误，应停止采样并恢复旧二元组。
 6. 不等。对象只是 candidate 内容。只有 manifest 校验通过且 `active` commit point 成功切换，才算发布。
 7. 因为“执行了 Harness 逻辑”不等于“把 Harness 动作表示成有行为概率、版本和 credit 的训练样本”。当前 Hermes 示例主要把 LLM 调用接给 AReaL 的模型 PPO，没有第二个 Harness optimizer。
-8. 不能。通过只说明这个 log-prob 公式值得进入后续 32 条校准和 32 条封存确认。预注册边界明确禁止它直接解锁 optimizer。
+8. 都不能。2/4 没有达到预注册的 4/4 机制门，因此既不能解锁 optimizer，也不能解锁 32 条校准与 32 条封存确认。下一步只能先运行新的单变量诊断；当前候选 C2 还没有运行。
 9. 如果写入动作本身会覆盖既有事实、泄漏凭据或越过允许路径，事后校验无法撤销副作用。正式 writer 应先验证内容和路径，再以独占方式写入。
 10. 拒绝为 stale。它内部自洽，只说明它是合法旧版本轨迹；lag0 还要求行为 `JointVersion` 等于当前活动版本。
 
@@ -1007,4 +1042,4 @@ C1 若 4/4 通过原概率门，可以立即启动 policy 与 Harness optimizer 
 - 有两个真实 candidate，但没有联合发布：候选联合训练，不是活动版本更新。
 - 两个真实 optimizer、联合 checkpoint、独立发布门和原子切换全部完成：才是本项目所说的“真正同时更新 policy 与 Harness”。
 
-下一步最值得观察的不是某个 loss 数字，而是 C0/C1 能否先让 stored behavior log-prob 成为可信训练输入。没有这一步，后面的 PPO ratio 即使能算，也没有可靠含义。
+下一步最值得观察的不是某个 loss 数字，而是尚未运行的 C2 能否在新的未见数据上解释并消除 stored behavior log-prob 的不一致。没有可信的数据面，后面的 PPO ratio 即使能算，也没有可靠含义。

@@ -111,8 +111,55 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertLess(c1_position, compare_position)
         self.assertIn('RUN_ID="${RUN_STAMP}-${SGLANG_LOGPROB_MODE}-${RUN_NONCE}"', launcher)
         self.assertIn("joint-bridge-${RUN_ID}", launcher)
-        self.assertNotIn("disable_cuda_graph", wrapper)
+        self.assertIn("JPH_SGLANG_DISABLE_CUDA_GRAPH=false", wrapper)
+        self.assertNotIn("JPH_SGLANG_DISABLE_CUDA_GRAPH=true", wrapper)
         self.assertNotIn("optimizer.step", wrapper + pair_runner)
+
+    def test_cuda_graph_screen_is_new_slice_single_variable_and_bounded(self) -> None:
+        wrapper = (SCRIPTS / "run_sglang_cuda_graph_screen.sh").read_text(
+            encoding="utf-8"
+        )
+        pair_runner = (
+            SCRIPTS / "run_sglang_cuda_graph_screen_pair.sh"
+        ).read_text(encoding="utf-8")
+        launcher = (SCRIPTS / "run_areal_joint_bridge.sh").read_text(
+            encoding="utf-8"
+        )
+        comparator = (
+            SCRIPTS / "compare_sglang_cuda_graph_screen.py"
+        ).read_text(encoding="utf-8")
+        config_preflight = (
+            SCRIPTS / "validate_sglang_cuda_graph_config.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET=64", wrapper)
+        self.assertIn("JPH_SGLANG_LOGPROB_MODE=standard-log-of-softmax-v1", wrapper)
+        self.assertIn("JPH_EXPERIMENTAL_AXIS=cuda-graph-v1", wrapper)
+        self.assertIn("DISABLE_CUDA_GRAPH=false", wrapper)
+        self.assertIn("DISABLE_CUDA_GRAPH=true", wrapper)
+        self.assertIn("exec /usr/bin/env -i", wrapper)
+        self.assertIn("cuda-graph-mechanism-screen-v1", wrapper + launcher)
+        self.assertIn('sglang.disable_cuda_graph="${SGLANG_DISABLE_CUDA_GRAPH}"', launcher)
+        c2a_position = pair_runner.index('"${GPU_ID}" c2a')
+        c2b_position = pair_runner.index('"${GPU_ID}" c2b')
+        compare_position = pair_runner.index("compare_sglang_cuda_graph_screen.py")
+        self.assertLess(c2a_position, c2b_position)
+        self.assertLess(c2b_position, compare_position)
+        self.assertIn("compare_cuda_graph_screen_runs", comparator)
+        self.assertIn("load_expr_config", config_preflight)
+        self.assertIn("SGLangConfig.build_args", config_preflight)
+        self.assertIn("type(composed) is not bool", config_preflight)
+        self.assertIn("type(built) is not bool", config_preflight)
+        self.assertIn("torch.cuda.is_initialized()", config_preflight)
+        self.assertIn("os.O_EXCL", config_preflight)
+        self.assertIn("config-preflight.json", pair_runner)
+        preflight_position = pair_runner.index(
+            "validate_sglang_cuda_graph_config.py"
+        )
+        self.assertLess(preflight_position, c2a_position)
+        self.assertNotIn(
+            "optimizer.step",
+            wrapper + pair_runner + comparator + config_preflight,
+        )
 
     def test_g1_launcher_is_private_external_and_verified(self) -> None:
         text = (SCRIPTS / "run_g1_integrity.sh").read_text(encoding="utf-8")

@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -17,6 +19,10 @@ from jphrl.experiments.sglang_logprob_screen import (
     artifact_tree_sha256,
     compare_screen_runs,
     write_screen_report,
+)
+from jphrl.experiments.sglang_cuda_graph_screen import (
+    CUDA_GRAPH_DATASET_SELECTION,
+    compare_cuda_graph_screen_runs,
 )
 from jphrl.harness.controller import HarnessState
 from jphrl.harness.learning import TabularHarnessController
@@ -64,9 +70,23 @@ def _runtime_contract(
     pair_id: str,
     mode: str,
     physical_gpu_id: int,
+    dataset_selection: str = SCREEN_DATASET_SELECTION,
+    disable_cuda_graph: bool = False,
+    runtime_schema: str = "jph.sglang-inference-runtime.v1",
+    experimental_axis: str = "generation-logprob-formula-v1",
 ) -> dict[str, object]:
+    treatment: dict[str, object] = {
+        "generation_logprob_mode": mode,
+        "sglang_return_original_logprob": mode == C1_MODE,
+    }
+    if runtime_schema == "jph.sglang-inference-runtime.v2":
+        treatment = {
+            "disable_cuda_graph": disable_cuda_graph,
+            "experimental_axis": experimental_axis,
+            **treatment,
+        }
     return {
-        "schema_version": "jph.sglang-inference-runtime.v1",
+        "schema_version": runtime_schema,
         "identity": {"run_id": run_id, "screen_pair_id": pair_id},
         "fixed": {
             "areal_commit": "a" * 40,
@@ -76,7 +96,7 @@ def _runtime_contract(
             "cuda_runtime_version": "12.6",
             "cuda_visible_devices": str(physical_gpu_id),
             "dataset_revision": "c" * 40,
-            "dataset_selection": SCREEN_DATASET_SELECTION,
+            "dataset_selection": dataset_selection,
             "driver_version": "550.54.15",
             "generation": {
                 "greedy": False,
@@ -99,7 +119,7 @@ def _runtime_contract(
             "server_args": {
                 "attention_backend": "fa3",
                 "base_gpu_id": 0,
-                "disable_cuda_graph": False,
+                "disable_cuda_graph": disable_cuda_graph,
                 "disable_radix_cache": True,
                 "dtype": "bfloat16",
                 "kv_cache_dtype": "auto",
@@ -115,10 +135,7 @@ def _runtime_contract(
             "torch_version": "2.8.0",
             "transformers_version": "4.57.1",
         },
-        "treatment": {
-            "generation_logprob_mode": mode,
-            "sglang_return_original_logprob": mode == C1_MODE,
-        },
+        "treatment": treatment,
     }
 
 
@@ -147,8 +164,13 @@ def _build_cell(
     physical_gpu_id: int = 0,
     prompt_suffix: str = "",
     output_token_delta: int = 0,
+    run_id_override: str | None = None,
+    dataset_selection: str = SCREEN_DATASET_SELECTION,
+    disable_cuda_graph: bool = False,
+    runtime_schema: str = "jph.sglang-inference-runtime.v1",
+    experimental_axis: str = "generation-logprob-formula-v1",
 ) -> Path:
-    run_id = f"run-{'c1' if mode == C1_MODE else 'c0'}"
+    run_id = run_id_override or f"run-{'c1' if mode == C1_MODE else 'c0'}"
     run_root = root / run_id
     run_root.mkdir(mode=0o700)
     run_root.chmod(0o700)
@@ -160,6 +182,10 @@ def _build_cell(
         pair_id=pair_id,
         mode=mode,
         physical_gpu_id=physical_gpu_id,
+        dataset_selection=dataset_selection,
+        disable_cuda_graph=disable_cuda_graph,
+        runtime_schema=runtime_schema,
+        experimental_axis=experimental_axis,
     )
     runtime_hash = inference_runtime_contract_sha256(runtime_contract)
     manifest: dict[str, object] = {
@@ -191,7 +217,7 @@ def _build_cell(
         checkpoint = controller.checkpoint()
         request_id = deterministic_bridge_request_id(
             task_id=index,
-            dataset_selection=SCREEN_DATASET_SELECTION,
+            dataset_selection=dataset_selection,
             base_messages=base_messages,
         )
         decision = replace(
@@ -231,7 +257,7 @@ def _build_cell(
             areal_commit="a" * 40,
             behavior_revision="b" * 40,
             dataset_revision="c" * 40,
-            dataset_selection=SCREEN_DATASET_SELECTION,
+            dataset_selection=dataset_selection,
             sglang_version="0.5.10.post1",
             generation_logprob_mode=mode,
             inference_runtime_contract_sha256=runtime_hash,
@@ -255,7 +281,7 @@ def _build_cell(
             areal_commit="a" * 40,
             behavior_snapshot_path="/allowed/model",
             behavior_revision="b" * 40,
-            dataset_selection=SCREEN_DATASET_SELECTION,
+            dataset_selection=dataset_selection,
             sglang_version="0.5.10.post1",
             generation_logprob_mode=mode,
             inference_runtime_contract=runtime_contract,
@@ -285,7 +311,7 @@ def _build_cell(
                 "areal_commit": "a" * 40,
                 "project_commit": "d" * 40,
                 "generation_logprob_mode": mode,
-                "dataset_selection": SCREEN_DATASET_SELECTION,
+                "dataset_selection": dataset_selection,
                 "sglang_version": "0.5.10.post1",
                 "inference_runtime_contract_sha256": runtime_hash,
             },
@@ -327,6 +353,7 @@ def _build_pair(
     c1_prompt_suffix: str = "",
     c1_output_token_delta: int = 0,
     c1_stored_tail: tuple[float, float] = (-1.005, -2.01),
+    runtime_schema: str = "jph.sglang-inference-runtime.v1",
 ) -> tuple[Path, Path]:
     pair_id = "pair-0123456789abcdef"
     c0 = _build_cell(
@@ -334,6 +361,7 @@ def _build_pair(
         mode=C0_MODE,
         pair_id=pair_id,
         stored_tail=(-1.03, -2.12),
+        runtime_schema=runtime_schema,
     )
     c1 = _build_cell(
         root,
@@ -343,8 +371,43 @@ def _build_pair(
         physical_gpu_id=c1_gpu,
         prompt_suffix=c1_prompt_suffix,
         output_token_delta=c1_output_token_delta,
+        runtime_schema=runtime_schema,
     )
     return c0, c1
+
+
+def _build_cuda_graph_pair(
+    root: Path,
+    *,
+    c2b_gpu: int = 0,
+    c2b_output_token_delta: int = 0,
+    c2b_stored_tail: tuple[float, float] = (-1.005, -2.01),
+) -> tuple[Path, Path]:
+    pair_id = "cuda-pair-0123456789abcdef"
+    common = {
+        "mode": C0_MODE,
+        "pair_id": pair_id,
+        "dataset_selection": CUDA_GRAPH_DATASET_SELECTION,
+        "runtime_schema": "jph.sglang-inference-runtime.v2",
+        "experimental_axis": "cuda-graph-v1",
+    }
+    c2a = _build_cell(
+        root,
+        **common,
+        run_id_override="run-c2a",
+        stored_tail=(-1.03, -2.12),
+        disable_cuda_graph=False,
+    )
+    c2b = _build_cell(
+        root,
+        **common,
+        run_id_override="run-c2b",
+        stored_tail=c2b_stored_tail,
+        disable_cuda_graph=True,
+        physical_gpu_id=c2b_gpu,
+        output_token_delta=c2b_output_token_delta,
+    )
+    return c2a, c2b
 
 
 class SGLangLogprobScreenTests(unittest.TestCase):
@@ -362,6 +425,18 @@ class SGLangLogprobScreenTests(unittest.TestCase):
                 report["summary"]["at_least_one_active_stored_logprob_changed"]
             )
             self.assertFalse(report["claim_boundary"]["may_unlock_joint_optimizer"])
+
+    def test_runtime_v2_formula_pair_remains_comparable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            c0_root, c1_root = _build_pair(
+                root,
+                runtime_schema="jph.sglang-inference-runtime.v2",
+            )
+            with patch.dict(os.environ, {"JPH_ROOT": str(root)}):
+                report = compare_screen_runs(c0_root, c1_root)
+            self.assertTrue(report["summary"]["mechanism_supported"])
+            self.assertTrue(report["summary"]["paired_runtime_fixed_fields_equal"])
 
     def test_rejects_rescored_logprob_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -543,6 +618,125 @@ class SGLangLogprobScreenTests(unittest.TestCase):
                     pointer=pair_root / ".." / "c0-run-root.txt",
                     run_root=run_root,
                 )
+
+    def test_cuda_graph_pair_supports_only_the_registered_treatment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            c2a_root, c2b_root = _build_cuda_graph_pair(root)
+            with patch.dict(os.environ, {"JPH_ROOT": str(root)}):
+                report = compare_cuda_graph_screen_runs(c2a_root, c2b_root)
+            self.assertTrue(report["summary"]["mechanism_supported"])
+            self.assertTrue(report["summary"]["paired_runtime_invariants_equal"])
+            self.assertTrue(report["summary"]["paired_score_alignment_equal"])
+            self.assertFalse(report["claim_boundary"]["may_unlock_joint_optimizer"])
+
+    def test_cuda_graph_pair_records_changed_output_as_negative_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            c2a_root, c2b_root = _build_cuda_graph_pair(
+                root,
+                c2b_output_token_delta=1,
+            )
+            with patch.dict(os.environ, {"JPH_ROOT": str(root)}):
+                report = compare_cuda_graph_screen_runs(c2a_root, c2b_root)
+            self.assertFalse(report["summary"]["paired_generation_equal"])
+            self.assertFalse(report["summary"]["paired_score_alignment_equal"])
+            self.assertFalse(report["summary"]["mechanism_supported"])
+            self.assertIsNone(
+                report["traces"][0]["paired_score"][
+                    "max_rescored_logprob_abs_delta"
+                ]
+            )
+
+    def test_cuda_graph_cli_writes_negative_report_before_exit_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            c2a_root, c2b_root = _build_cuda_graph_pair(
+                root,
+                c2b_stored_tail=(-1.03, -2.12),
+            )
+            output = root / "comparison.json"
+            project_root = Path(__file__).resolve().parents[1]
+            env = dict(os.environ)
+            env["JPH_ROOT"] = str(root)
+            env["PYTHONPATH"] = str(project_root)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        project_root
+                        / "scripts"
+                        / "compare_sglang_cuda_graph_screen.py"
+                    ),
+                    str(c2a_root),
+                    str(c2b_root),
+                    "--output",
+                    str(output),
+                ],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            self.assertTrue(output.is_file())
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertFalse(report["summary"]["mechanism_supported"])
+            self.assertEqual(report["record_sha256"], _sha256(report))
+
+    def test_cuda_graph_pair_rejects_another_runtime_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            c2a_root, c2b_root = _build_cuda_graph_pair(root, c2b_gpu=1)
+            with patch.dict(os.environ, {"JPH_ROOT": str(root)}):
+                report = compare_cuda_graph_screen_runs(c2a_root, c2b_root)
+            self.assertFalse(report["summary"]["paired_runtime_invariants_equal"])
+            self.assertFalse(report["summary"]["mechanism_supported"])
+
+    def test_runtime_v2_rejects_treatment_server_arg_mismatch(self) -> None:
+        contract = _runtime_contract(
+            run_id="run-c2b",
+            pair_id="cuda-pair-0123456789abcdef",
+            mode=C0_MODE,
+            physical_gpu_id=0,
+            dataset_selection=CUDA_GRAPH_DATASET_SELECTION,
+            disable_cuda_graph=True,
+            runtime_schema="jph.sglang-inference-runtime.v2",
+            experimental_axis="cuda-graph-v1",
+        )
+        contract["fixed"]["server_args"]["disable_cuda_graph"] = False
+        with self.assertRaisesRegex(
+            ValueError,
+            "CUDA Graph treatment differs from effective server args",
+        ):
+            inference_runtime_contract_sha256(contract)
+
+    def test_cuda_graph_pointer_uses_separate_pair_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pair_id = "cuda-pair-0123456789abcdef"
+            pair_root = (
+                root
+                / "artifacts"
+                / "sglang-cuda-graph-screen"
+                / "pairs"
+                / pair_id
+            )
+            pair_root.mkdir(parents=True, mode=0o700)
+            pair_root.chmod(0o700)
+            run_root = root / "artifacts" / "cuda-cell"
+            run_root.mkdir(parents=True, mode=0o700)
+            pointer = pair_root / "c2a-run-root.txt"
+            write_pointer(
+                configured_root=root,
+                pair_id=pair_id,
+                pair_artifact_group="sglang-cuda-graph-screen",
+                cell="c2a",
+                pointer=pointer,
+                run_root=run_root,
+            )
+            self.assertEqual(pointer.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

@@ -143,6 +143,8 @@ def _load_cell(
     run_root: Path,
     *,
     expected_mode: str,
+    expected_dataset_selection: str = SCREEN_DATASET_SELECTION,
+    expected_treatment: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     bridge_dir = run_root / "bridge-records"
     score_dir = run_root / "same-backend-scores"
@@ -193,20 +195,29 @@ def _load_cell(
     )
     _require(
         runtime_contract["fixed"]["dataset_selection"]
-        == SCREEN_DATASET_SELECTION,
+        == expected_dataset_selection,
         f"{manifest_path}: runtime dataset selection mismatch",
     )
     _require(
         runtime_contract["fixed"]["sglang_version"] == SGLANG_VERSION,
         f"{manifest_path}: runtime SGLang version mismatch",
     )
-    expected_return_original = expected_mode == C1_MODE
-    _require(
-        runtime_contract["treatment"]
-        == {
+    if expected_treatment is None:
+        expected_treatment = {
             "generation_logprob_mode": expected_mode,
-            "sglang_return_original_logprob": expected_return_original,
-        },
+            "sglang_return_original_logprob": expected_mode == C1_MODE,
+        }
+        if (
+            runtime_contract.get("schema_version")
+            == "jph.sglang-inference-runtime.v2"
+        ):
+            expected_treatment = {
+                "disable_cuda_graph": False,
+                "experimental_axis": "generation-logprob-formula-v1",
+                **expected_treatment,
+            }
+    _require(
+        runtime_contract["treatment"] == expected_treatment,
         f"{manifest_path}: runtime treatment mismatch",
     )
     cell_audit_path = run_root / "cell-audit.json"
@@ -272,7 +283,7 @@ def _load_cell(
             f"{path}: score mode mismatch",
         )
         _require(
-            origin.get("dataset_selection") == SCREEN_DATASET_SELECTION,
+            origin.get("dataset_selection") == expected_dataset_selection,
             f"{path}: score dataset selection mismatch",
         )
         _require(
@@ -298,7 +309,7 @@ def _load_cell(
             f"{path}: bridge mode mismatch",
         )
         _require(
-            audit["dataset_selection"] == SCREEN_DATASET_SELECTION,
+            audit["dataset_selection"] == expected_dataset_selection,
             f"{path}: bridge dataset selection mismatch",
         )
         _require(
@@ -356,7 +367,7 @@ def _load_cell(
             "areal_commit": bridge["areal_trace"]["origin"]["areal_commit"],
             "project_commit": bridge["origin"]["project_commit"],
             "generation_logprob_mode": expected_mode,
-            "dataset_selection": SCREEN_DATASET_SELECTION,
+            "dataset_selection": expected_dataset_selection,
             "sglang_version": SGLANG_VERSION,
             "inference_runtime_contract_sha256": runtime_contract_hash,
         }
@@ -432,6 +443,51 @@ def _paired_score_deltas(
     }
 
 
+def paired_generation_equal(
+    left_bridge: Mapping[str, object],
+    right_bridge: Mapping[str, object],
+) -> bool:
+    """Check every pre-registered non-logprob rollout field in a paired trace."""
+
+    left_joint = {
+        key: value
+        for key, value in left_bridge["joint_version"].items()
+        if key != "policy"
+    }
+    right_joint = {
+        key: value
+        for key, value in right_bridge["joint_version"].items()
+        if key != "policy"
+    }
+    return bool(
+        left_bridge["origin"] == right_bridge["origin"]
+        and left_bridge["task_id"] == right_bridge["task_id"]
+        and left_bridge["request_id"] == right_bridge["request_id"]
+        and left_joint == right_joint
+        and left_bridge["prompt_binding"] == right_bridge["prompt_binding"]
+        and left_bridge["harness"]["state"]
+        == right_bridge["harness"]["state"]
+        and left_bridge["harness"]["controller_checkpoint_before_decision"]
+        == right_bridge["harness"]["controller_checkpoint_before_decision"]
+        and left_bridge["harness"]["applied_instruction"]
+        == right_bridge["harness"]["applied_instruction"]
+        and left_bridge["harness"]["decision"]
+        == right_bridge["harness"]["decision"]
+        and left_bridge["areal_trace"]["origin"]
+        == right_bridge["areal_trace"]["origin"]
+        and left_bridge["areal_trace"]["model_response"]["input_tokens"]
+        == right_bridge["areal_trace"]["model_response"]["input_tokens"]
+        and left_bridge["areal_trace"]["model_response"]["output_tokens"]
+        == right_bridge["areal_trace"]["model_response"]["output_tokens"]
+        and left_bridge["areal_trace"]["model_response"]["output_versions"]
+        == right_bridge["areal_trace"]["model_response"]["output_versions"]
+        and left_bridge["areal_trace"]["model_response"]["stop_reason"]
+        == right_bridge["areal_trace"]["model_response"]["stop_reason"]
+        and left_bridge["areal_trace"]["interaction"]["reward"]
+        == right_bridge["areal_trace"]["interaction"]["reward"]
+    )
+
+
 def compare_screen_runs(c0_root: Path, c1_root: Path) -> dict[str, object]:
     configured_root = Path(os.environ["JPH_ROOT"]).resolve()
     c0_root = c0_root.resolve()
@@ -452,21 +508,33 @@ def compare_screen_runs(c0_root: Path, c1_root: Path) -> dict[str, object]:
         "screen runtime contracts are missing",
     )
     pair_id = c0_runtime["identity"]["screen_pair_id"]
+    c0_treatment = {
+        "generation_logprob_mode": C0_MODE,
+        "sglang_return_original_logprob": False,
+    }
+    c1_treatment = {
+        "generation_logprob_mode": C1_MODE,
+        "sglang_return_original_logprob": True,
+    }
+    if c0_runtime.get("schema_version") == "jph.sglang-inference-runtime.v2":
+        c0_treatment = {
+            "disable_cuda_graph": False,
+            "experimental_axis": "generation-logprob-formula-v1",
+            **c0_treatment,
+        }
+        c1_treatment = {
+            "disable_cuda_graph": False,
+            "experimental_axis": "generation-logprob-formula-v1",
+            **c1_treatment,
+        }
     runtime_fixed_equal = (
         isinstance(pair_id, str)
         and bool(pair_id)
         and pair_id == c1_runtime["identity"]["screen_pair_id"]
+        and c0_runtime["schema_version"] == c1_runtime["schema_version"]
         and c0_runtime["fixed"] == c1_runtime["fixed"]
-        and c0_runtime["treatment"]
-        == {
-            "generation_logprob_mode": C0_MODE,
-            "sglang_return_original_logprob": False,
-        }
-        and c1_runtime["treatment"]
-        == {
-            "generation_logprob_mode": C1_MODE,
-            "sglang_return_original_logprob": True,
-        }
+        and c0_runtime["treatment"] == c0_treatment
+        and c1_runtime["treatment"] == c1_treatment
     )
 
     traces: list[dict[str, object]] = []
@@ -480,43 +548,7 @@ def compare_screen_runs(c0_root: Path, c1_root: Path) -> dict[str, object]:
         right = c1[prompt_key]
         left_bridge = left["bridge"]
         right_bridge = right["bridge"]
-        left_joint = {
-            key: value
-            for key, value in left_bridge["joint_version"].items()
-            if key != "policy"
-        }
-        right_joint = {
-            key: value
-            for key, value in right_bridge["joint_version"].items()
-            if key != "policy"
-        }
-        generation_equal = (
-            left_bridge["origin"] == right_bridge["origin"]
-            and left_bridge["task_id"] == right_bridge["task_id"]
-            and left_bridge["request_id"] == right_bridge["request_id"]
-            and left_joint == right_joint
-            and left_bridge["prompt_binding"] == right_bridge["prompt_binding"]
-            and left_bridge["harness"]["state"]
-            == right_bridge["harness"]["state"]
-            and left_bridge["harness"]["controller_checkpoint_before_decision"]
-            == right_bridge["harness"]["controller_checkpoint_before_decision"]
-            and left_bridge["harness"]["applied_instruction"]
-            == right_bridge["harness"]["applied_instruction"]
-            and left_bridge["harness"]["decision"]
-            == right_bridge["harness"]["decision"]
-            and left_bridge["areal_trace"]["origin"]
-            == right_bridge["areal_trace"]["origin"]
-            and left_bridge["areal_trace"]["model_response"]["input_tokens"]
-            == right_bridge["areal_trace"]["model_response"]["input_tokens"]
-            and left_bridge["areal_trace"]["model_response"]["output_tokens"]
-            == right_bridge["areal_trace"]["model_response"]["output_tokens"]
-            and left_bridge["areal_trace"]["model_response"]["output_versions"]
-            == right_bridge["areal_trace"]["model_response"]["output_versions"]
-            and left_bridge["areal_trace"]["model_response"]["stop_reason"]
-            == right_bridge["areal_trace"]["model_response"]["stop_reason"]
-            and left_bridge["areal_trace"]["interaction"]["reward"]
-            == right_bridge["areal_trace"]["interaction"]["reward"]
-        )
+        generation_equal = paired_generation_equal(left_bridge, right_bridge)
         all_generation_equal = all_generation_equal and generation_equal
         paired_score = _paired_score_deltas(left["score"], right["score"])
         all_rescored_equal = (

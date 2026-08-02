@@ -21,7 +21,10 @@ from .schema import EpisodeTrace, JointVersion
 
 
 SCHEMA_VERSION = "jph.areal-joint-interaction-bridge.v2"
-INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = "jph.sglang-inference-runtime.v1"
+INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = "jph.sglang-inference-runtime.v2"
+LEGACY_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = (
+    "jph.sglang-inference-runtime.v1"
+)
 CONTEXT_BUILDER_VERSION = "gsm8k-harness-prompt-v1"
 HARNESS_ARTIFACT_VERSION = "gsm8k-bounded-prompt-actions-v1"
 GENERATION_LOGPROB_MODES = frozenset(
@@ -82,9 +85,13 @@ def inference_runtime_contract_sha256(
 ) -> str:
     """Return the content identity of a normalized, non-secret launch contract."""
 
+    schema_version = contract.get("schema_version")
     _require(
-        contract.get("schema_version")
-        == INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION,
+        schema_version
+        in {
+            LEGACY_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION,
+            INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION,
+        },
         "unknown inference runtime contract schema",
     )
     identity = contract.get("identity")
@@ -136,11 +143,40 @@ def inference_runtime_contract_sha256(
         set(fixed) == required_fixed,
         "inference runtime fixed field set differs from contract",
     )
+    if schema_version == LEGACY_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION:
+        required_treatment = {
+            "generation_logprob_mode",
+            "sglang_return_original_logprob",
+        }
+    else:
+        required_treatment = {
+            "disable_cuda_graph",
+            "experimental_axis",
+            "generation_logprob_mode",
+            "sglang_return_original_logprob",
+        }
     _require(
-        set(treatment)
-        == {"generation_logprob_mode", "sglang_return_original_logprob"},
+        set(treatment) == required_treatment,
         "inference runtime treatment field set differs from contract",
     )
+    if schema_version == INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION:
+        server_args = fixed.get("server_args")
+        _require(
+            isinstance(server_args, Mapping)
+            and type(server_args.get("disable_cuda_graph")) is bool
+            and server_args["disable_cuda_graph"]
+            is treatment["disable_cuda_graph"],
+            "CUDA Graph treatment differs from effective server args",
+        )
+        _require(
+            treatment.get("experimental_axis")
+            in {
+                "none-v1",
+                "generation-logprob-formula-v1",
+                "cuda-graph-v1",
+            },
+            "unknown inference runtime experimental axis",
+        )
     try:
         payload = _canonical_json(dict(contract))
     except (TypeError, ValueError) as exc:
@@ -701,6 +737,15 @@ def validate_areal_joint_bridge_record(
         is (generation_logprob_mode == "original-log-softmax-v1"),
         "inference runtime treatment differs from generation mode",
     )
+    if (
+        runtime_contract["schema_version"]
+        == INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION
+    ):
+        _require(
+            runtime_treatment["disable_cuda_graph"]
+            is runtime_server_args.get("disable_cuda_graph"),
+            "inference runtime CUDA Graph treatment differs from server args",
+        )
     dataset_selection = policy.get("dataset_selection")
     _require(
         isinstance(dataset_selection, str) and bool(dataset_selection),

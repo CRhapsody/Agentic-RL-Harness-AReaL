@@ -126,8 +126,16 @@ def _build_inference_runtime_contract(
         "request_retries",
     )
     mode = os.environ["JPH_SGLANG_LOGPROB_MODE"]
+    normalized_server_args = _json_value(server_args)
+    if not isinstance(normalized_server_args, dict):
+        raise TypeError("effective SGLang server args must be an object")
+    disable_cuda_graph = normalized_server_args.get("disable_cuda_graph")
+    if type(disable_cuda_graph) is not bool:
+        raise ValueError(
+            "effective SGLang server args must declare disable_cuda_graph"
+        )
     contract: dict[str, object] = {
-        "schema_version": "jph.sglang-inference-runtime.v1",
+        "schema_version": "jph.sglang-inference-runtime.v2",
         "identity": {
             "run_id": os.environ["JPH_RUN_ID"],
             "screen_pair_id": os.environ.get("JPH_SCREEN_PAIR_ID") or None,
@@ -155,7 +163,7 @@ def _build_inference_runtime_contract(
             "project_commit": os.environ["JPH_PROJECT_COMMIT"],
             "rollout": _selected_fields(config.rollout, rollout_fields),
             "seed": int(config.seed),
-            "server_args": _json_value(server_args),
+            "server_args": normalized_server_args,
             "sglang_environment": {
                 "SGLANG_CACHE_DIR": os.environ["SGLANG_CACHE_DIR"],
             },
@@ -164,6 +172,8 @@ def _build_inference_runtime_contract(
             "transformers_version": distribution_version("transformers"),
         },
         "treatment": {
+            "disable_cuda_graph": disable_cuda_graph,
+            "experimental_axis": os.environ["JPH_EXPERIMENTAL_AXIS"],
             "generation_logprob_mode": mode,
             "sglang_return_original_logprob": (
                 os.environ["SGLANG_RETURN_ORIGINAL_LOGPROB"] == "1"

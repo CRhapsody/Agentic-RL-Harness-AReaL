@@ -7,12 +7,17 @@ import re
 
 
 _SAFE_PAIR_ID = re.compile(r"^[A-Za-z0-9._-]{16,160}$")
+_PAIR_CELLS = {
+    "sglang-logprob-screen": {"c0", "c1"},
+    "sglang-cuda-graph-screen": {"c2a", "c2b"},
+}
 
 
 def write_pointer(
     *,
     configured_root: Path,
     pair_id: str,
+    pair_artifact_group: str = "sglang-logprob-screen",
     cell: str,
     pointer: Path,
     run_root: Path,
@@ -24,10 +29,12 @@ def write_pointer(
         raise ValueError(f"invalid configured root: {root}")
     if _SAFE_PAIR_ID.fullmatch(pair_id) is None:
         raise ValueError("unsafe screen pair ID")
-    if cell not in {"c0", "c1"}:
+    if pair_artifact_group not in _PAIR_CELLS:
+        raise ValueError(f"unknown screen pair artifact group: {pair_artifact_group}")
+    if cell not in _PAIR_CELLS[pair_artifact_group]:
         raise ValueError(f"unknown screen cell: {cell}")
     declared_pair_root = (
-        root / "artifacts" / "sglang-logprob-screen" / "pairs" / pair_id
+        root / "artifacts" / pair_artifact_group / "pairs" / pair_id
     )
     if declared_pair_root.is_symlink():
         raise ValueError(f"screen pair root is a symlink: {declared_pair_root}")
@@ -89,13 +96,25 @@ def main() -> None:
         description="Write one root-bounded SGLang screen pair pointer"
     )
     parser.add_argument("--pair-id", required=True)
-    parser.add_argument("--cell", choices=("c0", "c1"), required=True)
+    parser.add_argument(
+        "--pair-artifact-group",
+        choices=tuple(_PAIR_CELLS),
+        default="sglang-logprob-screen",
+    )
+    parser.add_argument(
+        "--cell",
+        choices=tuple(
+            sorted({cell for cells in _PAIR_CELLS.values() for cell in cells})
+        ),
+        required=True,
+    )
     parser.add_argument("--pointer", type=Path, required=True)
     parser.add_argument("--run-root", type=Path, required=True)
     args = parser.parse_args()
     write_pointer(
         configured_root=Path(os.environ["JPH_ROOT"]),
         pair_id=args.pair_id,
+        pair_artifact_group=args.pair_artifact_group,
         cell=args.cell,
         pointer=args.pointer,
         run_root=args.run_root,

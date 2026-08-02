@@ -40,6 +40,8 @@ TASK_COUNT="${JPH_AREAL_JOINT_BRIDGE_TASKS:-4}"
 TASK_OFFSET="${JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET:-0}"
 SGLANG_LOGPROB_MODE="${JPH_SGLANG_LOGPROB_MODE:-standard-log-of-softmax-v1}"
 CLEAN_ENVIRONMENT_POLICY="${JPH_CLEAN_ENVIRONMENT_POLICY:-filtered-inherited-v1}"
+SGLANG_DISABLE_CUDA_GRAPH="${JPH_SGLANG_DISABLE_CUDA_GRAPH:-false}"
+EXPERIMENTAL_AXIS="${JPH_EXPERIMENTAL_AXIS:-none-v1}"
 
 if [[ ! "${TASK_COUNT}" =~ ^[1-8]$ ]]; then
   echo "JPH_AREAL_JOINT_BRIDGE_TASKS must be an integer from 1 through 8" >&2
@@ -67,11 +69,20 @@ case "${SGLANG_LOGPROB_MODE}" in
     exit 2
     ;;
 esac
+case "${SGLANG_DISABLE_CUDA_GRAPH}" in
+  true|false) ;;
+  *)
+    echo "JPH_SGLANG_DISABLE_CUDA_GRAPH must be true or false" >&2
+    exit 2
+    ;;
+esac
 case "${BRIDGE_RUN_KIND}" in
   formal-v1)
     if [[ "${TASK_COUNT}" != 4 || "${TASK_OFFSET}" != 0 ]] \
-      || [[ "${SGLANG_LOGPROB_MODE}" != standard-log-of-softmax-v1 ]]; then
-      echo "formal-v1 requires count=4 offset=0 and the standard log-prob mode" >&2
+      || [[ "${SGLANG_LOGPROB_MODE}" != standard-log-of-softmax-v1 ]] \
+      || [[ "${SGLANG_DISABLE_CUDA_GRAPH}" != false ]] \
+      || [[ "${EXPERIMENTAL_AXIS}" != none-v1 ]]; then
+      echo "formal-v1 requires count=4 offset=0, standard log-prob, CUDA Graph enabled, and no experimental axis" >&2
       exit 2
     fi
     ARTIFACT_GROUP="areal-joint-bridge"
@@ -89,7 +100,39 @@ case "${BRIDGE_RUN_KIND}" in
       echo "logprob mechanism screen requires a safe JPH_SCREEN_PAIR_ID" >&2
       exit 2
     fi
+    if [[ "${SGLANG_DISABLE_CUDA_GRAPH}" != false ]] \
+      || [[ "${EXPERIMENTAL_AXIS}" != generation-logprob-formula-v1 ]]; then
+      echo "logprob mechanism screen requires CUDA Graph enabled and the formula axis" >&2
+      exit 2
+    fi
     ARTIFACT_GROUP="sglang-logprob-screen/${SGLANG_LOGPROB_MODE}"
+    ;;
+  cuda-graph-mechanism-screen-v1)
+    if [[ "${TASK_COUNT}" != 4 || "${TASK_OFFSET}" != 64 ]] \
+      || [[ "${SGLANG_LOGPROB_MODE}" != standard-log-of-softmax-v1 ]]; then
+      echo "CUDA Graph screen requires count=4 offset=64 and standard log-prob" >&2
+      exit 2
+    fi
+    if [[ "${CLEAN_ENVIRONMENT_POLICY}" != env-i-v1 ]]; then
+      echo "CUDA Graph screen requires the env-i-v1 launch policy" >&2
+      exit 2
+    fi
+    if [[ ! "${JPH_SCREEN_PAIR_ID:-}" =~ ^[A-Za-z0-9._-]{16,160}$ ]]; then
+      echo "CUDA Graph screen requires a safe JPH_SCREEN_PAIR_ID" >&2
+      exit 2
+    fi
+    if [[ "${EXPERIMENTAL_AXIS}" != cuda-graph-v1 ]]; then
+      echo "CUDA Graph screen requires the cuda-graph-v1 axis" >&2
+      exit 2
+    fi
+    if [[ "${SGLANG_DISABLE_CUDA_GRAPH}" == false ]]; then
+      CUDA_GRAPH_CELL=c2a
+      CUDA_GRAPH_VARIANT=cuda-graph-enabled-v1
+    else
+      CUDA_GRAPH_CELL=c2b
+      CUDA_GRAPH_VARIANT=cuda-graph-disabled-v1
+    fi
+    ARTIFACT_GROUP="sglang-cuda-graph-screen/${CUDA_GRAPH_VARIANT}"
     ;;
   *)
     echo "Unknown JPH_BRIDGE_RUN_KIND: ${BRIDGE_RUN_KIND}" >&2
@@ -212,7 +255,11 @@ fi
 
 RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_NONCE="$("${AREAL_VENV}/bin/python" -c 'import secrets; print(secrets.token_hex(16))')"
-RUN_ID="${RUN_STAMP}-${SGLANG_LOGPROB_MODE}-${RUN_NONCE}"
+if [[ "${BRIDGE_RUN_KIND}" == cuda-graph-mechanism-screen-v1 ]]; then
+  RUN_ID="${RUN_STAMP}-${CUDA_GRAPH_VARIANT}-${RUN_NONCE}"
+else
+  RUN_ID="${RUN_STAMP}-${SGLANG_LOGPROB_MODE}-${RUN_NONCE}"
+fi
 RUN_ROOT="${JPH_ROOT}/artifacts/${ARTIFACT_GROUP}/${RUN_ID}"
 BRIDGE_DIR="${RUN_ROOT}/bridge-records"
 SAME_BACKEND_SCORE_DIR="${RUN_ROOT}/same-backend-scores"
@@ -257,7 +304,7 @@ JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
 SECRET_REDACTOR_PID="$!"
 
 echo "project=${PROJECT_COMMIT} AReaL=${ACTUAL_AREAL_COMMIT} physical_gpu=${GPU_ID} model_revision=${MODEL_REVISION} dataset_revision=${DATASET_REVISION}" | tee -a "${LOG_PATH}"
-echo "run_id=${RUN_ID} run_kind=${BRIDGE_RUN_KIND} dataset_selection=${DATASET_SELECTION} sglang_version=${SGLANG_VERSION} generation_logprob_mode=${SGLANG_LOGPROB_MODE}" | tee -a "${LOG_PATH}"
+echo "run_id=${RUN_ID} run_kind=${BRIDGE_RUN_KIND} dataset_selection=${DATASET_SELECTION} sglang_version=${SGLANG_VERSION} generation_logprob_mode=${SGLANG_LOGPROB_MODE} disable_cuda_graph=${SGLANG_DISABLE_CUDA_GRAPH} experimental_axis=${EXPERIMENTAL_AXIS}" | tee -a "${LOG_PATH}"
 echo "gpu_uuid=${GPU_UUID} gpu_name=${GPU_NAME} driver=${GPU_DRIVER_VERSION} clean_environment_policy=${CLEAN_ENVIRONMENT_POLICY}" | tee -a "${LOG_PATH}"
 echo "run_root=${RUN_ROOT} bridge_dir=${BRIDGE_DIR} same_backend_score_dir=${SAME_BACKEND_SCORE_DIR}" | tee -a "${LOG_PATH}"
 
@@ -279,6 +326,8 @@ JPH_BEHAVIOR_REVISION="${MODEL_REVISION}" \
 JPH_DATASET_REVISION="${DATASET_REVISION}" \
 JPH_DATASET_SELECTION="${DATASET_SELECTION}" \
 JPH_SGLANG_LOGPROB_MODE="${SGLANG_LOGPROB_MODE}" \
+JPH_SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH}" \
+JPH_EXPERIMENTAL_AXIS="${EXPERIMENTAL_AXIS}" \
 JPH_SGLANG_VERSION="${SGLANG_VERSION}" \
 JPH_RUN_ID="${RUN_ID}" \
 JPH_SCREEN_PAIR_ID="${JPH_SCREEN_PAIR_ID:-}" \
@@ -311,6 +360,7 @@ JPH_EXPECTED_POLICY_VERSION=0 \
   rollout.dump_to_file=false \
   '+rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}' \
   sglang.mem_fraction_static=0.35 \
+  sglang.disable_cuda_graph="${SGLANG_DISABLE_CUDA_GRAPH}" \
   sglang.context_length=1024 \
   sglang.max_running_requests=1 \
   2>&1 | tee -a "${LOG_PATH}"
@@ -329,7 +379,8 @@ JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
   "${AREAL_VENV}/bin/python" "${SCRIPT_DIR}/redact_runtime_admin_key.py" \
     "${RUN_ROOT}"
 
-if [[ "${BRIDGE_RUN_KIND}" == logprob-mechanism-screen-v1 ]]; then
+if [[ "${BRIDGE_RUN_KIND}" == logprob-mechanism-screen-v1 ]] \
+  || [[ "${BRIDGE_RUN_KIND}" == cuda-graph-mechanism-screen-v1 ]]; then
   echo "SGLang log-prob screen cell finished; beginning immutable final audit" \
     >> "${LOG_PATH}"
   JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
@@ -337,14 +388,20 @@ if [[ "${BRIDGE_RUN_KIND}" == logprob-mechanism-screen-v1 ]]; then
       "${SCRIPT_DIR}/audit_sglang_logprob_screen_cell.py" "${RUN_ROOT}"
   RUN_TREE_FINALIZED=1
   POINTER_PATH="${JPH_SCREEN_CELL_POINTER:-}"
-  if [[ "${SGLANG_LOGPROB_MODE}" == standard-log-of-softmax-v1 ]]; then
+  if [[ "${BRIDGE_RUN_KIND}" == cuda-graph-mechanism-screen-v1 ]]; then
+    SCREEN_CELL="${CUDA_GRAPH_CELL}"
+    POINTER_GROUP=sglang-cuda-graph-screen
+  elif [[ "${SGLANG_LOGPROB_MODE}" == standard-log-of-softmax-v1 ]]; then
     SCREEN_CELL=c0
+    POINTER_GROUP=sglang-logprob-screen
   else
     SCREEN_CELL=c1
+    POINTER_GROUP=sglang-logprob-screen
   fi
   "${AREAL_VENV}/bin/python" \
     "${SCRIPT_DIR}/write_sglang_logprob_screen_pointer.py" \
     --pair-id "${JPH_SCREEN_PAIR_ID}" \
+    --pair-artifact-group "${POINTER_GROUP}" \
     --cell "${SCREEN_CELL}" \
     --pointer "${POINTER_PATH}" \
     --run-root "${RUN_ROOT}"
