@@ -1,0 +1,43 @@
+# Source repositories contain code and small, reviewable metadata only.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local environments and editor state.
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+
+# Data, models, checkpoints, trajectories, and experiment products must live
+# outside the repository (remotely under /mnt/sdb/ljw/chizm/{data,models,...}).
+data/
+datasets/
+models/
+checkpoints/
+artifacts/
+outputs/
+results/
+logs/
+wandb/
+cache/
+tmp/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.arrow
+*.parquet
+*.jsonl
+
+# Small plans, schemas, configs, and test fixtures remain tracked.
+!tests/fixtures/**/*.jsonl

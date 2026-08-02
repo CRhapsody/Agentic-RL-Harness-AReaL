@@ -251,8 +251,8 @@ jphrl/
 
 - 统一综述：[[PaperNotes/Agentic-RL-Harness-统一范式|Agentic RL × Harness：近期工作、统一范式与差异]]
 - 现代 RL 书籍：`Book/hands-on-modern-rl`，固定知识审计 commit `29e27088e01097ae6bd149313581a8ae5b68f65b`
-- 详细实验协议：[EXPERIMENT_PLAN.md](../../refine-logs/EXPERIMENT_PLAN.md)
-- 运行记录模板：[EXPERIMENT_TRACKER.md](../../refine-logs/EXPERIMENT_TRACKER.md)
+- 详细实验协议：[EXPERIMENT_PLAN.md](refine-logs/EXPERIMENT_PLAN.md)
+- 运行记录模板：[EXPERIMENT_TRACKER.md](refine-logs/EXPERIMENT_TRACKER.md)
 
 ## 12. 开工前唯一硬件门
 
