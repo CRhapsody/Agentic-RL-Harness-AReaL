@@ -25,7 +25,7 @@
 | JPH-M0-AREAL-ENV-001 | B0 | 固定 AReaL 环境安装与 CUDA 校验 | 0 | N/A | N/A | passed | 472 个锁定包；PyTorch 2.9.1+cu129；FlashAttention CUDA 运算通过；路径审计 `ok=true` | `/mnt/sdb/ljw/chizm/artifacts/bootstrap/areal-v2.0.0/` | `v2.0.0@fee938e...`；tmux exit=0 |
 | JPH-B0-PREFETCH-001 | B0 | 1.5B 模型与 GSM8K 预取 | 0 | base | fixed | passed | Qwen commit `989aa798...`；GSM8K commit `740312a...`，7473 train/1319 test | 外置 HF cache 与 bootstrap manifest | 约 3.0GiB；离线固定 snapshot |
 | JPH-B0-MODEL-LOAD-001 | B0 | 固定模型离线 CUDA load/generate | 0 | base | fixed | passed | 1,543,714,304 参数；BF16；峰值 3,100,396,032 bytes；短生成成功 | `/mnt/sdb/ljw/chizm/artifacts/bootstrap/qwen2.5-1.5b-cuda-smoke.json` | GPU 0；不是 AReaL 训练结果 |
-| JPH-B0-OFFICIAL-001 | B0 | 官方 AReaL 1-step | 0 | base | fixed | running | run `20260802T070510Z`；4 个 FSDP actor rank 已建立，GPU 0 至 3 约用 5.9 至 6.8GiB；最终结果待日志 | `/mnt/sdb/ljw/chizm/artifacts/areal-b0/20260802T070510Z` | 门禁为每卡 used≤8GiB 且 free≥72GiB；GPU 2/3 与其他用户各约 0.9GiB 进程共享，未干预 |
+| JPH-B0-OFFICIAL-001 | B0 | 官方 AReaL 1-step | 0 | base | fixed | running | 前两个 GPU run 已完成故障定位并安全停止；下一次 run 待启动 | 外置 artifacts/logs | 门禁为每卡 used≤10GiB 且 free≥70GiB；不终止或修改其他用户进程 |
 | JPH-B0-TRACE-001 | B0 | token/logprob/mask/version 复算 | 0 | base | fixed | planned |  | 外置 trace |  |
 | JPH-B1-HO-S0 | B1 | Harness-only contextual bandit | 0 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9875；随机基线 0.2；参数 delta L2 累计 8.4126 | `/mnt/sdb/ljw/chizm/artifacts/harness-bandit/b1-three-seed.json` | 远端复跑，400 steps |
 | JPH-B1-HO-S1 | B1 | Harness-only contextual bandit | 1 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9885；随机基线 0.2；参数 delta L2 累计 8.2224 | 同上 | 远端复跑，400 steps |
@@ -118,7 +118,7 @@ decision:
 | 2026-08-02 | 先通过 B0/B1，再实现 P3 | 当前 25 tests 只覆盖固定 controller 与 trace contract | 阶段门失败即停，不消耗大规模 GPU |
 | 2026-08-02 | 公网访问使用目标目录内的 loopback CONNECT 代理，不修改服务器 DNS | 系统有公网路由但 systemd-resolved 无上游；显式 DNS、TLS、GitHub 与依赖安装均通过 | 停止 `jph-net` tmux session 即完全移除 |
 | 2026-08-02 | 所有长任务使用目标目录内的显式 tmux socket | 默认 tmux socket 会写 `/tmp`；`/mnt/sdb/ljw/chizm/runtime/tmux/jph.sock` 在 SSH 重连后仍存活 | 停止相应 session；日志与 socket 均在目标根目录 |
-| 2026-08-02 | B0 以显存余量代替 `<500MiB` 空闲判定 | 五次采样最少空闲 77,843MiB；SGLang `mem_fraction_static=0.8` 对 80GiB 卡静态预算为 64GiB，72GiB 最小空闲仍留 8GiB；actor 调度声明 32GiB | 环境变量可提高 `JPH_B0_MIN_FREE_MEMORY_MIB` 或降低 `JPH_B0_MAX_USED_MEMORY_MIB`；启动脚本再次检查 |
+| 2026-08-02 | B0 以显存余量代替 `<500MiB` 空闲判定 | SGLang `mem_fraction_static=0.8` 对 80GiB 卡静态预算为 64GiB；70GiB 最小空闲仍留 6GiB；actor 调度声明 32GiB | 默认要求 used≤10GiB 且 free≥70GiB；环境变量可收紧门禁，启动脚本再次检查 |
 
 ## Failure Log
 
