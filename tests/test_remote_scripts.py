@@ -59,6 +59,13 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("rollout.max_concurrent_rollouts=8", text)
         self.assertIn("rollout.max_head_offpolicyness=0", text)
         self.assertIn("CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7", text)
+        self.assertIn('MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/', text)
+        self.assertIn('DATASET_REPORT="${JPH_ROOT}/artifacts/bootstrap/', text)
+        self.assertIn('actor.path="${MODEL_SNAPSHOT}"', text)
+        self.assertIn('train_dataset.path="${DATASET_SNAPSHOT}"', text)
+        self.assertIn("HF_HUB_OFFLINE=1", text)
+        self.assertIn("HF_DATASETS_OFFLINE=1", text)
+        self.assertIn("TRANSFORMERS_OFFLINE=1", text)
 
     def test_real_smoke_requires_an_on_disk_trace_audit(self) -> None:
         text = (SCRIPTS / "run_remote_smoke.sh").read_text(encoding="utf-8")

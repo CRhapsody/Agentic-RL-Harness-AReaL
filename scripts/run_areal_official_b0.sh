@@ -8,6 +8,8 @@ source "${SCRIPT_DIR}/remote_env.sh"
 AREAL_REPO="${JPH_ROOT}/src/AReaL-v2.0.0"
 AREAL_VENV="${JPH_ROOT}/venvs/areal-v2.0.0"
 EXPECTED_COMMIT="fee938eada49208a5aabdbc1095730a13076a349"
+MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/qwen2.5-1.5b-snapshot.json"
+DATASET_REPORT="${JPH_ROOT}/artifacts/bootstrap/gsm8k-snapshot.json"
 
 if [[ ! -d "${AREAL_REPO}/.git" ]]; then
   echo "Missing ${AREAL_REPO}; bootstrap the pinned AReaL source first" >&2
@@ -17,6 +19,36 @@ if [[ ! -x "${AREAL_VENV}/bin/python" ]]; then
   echo "Missing ${AREAL_VENV}; bootstrap the pinned AReaL environment first" >&2
   exit 2
 fi
+for REPORT in "${MODEL_REPORT}" "${DATASET_REPORT}"; do
+  if [[ ! -f "${REPORT}" ]]; then
+    echo "Missing pinned Hugging Face snapshot report: ${REPORT}" >&2
+    exit 2
+  fi
+done
+
+MODEL_SNAPSHOT="$(
+  "${AREAL_VENV}/bin/python" -c \
+    'import json, sys; print(json.load(open(sys.argv[1]))["snapshot_path"])' \
+    "${MODEL_REPORT}"
+)"
+DATASET_SNAPSHOT="$(
+  "${AREAL_VENV}/bin/python" -c \
+    'import json, sys; print(json.load(open(sys.argv[1]))["snapshot_path"])' \
+    "${DATASET_REPORT}"
+)"
+for SNAPSHOT in "${MODEL_SNAPSHOT}" "${DATASET_SNAPSHOT}"; do
+  if [[ ! -d "${SNAPSHOT}" ]]; then
+    echo "Pinned snapshot directory is missing: ${SNAPSHOT}" >&2
+    exit 2
+  fi
+  case "${SNAPSHOT}" in
+    "${JPH_ROOT}"/*) ;;
+    *)
+      echo "Pinned snapshot escapes ${JPH_ROOT}: ${SNAPSHOT}" >&2
+      exit 2
+      ;;
+  esac
+done
 
 ACTUAL_COMMIT="$(git -C "${AREAL_REPO}" rev-parse HEAD)"
 if [[ "${ACTUAL_COMMIT}" != "${EXPECTED_COMMIT}" ]]; then
@@ -62,6 +94,9 @@ cd "${AREAL_REPO}"
 echo "AReaL=${ACTUAL_COMMIT} GPUs=0,1,2,3,4,5,6,7 run_root=${RUN_ROOT}"
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+HF_HUB_OFFLINE=1 \
+HF_DATASETS_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
   "${AREAL_VENV}/bin/python" examples/math/gsm8k_rl.py \
   --config examples/math/gsm8k_grpo.yaml \
   scheduler.type=local \
@@ -70,6 +105,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   cluster.n_nodes=1 \
   cluster.n_gpus_per_node=8 \
   total_train_steps=1 \
+  actor.path="${MODEL_SNAPSHOT}" \
+  tokenizer_path="${MODEL_SNAPSHOT}" \
+  train_dataset.path="${DATASET_SNAPSHOT}" \
+  valid_dataset.path="${DATASET_SNAPSHOT}" \
   train_dataset.batch_size=8 \
   train_dataset.num_workers=2 \
   valid_dataset.batch_size=8 \
