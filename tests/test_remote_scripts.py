@@ -1,5 +1,8 @@
 from pathlib import Path
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -74,6 +77,9 @@ class RemoteScriptContractTests(unittest.TestCase):
             text,
         )
         self.assertNotIn("AREAL_ALLOW_DEFAULT_ADMIN_KEY=1", text)
+        self.assertIn("umask 077", text)
+        self.assertIn("redact_runtime_admin_key.py", text)
+        self.assertNotIn("set -x", text)
         self.assertIn('JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6', text)
         self.assertIn('export CUDACXX="${CUDA_HOME}/bin/nvcc"', text)
         self.assertIn('export PATH="${AREAL_VENV}/bin:${CUDA_HOME}/bin:${PATH}"', text)
@@ -117,6 +123,38 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertNotIn("pkill", text)
         self.assertNotIn("kill -", text)
 
+    def test_runtime_admin_key_redactor_stays_in_root_and_scrubs_text(self) -> None:
+        redactor = SCRIPTS / "redact_runtime_admin_key.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "run" / "config.yaml"
+            artifact.parent.mkdir()
+            secret = "jph-b0-test-secret"
+            artifact.write_text(f"admin_api_key: {secret}\n", encoding="utf-8")
+            env = {
+                **os.environ,
+                "JPH_ROOT": str(root),
+                "JPH_AREAL_ADMIN_API_KEY": secret,
+            }
+            subprocess.run(
+                [sys.executable, str(redactor), str(root / "run")],
+                check=True,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            result = artifact.read_text(encoding="utf-8")
+            self.assertNotIn(secret, result)
+            self.assertIn("<redacted-runtime-admin-key>", result)
+
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    [sys.executable, str(redactor), str(root.parent)],
+                    check=True,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
     def test_b0_launcher_rechecks_memory_headroom(self) -> None:
         text = (SCRIPTS / "run_areal_official_b0.sh").read_text(
             encoding="utf-8"

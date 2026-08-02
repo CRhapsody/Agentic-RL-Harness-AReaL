@@ -111,10 +111,19 @@ RUN_ADMIN_API_KEY="$(
   "${AREAL_VENV}/bin/python" -c \
     'import secrets; print("jph-b0-" + secrets.token_urlsafe(32))'
 )"
+umask 077
 mkdir -p "${RUN_ROOT}" "${NAME_RESOLVE_ROOT}"
 
 GPU_MONITOR_PID=""
+SECRET_REDACTOR_PID=""
 cleanup() {
+  if [[ -n "${SECRET_REDACTOR_PID}" ]]; then
+    kill "${SECRET_REDACTOR_PID}" >/dev/null 2>&1 || true
+    wait "${SECRET_REDACTOR_PID}" >/dev/null 2>&1 || true
+  fi
+  JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
+    "${AREAL_VENV}/bin/python" "${SCRIPT_DIR}/redact_runtime_admin_key.py" \
+      "${RUN_ROOT}" "${LOG_PATH}" >/dev/null 2>&1 || true
   if [[ -n "${GPU_MONITOR_PID}" ]]; then
     kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
     wait "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
@@ -123,6 +132,10 @@ cleanup() {
 trap cleanup EXIT
 nvidia-smi dmon -s pucm -d 5 -o TD > "${RUN_ROOT}/gpu-dmon.log" 2>&1 &
 GPU_MONITOR_PID="$!"
+JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
+  "${AREAL_VENV}/bin/python" "${SCRIPT_DIR}/redact_runtime_admin_key.py" \
+    --watch-seconds 600 "${RUN_ROOT}" "${LOG_PATH}" >/dev/null 2>&1 &
+SECRET_REDACTOR_PID="$!"
 
 cd "${AREAL_REPO}"
 echo "AReaL=${ACTUAL_COMMIT} GPUs=0,1,2,3,4,5,6,7 run_root=${RUN_ROOT}"
