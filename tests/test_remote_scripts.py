@@ -97,6 +97,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("JPH_AREAL_TRACE_TASKS=1", launcher)
         self.assertIn("rollout.backend=sglang:d1p1t1", launcher)
         self.assertIn("sglang.mem_fraction_static=0.35", launcher)
+        self.assertNotIn("rollout.agent=null", launcher)
         self.assertIn("flock -n 9", launcher)
         self.assertIn("HF_HUB_OFFLINE=1", launcher)
         self.assertIn("AutoModelForCausalLM.from_pretrained", verifier)

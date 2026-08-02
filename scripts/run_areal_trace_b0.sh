@@ -136,7 +136,6 @@ JPH_BEHAVIOR_REVISION="${MODEL_REVISION}" \
   rollout.backend=sglang:d1p1t1 \
   rollout.max_concurrent_rollouts=1 \
   rollout.dump_to_file=false \
-  rollout.agent=null \
   sglang.mem_fraction_static=0.35 \
   sglang.context_length=1024 \
   sglang.max_running_requests=1 \
