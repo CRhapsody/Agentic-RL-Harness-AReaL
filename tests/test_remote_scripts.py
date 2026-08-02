@@ -69,6 +69,13 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("HF_HUB_OFFLINE=1", text)
         self.assertIn("flock -n 9", text)
 
+    def test_dataset_prefetch_pins_revision_and_audits_cache_paths(self) -> None:
+        text = (SCRIPTS / "prefetch_hf_dataset.py").read_text(encoding="utf-8")
+        self.assertIn('repo_type="dataset"', text)
+        self.assertIn("revision=commit", text)
+        self.assertIn("require_within_configured_root(snapshot)", text)
+        self.assertIn('require_within_configured_root(entry["filename"])', text)
+
     def test_real_trace_audit_rejects_scripted_and_accepts_valid_hf_metadata(self) -> None:
         result = run_calculator_smoke(
             model=MockStructuredModel(),
