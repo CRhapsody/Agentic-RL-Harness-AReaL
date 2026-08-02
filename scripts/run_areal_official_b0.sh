@@ -107,6 +107,10 @@ RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ROOT="${JPH_ROOT}/artifacts/areal-b0/${RUN_STAMP}"
 LOG_PATH="${JPH_ROOT}/logs/areal-b0-${RUN_STAMP}.log"
 NAME_RESOLVE_ROOT="${JPH_ROOT}/runtime/name_resolve/${RUN_STAMP}"
+RUN_ADMIN_API_KEY="$(
+  "${AREAL_VENV}/bin/python" -c \
+    'import secrets; print("jph-b0-" + secrets.token_urlsafe(32))'
+)"
 mkdir -p "${RUN_ROOT}" "${NAME_RESOLVE_ROOT}"
 
 GPU_MONITOR_PID=""
@@ -127,6 +131,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 HF_HUB_OFFLINE=1 \
 HF_DATASETS_OFFLINE=1 \
 TRANSFORMERS_OFFLINE=1 \
+JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
   "${AREAL_VENV}/bin/python" examples/math/gsm8k_rl.py \
   --config examples/math/gsm8k_grpo.yaml \
   scheduler.type=local \
@@ -149,6 +154,7 @@ TRANSFORMERS_OFFLINE=1 \
   rollout.max_concurrent_rollouts=8 \
   rollout.max_head_offpolicyness=0 \
   rollout.dump_to_file=true \
+  'rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}' \
   cluster.fileroot="${RUN_ROOT}" \
   cluster.name_resolve.nfs_record_root="${NAME_RESOLVE_ROOT}" \
   2>&1 | tee "${LOG_PATH}"

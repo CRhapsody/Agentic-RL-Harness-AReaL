@@ -67,6 +67,13 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("HF_HUB_OFFLINE=1", text)
         self.assertIn("HF_DATASETS_OFFLINE=1", text)
         self.assertIn("TRANSFORMERS_OFFLINE=1", text)
+        self.assertIn("secrets.token_urlsafe(32)", text)
+        self.assertIn('JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}"', text)
+        self.assertIn(
+            "'rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}'",
+            text,
+        )
+        self.assertNotIn("AREAL_ALLOW_DEFAULT_ADMIN_KEY=1", text)
         self.assertIn('JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6', text)
         self.assertIn('export CUDACXX="${CUDA_HOME}/bin/nvcc"', text)
         self.assertIn('export PATH="${AREAL_VENV}/bin:${CUDA_HOME}/bin:${PATH}"', text)
