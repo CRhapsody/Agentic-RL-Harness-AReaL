@@ -10,6 +10,17 @@ AREAL_VENV="${JPH_ROOT}/venvs/areal-v2.0.0"
 EXPECTED_COMMIT="fee938eada49208a5aabdbc1095730a13076a349"
 MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/qwen2.5-1.5b-snapshot.json"
 DATASET_REPORT="${JPH_ROOT}/artifacts/bootstrap/gsm8k-snapshot.json"
+MIN_FREE_MEMORY_MIB="${JPH_B0_MIN_FREE_MEMORY_MIB:-73728}"
+MAX_USED_MEMORY_MIB="${JPH_B0_MAX_USED_MEMORY_MIB:-8192}"
+
+if [[ ! "${MIN_FREE_MEMORY_MIB}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "JPH_B0_MIN_FREE_MEMORY_MIB must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "${MAX_USED_MEMORY_MIB}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "JPH_B0_MAX_USED_MEMORY_MIB must be a positive integer" >&2
+  exit 2
+fi
 
 if [[ ! -d "${AREAL_REPO}/.git" ]]; then
   echo "Missing ${AREAL_REPO}; bootstrap the pinned AReaL source first" >&2
@@ -66,9 +77,18 @@ if [[ "${GPU_COUNT}" != "8" ]]; then
   exit 3
 fi
 for GPU_ID in 0 1 2 3 4 5 6 7; do
-  GPU_MEMORY_USED="$(nvidia-smi -i "${GPU_ID}" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')"
-  if [[ ! "${GPU_MEMORY_USED}" =~ ^[0-9]+$ ]] || (( GPU_MEMORY_USED >= 500 )); then
-    echo "GPU ${GPU_ID} is not free: ${GPU_MEMORY_USED} MiB is in use" >&2
+  IFS=, read -r GPU_MEMORY_USED GPU_MEMORY_FREE < <(
+    nvidia-smi -i "${GPU_ID}" \
+      --query-gpu=memory.used,memory.free \
+      --format=csv,noheader,nounits | tr -d ' '
+  )
+  if [[ ! "${GPU_MEMORY_USED}" =~ ^[0-9]+$ ]] || \
+    [[ ! "${GPU_MEMORY_FREE}" =~ ^[0-9]+$ ]]; then
+    echo "Could not read GPU ${GPU_ID} memory usage" >&2
+    exit 3
+  fi
+  if ((GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB || GPU_MEMORY_USED > MAX_USED_MEMORY_MIB)); then
+    echo "GPU ${GPU_ID} failed the memory headroom gate: used=${GPU_MEMORY_USED}MiB free=${GPU_MEMORY_FREE}MiB; require used<=${MAX_USED_MEMORY_MIB}MiB and free>=${MIN_FREE_MEMORY_MIB}MiB" >&2
     exit 3
   fi
 done

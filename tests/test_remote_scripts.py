@@ -97,10 +97,23 @@ class RemoteScriptContractTests(unittest.TestCase):
         text = (SCRIPTS / "wait_and_run_areal_b0.sh").read_text(encoding="utf-8")
         self.assertIn('JPH_B0_MAX_WAIT_SECONDS:-86400', text)
         self.assertIn('JPH_B0_POLL_SECONDS:-60', text)
-        self.assertIn('GPU_MEMORY_USED >= 500', text)
+        self.assertIn('JPH_B0_MIN_FREE_MEMORY_MIB:-73728', text)
+        self.assertIn('JPH_B0_MAX_USED_MEMORY_MIB:-8192', text)
+        self.assertIn('GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB', text)
+        self.assertIn('GPU_MEMORY_USED > MAX_USED_MEMORY_MIB', text)
         self.assertIn('run_areal_official_b0.sh', text)
         self.assertNotIn("pkill", text)
         self.assertNotIn("kill -", text)
+
+    def test_b0_launcher_rechecks_memory_headroom(self) -> None:
+        text = (SCRIPTS / "run_areal_official_b0.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('JPH_B0_MIN_FREE_MEMORY_MIB:-73728', text)
+        self.assertIn('JPH_B0_MAX_USED_MEMORY_MIB:-8192', text)
+        self.assertIn('--query-gpu=memory.used,memory.free', text)
+        self.assertIn('GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB', text)
+        self.assertIn('GPU_MEMORY_USED > MAX_USED_MEMORY_MIB', text)
 
     def test_real_trace_audit_rejects_scripted_and_accepts_valid_hf_metadata(self) -> None:
         result = run_calculator_smoke(
