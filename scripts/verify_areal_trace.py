@@ -142,6 +142,24 @@ def recompute_behavior_logprobs(
                 abs(actual - expected)
                 for actual, expected in zip(recomputed_values, stored_values)
             ]
+            largest_errors = sorted(
+                (
+                    {
+                        "action_position": position,
+                        "token_id": input_ids[position],
+                        "stored_logprob": expected,
+                        "recomputed_logprob": actual,
+                        "abs_error": error,
+                        "importance_ratio_error": abs(
+                            math.exp(actual - expected) - 1.0
+                        ),
+                    }
+                    for position, expected, actual, error in zip(
+                        selected, stored_values, recomputed_values, errors
+                    )
+                ),
+                key=lambda item: (-item["abs_error"], item["action_position"]),
+            )[:5]
             mean_abs_error = sum(errors) / len(errors)
             observed_max_abs_error = max(errors)
             p95_abs_error = _percentile(errors, 0.95)
@@ -162,6 +180,7 @@ def recompute_behavior_logprobs(
                     "p95_abs_error": p95_abs_error,
                     "max_abs_error": observed_max_abs_error,
                     "max_importance_ratio_error": max(importance_ratio_errors),
+                    "largest_errors": largest_errors,
                     "tolerance": {
                         "max_abs_error": max_abs_error,
                         "max_mean_abs_error": max_mean_abs_error,

@@ -118,6 +118,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("AutoModelForCausalLM.from_pretrained", verifier)
         self.assertIn("local_files_only=True", verifier)
         self.assertIn("max_abs_error", verifier)
+        self.assertIn('"largest_errors": largest_errors', verifier)
         self.assertIn('"policy_update": False', verifier)
         self.assertIn('"harness_update": False', verifier)
 
