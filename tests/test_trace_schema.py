@@ -102,6 +102,7 @@ class TraceSchemaTests(unittest.TestCase):
                 "action_ids": ["DIRECT", "VERIFY"],
                 "action_mask": [True, True],
                 "pre_mask_logits": [0.0, 0.0],
+                "harness_loss_mask": 1,
             },
         )
         with self.assertRaisesRegex(ValueError, "does not match"):

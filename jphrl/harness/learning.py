@@ -14,6 +14,12 @@ from .spec import HarnessAction
 _ACTION_IDS = tuple(action.value for action in HarnessAction)
 
 
+def _nested_tuple(value: object) -> object:
+    if isinstance(value, list):
+        return tuple(_nested_tuple(item) for item in value)
+    return value
+
+
 def _state_key(state: HarnessState) -> str:
     """Encode only observable Harness state, never task answers or rewards."""
 
@@ -155,6 +161,7 @@ class TabularHarnessController:
             action_ids=_ACTION_IDS,
             action_mask=action_mask,
             pre_mask_logits=logits,
+            harness_loss_mask=1,
         )
         self._sample_count += 1
         return decision
@@ -252,7 +259,7 @@ class TabularHarnessController:
         return candidate, stats
 
     def snapshot(self) -> dict[str, object]:
-        """Return small, JSON-compatible model parameters (RNG is checkpointed later)."""
+        """Return a small parameter-only snapshot for reporting, not restoration."""
 
         return {
             "schema_version": self.schema_version,
@@ -263,3 +270,36 @@ class TabularHarnessController:
                 key: list(values) for key, values in sorted(self._logits_by_state.items())
             },
         }
+
+    def checkpoint(self) -> dict[str, object]:
+        """Return all state required to reproduce the next sampled decision."""
+
+        payload = self.snapshot()
+        payload.update(
+            {
+                "rng_state": self._rng.getstate(),
+                "sample_count": self._sample_count,
+            }
+        )
+        return payload
+
+    @classmethod
+    def from_checkpoint(cls, payload: Mapping[str, object]) -> TabularHarnessController:
+        if payload.get("schema_version") != cls.schema_version:
+            raise ValueError("Harness checkpoint schema version differs")
+        logits_payload = payload.get("logits_by_state")
+        if not isinstance(logits_payload, Mapping):
+            raise ValueError("Harness checkpoint logits must be an object")
+        controller = cls(
+            seed=int(payload["seed"]),
+            step=int(payload["step"]),
+            logits_by_state={
+                str(key): tuple(float(value) for value in values)
+                for key, values in logits_payload.items()
+            },
+            rng_state=_nested_tuple(payload["rng_state"]),
+            sample_count=int(payload["sample_count"]),
+        )
+        if payload.get("version") != controller.version:
+            raise ValueError("Harness checkpoint version differs from restored parameters")
+        return controller

@@ -19,6 +19,15 @@ SCRIPTS = PROJECT_ROOT / "scripts"
 
 
 class RemoteScriptContractTests(unittest.TestCase):
+    def test_g1_launcher_is_private_external_and_verified(self) -> None:
+        text = (SCRIPTS / "run_g1_integrity.sh").read_text(encoding="utf-8")
+        self.assertIn("umask 077", text)
+        self.assertIn("/mnt/sdb/ljw/chizm/artifacts/g1/", text)
+        self.assertIn("--episodes 1000", text)
+        self.assertIn("--project-commit", text)
+        self.assertIn("verify_g1_integrity.py", text)
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", text)
+
     def test_environment_freezes_root_mirrors_and_worker_defaults(self) -> None:
         text = (SCRIPTS / "remote_env.sh").read_text(encoding="utf-8")
         self.assertIn('export JPH_ROOT="/mnt/sdb/ljw/chizm"', text)

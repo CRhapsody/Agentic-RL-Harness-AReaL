@@ -112,6 +112,7 @@ class EpisodeTrace:
                 logits = event.payload.get("pre_mask_logits")
                 old_logprob = event.payload.get("old_harness_logprob")
                 controller_version = event.payload.get("controller_version")
+                harness_loss_mask = event.payload.get("harness_loss_mask")
                 if not isinstance(decision_id, str) or not decision_id:
                     raise ValueError("harness decision ID must be a non-empty string")
                 if decision_id in decision_ids:
@@ -142,6 +143,8 @@ class EpisodeTrace:
                     raise ValueError("old Harness log-prob cannot be positive")
                 if controller_version != self.joint_version.harness_controller:
                     raise ValueError("Harness controller version differs from pinned episode version")
+                if type(harness_loss_mask) is not int or harness_loss_mask not in (0, 1):
+                    raise ValueError("Harness loss mask must be integer 0 or 1")
                 valid_logits = [float(logit) for logit, allowed in zip(logits, action_mask) if allowed]
                 maximum = max(valid_logits)
                 log_normalizer = maximum + math.log(

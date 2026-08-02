@@ -28,6 +28,7 @@ class HarnessDecision:
     action_ids: tuple[str, ...]
     action_mask: tuple[bool, ...]
     pre_mask_logits: tuple[float, ...]
+    harness_loss_mask: int
 
 
 def _deterministic_decision(
@@ -45,6 +46,7 @@ def _deterministic_decision(
         action_ids=action_ids,
         action_mask=action_mask,
         pre_mask_logits=tuple(0.0 for _ in action_ids),
+        harness_loss_mask=0,
     )
 
 
