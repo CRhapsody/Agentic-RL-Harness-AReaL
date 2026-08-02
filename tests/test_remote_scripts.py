@@ -30,6 +30,8 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn('export JPH_DATALOADER_WORKERS="${JPH_DATALOADER_WORKERS:-2}"', text)
         self.assertIn('export UV_PYTHON_INSTALL_DIR="${JPH_ROOT}/runtime/python"', text)
         self.assertIn('export UV_PYTHON_BIN_DIR="${JPH_ROOT}/bin"', text)
+        self.assertIn('export UV_PYTHON_PREFERENCE="only-managed"', text)
+        self.assertNotIn("UV_MANAGED_PYTHON", text)
 
     def test_areal_bootstrap_is_pinned_and_installs_flash_after_exact_sync(self) -> None:
         text = (SCRIPTS / "bootstrap_areal_v2.sh").read_text(encoding="utf-8")

@@ -120,3 +120,4 @@ decision:
 | 时间 | Run ID | 症状 | 首个证据 | 分类 | 处理 |
 |---|---|---|---|---|---|
 | 2026-08-02 | JPH-M0-GITHUB-001 | `Could not resolve host` | `resolvectl status` 所有 link `Current Scopes: none` | infra | 使用不改系统状态的临时反向 SOCKS；认证仍需设备确认 |
+| 2026-08-02 | JPH-B0-OFFICIAL-001 | `UV_MANAGED_PYTHON` cannot be used with `--python-preference` | uv 0.11.26 在 Python 下载前拒绝互斥环境开关 | infra/config | 删除冗余 `UV_MANAGED_PYTHON=1`，保留 `UV_PYTHON_PREFERENCE=only-managed`；加回归测试后从同一 bootstrap 继续 |
