@@ -23,8 +23,9 @@
 | JPH-M0-REMOTE-ENV-001 | B0 | SSH/GPU/磁盘预检 | 0 | N/A | N/A | passed | 8×A100 80GB；0/1/4–7 <500MiB；安装后约 230GiB 可用 | `/mnt/sdb/ljw/chizm/artifacts/bootstrap/` | 系统 DNS 无上游；公网 IP 可达 |
 | JPH-M0-GITHUB-001 | B0 | 目标根目录内 GitHub 登录 | 0 | N/A | N/A | passed | `gh auth status`：账号 `CRhapsody`；项目经 push/pull 同步 | `/mnt/sdb/ljw/chizm/config/github` | Git 配置位于目标根目录的 runtime HOME |
 | JPH-M0-AREAL-ENV-001 | B0 | 固定 AReaL 环境安装与 CUDA 校验 | 0 | N/A | N/A | passed | 472 个锁定包；PyTorch 2.9.1+cu129；FlashAttention CUDA 运算通过；路径审计 `ok=true` | `/mnt/sdb/ljw/chizm/artifacts/bootstrap/areal-v2.0.0/` | `v2.0.0@fee938e...`；tmux exit=0 |
-| JPH-B0-PREFETCH-001 | B0 | 1.5B 模型与 GSM8K 预取 | 0 | base | fixed | running | Qwen snapshot 正在下载 | 外置 HF cache 与 bootstrap manifest | `jph-prefetch-model` tmux session |
-| JPH-B0-OFFICIAL-001 | B0 | 官方 AReaL 1-step | 0 | base | fixed | planned | GPU 2/3 各被其他用户进程占用约 902MiB | 外置 artifacts/logs | 不终止他人进程；8 卡全空闲后启动 |
+| JPH-B0-PREFETCH-001 | B0 | 1.5B 模型与 GSM8K 预取 | 0 | base | fixed | passed | Qwen commit `989aa798...`；GSM8K commit `740312a...`，7473 train/1319 test | 外置 HF cache 与 bootstrap manifest | 约 3.0GiB；离线固定 snapshot |
+| JPH-B0-MODEL-LOAD-001 | B0 | 固定模型离线 CUDA load/generate | 0 | base | fixed | passed | 1,543,714,304 参数；BF16；峰值 3,100,396,032 bytes；短生成成功 | `/mnt/sdb/ljw/chizm/artifacts/bootstrap/qwen2.5-1.5b-cuda-smoke.json` | GPU 0；不是 AReaL 训练结果 |
+| JPH-B0-OFFICIAL-001 | B0 | 官方 AReaL 1-step | 0 | base | fixed | planned | GPU 2/3 被其他用户活动任务占用 | 外置 artifacts/logs | 不终止他人进程；有界 tmux waiter 在 8 卡全空闲后启动 |
 | JPH-B0-TRACE-001 | B0 | token/logprob/mask/version 复算 | 0 | base | fixed | planned |  | 外置 trace |  |
 | JPH-B1-HO-S0 | B1 | Harness-only contextual bandit | 0 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9875；随机基线 0.2；参数 delta L2 累计 8.4126 | `/mnt/sdb/ljw/chizm/artifacts/harness-bandit/b1-three-seed.json` | 远端复跑，400 steps |
 | JPH-B1-HO-S1 | B1 | Harness-only contextual bandit | 1 | frozen/not invoked | trainable | passed | 最差最优动作概率 0.9885；随机基线 0.2；参数 delta L2 累计 8.2224 | 同上 | 远端复跑，400 steps |

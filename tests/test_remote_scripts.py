@@ -93,6 +93,15 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn('torch.cuda.synchronize()', text)
         self.assertIn('"peak_memory_bytes"', text)
 
+    def test_b0_waiter_is_bounded_and_never_kills_gpu_processes(self) -> None:
+        text = (SCRIPTS / "wait_and_run_areal_b0.sh").read_text(encoding="utf-8")
+        self.assertIn('JPH_B0_MAX_WAIT_SECONDS:-86400', text)
+        self.assertIn('JPH_B0_POLL_SECONDS:-60', text)
+        self.assertIn('GPU_MEMORY_USED >= 500', text)
+        self.assertIn('run_areal_official_b0.sh', text)
+        self.assertNotIn("pkill", text)
+        self.assertNotIn("kill -", text)
+
     def test_real_trace_audit_rejects_scripted_and_accepts_valid_hf_metadata(self) -> None:
         result = run_calculator_smoke(
             model=MockStructuredModel(),
