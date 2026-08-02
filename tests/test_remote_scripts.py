@@ -67,6 +67,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("HF_HUB_OFFLINE=1", text)
         self.assertIn("HF_DATASETS_OFFLINE=1", text)
         self.assertIn("TRANSFORMERS_OFFLINE=1", text)
+        self.assertIn('export PATH="${AREAL_VENV}/bin:${PATH}"', text)
 
     def test_real_smoke_requires_an_on_disk_trace_audit(self) -> None:
         text = (SCRIPTS / "run_remote_smoke.sh").read_text(encoding="utf-8")

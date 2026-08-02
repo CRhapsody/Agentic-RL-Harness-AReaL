@@ -30,6 +30,7 @@ if [[ ! -x "${AREAL_VENV}/bin/python" ]]; then
   echo "Missing ${AREAL_VENV}; bootstrap the pinned AReaL environment first" >&2
   exit 2
 fi
+export PATH="${AREAL_VENV}/bin:${PATH}"
 for REPORT in "${MODEL_REPORT}" "${DATASET_REPORT}"; do
   if [[ ! -f "${REPORT}" ]]; then
     echo "Missing pinned Hugging Face snapshot report: ${REPORT}" >&2
