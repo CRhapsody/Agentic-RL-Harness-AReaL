@@ -1,0 +1,106 @@
+from pathlib import Path
+import json
+import tempfile
+import unittest
+
+from jphrl.envs.calculator import TASKS
+from jphrl.harness.controller import SmokeHarnessController
+from jphrl.harness.spec import HarnessSpec
+from jphrl.models.base import MockStructuredModel
+from jphrl.runner import run_calculator_smoke
+from jphrl.trajectory.schema import JointVersion
+from scripts.verify_real_smoke_trace import verify_trace
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = PROJECT_ROOT / "scripts"
+
+
+class RemoteScriptContractTests(unittest.TestCase):
+    def test_environment_freezes_root_mirrors_and_worker_defaults(self) -> None:
+        text = (SCRIPTS / "remote_env.sh").read_text(encoding="utf-8")
+        self.assertIn('export JPH_ROOT="/mnt/sdb/ljw/chizm"', text)
+        self.assertIn('export PYTHONPATH="${JPH_PROJECT_DIR}"', text)
+        self.assertIn('export PATH="${JPH_ROOT}/bin:/usr/local/cuda/bin:', text)
+        self.assertNotIn("PYTHONPATH:+", text)
+        self.assertIn('export HF_ENDPOINT="https://hf-mirror.com"', text)
+        self.assertIn(
+            'export PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"',
+            text,
+        )
+        self.assertIn('export JPH_DATALOADER_WORKERS="${JPH_DATALOADER_WORKERS:-2}"', text)
+        self.assertIn('export UV_PYTHON_INSTALL_DIR="${JPH_ROOT}/runtime/python"', text)
+        self.assertIn('export UV_PYTHON_BIN_DIR="${JPH_ROOT}/bin"', text)
+
+    def test_areal_bootstrap_is_pinned_and_installs_flash_after_exact_sync(self) -> None:
+        text = (SCRIPTS / "bootstrap_areal_v2.sh").read_text(encoding="utf-8")
+        self.assertIn("fee938eada49208a5aabdbc1095730a13076a349", text)
+        self.assertIn('UV_VERSION="0.11.26"', text)
+        self.assertIn('UV_BIN="${JPH_ROOT}/bin/uv"', text)
+        self.assertIn("UV_UNMANAGED_INSTALL=\"${JPH_ROOT}/bin\"", text)
+        self.assertNotIn("python3 -m venv", text)
+        sync_position = text.index('"${UV_BIN}" sync')
+        flash_install_position = text.rindex('"${UV_BIN}" pip install')
+        self.assertLess(sync_position, flash_install_position)
+        self.assertIn("--no-deps", text)
+        self.assertIn("--locked", text)
+        self.assertIn("--extra cuda", text)
+        self.assertIn('"${UV_BIN}" pip freeze --python', text)
+        self.assertIn("validate_areal_runtime.py", text)
+
+    def test_areal_b0_is_bounded_and_does_not_max_workers(self) -> None:
+        text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
+        self.assertIn("total_train_steps=1", text)
+        self.assertIn("train_dataset.num_workers=2", text)
+        self.assertIn("valid_dataset.num_workers=2", text)
+        self.assertIn("rollout.max_concurrent_rollouts=8", text)
+        self.assertIn("rollout.max_head_offpolicyness=0", text)
+        self.assertIn("CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7", text)
+
+    def test_real_smoke_requires_an_on_disk_trace_audit(self) -> None:
+        text = (SCRIPTS / "run_remote_smoke.sh").read_text(encoding="utf-8")
+        self.assertIn("Qwen/Qwen2.5-1.5B-Instruct", text)
+        self.assertIn("verify_real_smoke_trace.py", text)
+        self.assertIn("AUDIT_PATH=", text)
+        self.assertIn("prefetch_hf_model.py", text)
+        self.assertIn("HF_HUB_OFFLINE=1", text)
+        self.assertIn("flock -n 9", text)
+
+    def test_real_trace_audit_rejects_scripted_and_accepts_valid_hf_metadata(self) -> None:
+        result = run_calculator_smoke(
+            model=MockStructuredModel(),
+            task=TASKS["add-17-25"],
+            controller=SmokeHarnessController(),
+            harness_spec=HarnessSpec(),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.json"
+            result.trace.write_json(path)
+            with self.assertRaisesRegex(ValueError, "scripted|non-HF"):
+                verify_trace(path)
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            commit = "a" * 40
+            payload["joint_version"]["policy"] = f"hf:test-policy@{commit}:config"
+            payload["joint_version"]["tokenizer"] = f"hf:test-tokenizer@{commit}:tokenizer"
+            version_id = JointVersion(**payload["joint_version"]).version_id
+            for event in payload["events"]:
+                event["joint_version_id"] = version_id
+                if event["kind"] == "model_response":
+                    event["payload"].update(
+                        {
+                            "input_token_ids": [10],
+                            "output_token_ids": [20],
+                            "output_token_logprobs": [-0.1],
+                            "completion_loss_mask": [1],
+                            "policy_kind": "causal_lm",
+                            "token_metadata_status": "available",
+                        }
+                    )
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            report = verify_trace(path)
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["completion_token_counts"], [1, 1])
+
+
+if __name__ == "__main__":
+    unittest.main()

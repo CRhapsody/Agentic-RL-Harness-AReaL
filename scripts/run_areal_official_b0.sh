@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/remote_env.sh"
+
+AREAL_REPO="${JPH_ROOT}/src/AReaL-v2.0.0"
+AREAL_VENV="${JPH_ROOT}/venvs/areal-v2.0.0"
+EXPECTED_COMMIT="fee938eada49208a5aabdbc1095730a13076a349"
+
+if [[ ! -d "${AREAL_REPO}/.git" ]]; then
+  echo "Missing ${AREAL_REPO}; bootstrap the pinned AReaL source first" >&2
+  exit 2
+fi
+if [[ ! -x "${AREAL_VENV}/bin/python" ]]; then
+  echo "Missing ${AREAL_VENV}; bootstrap the pinned AReaL environment first" >&2
+  exit 2
+fi
+
+ACTUAL_COMMIT="$(git -C "${AREAL_REPO}" rev-parse HEAD)"
+if [[ "${ACTUAL_COMMIT}" != "${EXPECTED_COMMIT}" ]]; then
+  echo "AReaL commit mismatch: expected ${EXPECTED_COMMIT}, got ${ACTUAL_COMMIT}" >&2
+  exit 2
+fi
+if ! grep -q "total_train_steps" "${AREAL_REPO}/areal/api/cli_args.py"; then
+  echo "Pinned AReaL source does not expose total_train_steps; refusing an unbounded B0" >&2
+  exit 2
+fi
+
+GPU_COUNT="$(nvidia-smi --list-gpus | wc -l | tr -d ' ')"
+if [[ "${GPU_COUNT}" != "8" ]]; then
+  echo "Official B0 requires exactly 8 visible GPUs; found ${GPU_COUNT}" >&2
+  exit 3
+fi
+for GPU_ID in 0 1 2 3 4 5 6 7; do
+  GPU_MEMORY_USED="$(nvidia-smi -i "${GPU_ID}" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')"
+  if [[ ! "${GPU_MEMORY_USED}" =~ ^[0-9]+$ ]] || (( GPU_MEMORY_USED >= 500 )); then
+    echo "GPU ${GPU_ID} is not free: ${GPU_MEMORY_USED} MiB is in use" >&2
+    exit 3
+  fi
+done
+
+RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_ROOT="${JPH_ROOT}/artifacts/areal-b0/${RUN_STAMP}"
+LOG_PATH="${JPH_ROOT}/logs/areal-b0-${RUN_STAMP}.log"
+NAME_RESOLVE_ROOT="${JPH_ROOT}/runtime/name_resolve/${RUN_STAMP}"
+mkdir -p "${RUN_ROOT}" "${NAME_RESOLVE_ROOT}"
+
+GPU_MONITOR_PID=""
+cleanup() {
+  if [[ -n "${GPU_MONITOR_PID}" ]]; then
+    kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
+    wait "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+nvidia-smi dmon -s pucm -d 5 -o TD > "${RUN_ROOT}/gpu-dmon.log" 2>&1 &
+GPU_MONITOR_PID="$!"
+
+cd "${AREAL_REPO}"
+echo "AReaL=${ACTUAL_COMMIT} GPUs=0,1,2,3,4,5,6,7 run_root=${RUN_ROOT}"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  "${AREAL_VENV}/bin/python" examples/math/gsm8k_rl.py \
+  --config examples/math/gsm8k_grpo.yaml \
+  scheduler.type=local \
+  experiment_name=jph-b0 \
+  trial_name="${RUN_STAMP}" \
+  cluster.n_nodes=1 \
+  cluster.n_gpus_per_node=8 \
+  total_train_steps=1 \
+  train_dataset.batch_size=8 \
+  train_dataset.num_workers=2 \
+  valid_dataset.batch_size=8 \
+  valid_dataset.num_workers=2 \
+  gconfig.n_samples=2 \
+  gconfig.max_new_tokens=256 \
+  gconfig.max_tokens=512 \
+  rollout.max_concurrent_rollouts=8 \
+  rollout.max_head_offpolicyness=0 \
+  rollout.dump_to_file=true \
+  cluster.fileroot="${RUN_ROOT}" \
+  cluster.name_resolve.nfs_record_root="${NAME_RESOLVE_ROOT}" \
+  2>&1 | tee "${LOG_PATH}"
