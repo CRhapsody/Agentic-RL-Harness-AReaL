@@ -167,7 +167,7 @@ JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
   rollout.max_concurrent_rollouts=8 \
   rollout.max_head_offpolicyness=0 \
   rollout.dump_to_file=true \
-  'rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}' \
+  '+rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}' \
   cluster.fileroot="${RUN_ROOT}" \
   cluster.name_resolve.nfs_record_root="${NAME_RESOLVE_ROOT}" \
   2>&1 | tee "${LOG_PATH}"

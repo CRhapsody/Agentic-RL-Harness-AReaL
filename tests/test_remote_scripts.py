@@ -73,7 +73,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("secrets.token_urlsafe(32)", text)
         self.assertIn('JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}"', text)
         self.assertIn(
-            "'rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}'",
+            "'+rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}'",
             text,
         )
         self.assertNotIn("AREAL_ALLOW_DEFAULT_ADMIN_KEY=1", text)
