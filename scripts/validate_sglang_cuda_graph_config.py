@@ -25,7 +25,7 @@ def _compose(config_path: Path, expected: bool) -> dict[str, object]:
         [
             "--config",
             str(config_path),
-            f"sglang.disable_cuda_graph={value}",
+            f"+sglang.disable_cuda_graph={value}",
         ],
         GRPOConfig,
     )
@@ -45,7 +45,7 @@ def _compose(config_path: Path, expected: bool) -> dict[str, object]:
             "SGLangConfig.build_args did not preserve disable_cuda_graph"
         )
     return {
-        "cli_override": f"sglang.disable_cuda_graph={value}",
+        "cli_override": f"+sglang.disable_cuda_graph={value}",
         "composed_type": type(composed).__name__,
         "composed_value": composed,
         "server_arg_type": type(built).__name__,

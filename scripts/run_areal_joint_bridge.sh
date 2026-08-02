@@ -360,7 +360,7 @@ JPH_EXPECTED_POLICY_VERSION=0 \
   rollout.dump_to_file=false \
   '+rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}' \
   sglang.mem_fraction_static=0.35 \
-  sglang.disable_cuda_graph="${SGLANG_DISABLE_CUDA_GRAPH}" \
+  +sglang.disable_cuda_graph="${SGLANG_DISABLE_CUDA_GRAPH}" \
   sglang.context_length=1024 \
   sglang.max_running_requests=1 \
   2>&1 | tee -a "${LOG_PATH}"
