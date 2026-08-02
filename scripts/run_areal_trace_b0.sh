@@ -20,16 +20,21 @@ AREAL_VENV="${JPH_ROOT}/venvs/areal-v2.0.0"
 EXPECTED_AREAL_COMMIT="fee938eada49208a5aabdbc1095730a13076a349"
 MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/qwen2.5-1.5b-snapshot.json"
 DATASET_REPORT="${JPH_ROOT}/artifacts/bootstrap/gsm8k-snapshot.json"
+CUDA_TOOLKIT_ROOT="${JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6}"
 MAX_USED_MEMORY_MIB="${JPH_TRACE_MAX_USED_MEMORY_MIB:-10240}"
 MIN_FREE_MEMORY_MIB="${JPH_TRACE_MIN_FREE_MEMORY_MIB:-65536}"
 
-for path in "${AREAL_REPO}/.git" "${AREAL_VENV}/bin/python" "${MODEL_REPORT}" "${DATASET_REPORT}"; do
+for path in "${AREAL_REPO}/.git" "${AREAL_VENV}/bin/python" "${MODEL_REPORT}" "${DATASET_REPORT}" "${CUDA_TOOLKIT_ROOT}/bin/nvcc"; do
   if [[ ! -e "${path}" ]]; then
     echo "Missing required path: ${path}" >&2
     exit 2
   fi
 done
-export PATH="${AREAL_VENV}/bin:${PATH}"
+export CUDA_HOME="${CUDA_TOOLKIT_ROOT}"
+export CUDACXX="${CUDA_HOME}/bin/nvcc"
+export PATH="${AREAL_VENV}/bin:${CUDA_HOME}/bin:${PATH}"
+"${CUDACXX}" -std=c++20 -x cu -c /dev/null \
+  -o "${JPH_ROOT}/tmp/nvcc-trace-preflight.o"
 ACTUAL_AREAL_COMMIT="$(git -C "${AREAL_REPO}" rev-parse HEAD)"
 if [[ "${ACTUAL_AREAL_COMMIT}" != "${EXPECTED_AREAL_COMMIT}" ]]; then
   echo "AReaL commit mismatch: ${ACTUAL_AREAL_COMMIT}" >&2
