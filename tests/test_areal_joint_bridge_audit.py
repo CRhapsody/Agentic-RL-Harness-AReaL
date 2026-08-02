@@ -132,13 +132,17 @@ class SensitiveArtifactAuditTests(unittest.TestCase):
                 '{"agent":{"admin_api_key":"<redacted-runtime-admin-key>"}}\n',
                 encoding="utf-8",
             )
+            (root / "safe.env").write_text(
+                "refresh_token=${REFRESH_TOKEN_FROM_ENV}\n",
+                encoding="utf-8",
+            )
             with patch.dict(
                 os.environ,
                 {"JPH_AREAL_ADMIN_API_KEY": "jph-bridge-ephemeral"},
             ):
                 report = _audit_sensitive_artifacts(root)
             self.assertEqual(report["unsafe_fields"], [])
-            self.assertEqual(report["redacted_or_safe_sensitive_fields"], 2)
+            self.assertEqual(report["redacted_or_safe_sensitive_fields"], 3)
 
     def test_rejects_runtime_secret_anywhere_in_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -159,6 +163,27 @@ class SensitiveArtifactAuditTests(unittest.TestCase):
                         f"{key}: should-not-be-here\n",
                         encoding="utf-8",
                     )
+                    with patch.dict(
+                        os.environ,
+                        {"JPH_AREAL_ADMIN_API_KEY": "jph-bridge-ephemeral"},
+                    ):
+                        with self.assertRaisesRegex(ValueError, "sensitive fields"):
+                            _audit_sensitive_artifacts(root)
+
+    def test_rejects_assignment_prefix_and_cli_sensitive_syntax(self) -> None:
+        cases = (
+            "github_token=ghp_example_secret\n",
+            "auth.github_token: ghp_example_secret\n",
+            "--refresh_token ghp_example_secret\n",
+            "--session_api_key=example_secret\n",
+            "AUTH.SECRET_KEY=example_secret\n",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "resolved-config"
+            for content in cases:
+                with self.subTest(content=content.strip()):
+                    artifact.write_text(content, encoding="utf-8")
                     with patch.dict(
                         os.environ,
                         {"JPH_AREAL_ADMIN_API_KEY": "jph-bridge-ephemeral"},

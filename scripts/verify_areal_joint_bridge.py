@@ -26,11 +26,19 @@ SAME_BACKEND_SCHEMA_VERSION = "jph.areal-same-backend-logprob.v2"
 MAX_SAME_BACKEND_MEAN_IMPORTANCE_RATIO_ERROR = 0.02
 MAX_SAME_BACKEND_IMPORTANCE_RATIO_ERROR = 0.10
 _SENSITIVE_FIELD_PATTERN = "|".join(re.escape(key) for key in SENSITIVE_KEY_PARTS)
-_SENSITIVE_KEY_LINE = re.compile(
-    rf'''(?ix)^\s*["']?({_SENSITIVE_FIELD_PATTERN})["']?\s*:\s*(.*?)\s*,?\s*$'''
+_SENSITIVE_VALUE_PATTERN = r'''(\$\{[^}\r\n]+\}|"[^"]*"|'[^']*'|[^,}\s]+)'''
+_SENSITIVE_ASSIGNMENT = re.compile(
+    rf'''(?ix)
+    (?<![A-Za-z0-9_])
+    ["']?(?:[A-Za-z0-9_-]+\.)*({_SENSITIVE_FIELD_PATTERN})["']?
+    \s*(?::|=)\s*{_SENSITIVE_VALUE_PATTERN}
+    '''
 )
-_SENSITIVE_KEY_INLINE = re.compile(
-    rf'''(?ix)["']({_SENSITIVE_FIELD_PATTERN})["']\s*:\s*("[^"]*"|'[^']*'|[^,}}\s]+)'''
+_SENSITIVE_CLI_ARGUMENT = re.compile(
+    rf'''(?ix)
+    (?<!\S)--({_SENSITIVE_FIELD_PATTERN})
+    (?:\s+|=){_SENSITIVE_VALUE_PATTERN}
+    '''
 )
 _SAFE_LITERAL_VALUES = {"", "null", "none"}
 _ENV_REFERENCE = re.compile(r"^\$\{(?:oc\.env:)?[A-Za-z_][A-Za-z0-9_]*\}$")
@@ -287,15 +295,12 @@ def _audit_sensitive_artifacts(run_root: Path) -> dict[str, object]:
         scanned_text_files += 1
         text = data.decode("utf-8", errors="replace")
         for line_number, line in enumerate(text.splitlines(), start=1):
-            match = _SENSITIVE_KEY_LINE.match(line)
-            fields = (
-                [(match.group(1), match.group(2))]
-                if match is not None
-                else [
-                    (item.group(1), item.group(2))
-                    for item in _SENSITIVE_KEY_INLINE.finditer(line)
-                ]
-            )
+            matched_fields = {
+                (item.group(1).lower(), item.group(2))
+                for pattern in (_SENSITIVE_ASSIGNMENT, _SENSITIVE_CLI_ARGUMENT)
+                for item in pattern.finditer(line)
+            }
+            fields = sorted(matched_fields)
             for key, raw_value in fields:
                 normalized = raw_value.strip().removesuffix(",").strip()
                 if (
