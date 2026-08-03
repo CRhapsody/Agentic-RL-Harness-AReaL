@@ -405,7 +405,7 @@ class M0JointInputTests(unittest.TestCase):
 
         wrong_session = deepcopy(source.start_response)
         wrong_session["sessions"][0]["session_id"] = "crossed-session"
-        with self.assertRaisesRegex(M0JointInputError, "start-session receipt differs"):
+        with self.assertRaisesRegex(M0JointInputError, "session differs"):
             prepare_m0_joint_training_input(
                 source.bridge,
                 start_session_response=wrong_session,

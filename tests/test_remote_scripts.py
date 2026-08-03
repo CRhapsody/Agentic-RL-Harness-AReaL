@@ -281,6 +281,10 @@ class RemoteScriptContractTests(unittest.TestCase):
         text = (SCRIPTS / "remote_env.sh").read_text(encoding="utf-8")
         self.assertIn('export JPH_ROOT="/mnt/sdb/ljw/chizm"', text)
         self.assertIn('export PYTHONPATH="${JPH_PROJECT_DIR}"', text)
+        self.assertIn(
+            'export JPH_AREAL_ROOT="${JPH_ROOT}/src/AReaL-v2.0.0"', text
+        )
+        self.assertIn('export JPH_AREAL_SOURCE="${JPH_AREAL_ROOT}"', text)
         self.assertIn('export PATH="${JPH_ROOT}/bin:/usr/local/cuda/bin:', text)
         self.assertNotIn("PYTHONPATH:+", text)
         self.assertIn('export HF_ENDPOINT="https://hf-mirror.com"', text)

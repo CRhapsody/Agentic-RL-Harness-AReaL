@@ -4,6 +4,8 @@ set -euo pipefail
 
 export JPH_ROOT="/mnt/sdb/ljw/chizm"
 export JPH_PROJECT_DIR="${JPH_ROOT}/src/Agentic-RL-Harness-AReaL"
+export JPH_AREAL_ROOT="${JPH_ROOT}/src/AReaL-v2.0.0"
+export JPH_AREAL_SOURCE="${JPH_AREAL_ROOT}"
 export PATH="${JPH_ROOT}/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PYTHONPATH="${JPH_PROJECT_DIR}"
 
