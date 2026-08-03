@@ -17,10 +17,13 @@ from .areal_trace_contract import (
     build_areal_trace_record,
     validate_areal_trace_record,
 )
+from .areal_interaction_sidecar import (
+    validate_interaction_adapter_sidecar,
+)
 from .schema import EpisodeTrace, JointVersion
 
 
-SCHEMA_VERSION = "jph.areal-joint-interaction-bridge.v2"
+SCHEMA_VERSION = "jph.areal-joint-interaction-bridge.v3"
 INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = "jph.sglang-inference-runtime.v2"
 LEGACY_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = (
     "jph.sglang-inference-runtime.v1"
@@ -394,6 +397,7 @@ def build_areal_joint_bridge_record(
     sglang_version: str,
     generation_logprob_mode: str,
     inference_runtime_contract: Mapping[str, object],
+    interaction_adapter_sidecar: Mapping[str, object],
 ) -> dict[str, object]:
     """Bind a real AReaL interaction and a prompt-effective Harness decision."""
 
@@ -410,6 +414,21 @@ def build_areal_joint_bridge_record(
     instruction = HARNESS_INSTRUCTIONS[harness_decision.action]
     runtime_contract = dict(inference_runtime_contract)
     runtime_contract_sha256 = inference_runtime_contract_sha256(runtime_contract)
+    sidecar = dict(interaction_adapter_sidecar)
+    sidecar_audit = validate_interaction_adapter_sidecar(sidecar)
+    _require(
+        sidecar_audit["binding_count"] == 1,
+        "single-interaction bridge requires exactly one adapter binding",
+    )
+    binding = sidecar["bindings"][0]
+    _require(
+        binding["joint_version_id"] == joint_version.version_id,
+        "interaction sidecar JointVersion differs from bridge",
+    )
+    _require(
+        binding["interaction_id"] == interaction.interaction_id,
+        "interaction sidecar differs from the AReaL interaction",
+    )
     _require(
         len(project_commit) == 40
         and all(character in "0123456789abcdef" for character in project_commit),
@@ -437,8 +456,10 @@ def build_areal_joint_bridge_record(
         },
         "task_id": task_id,
         "request_id": request_id,
+        "episode_id": binding["episode_id"],
         "joint_version": asdict(joint_version),
         "joint_version_id": joint_version.version_id,
+        "interaction_adapter_sidecar": sidecar,
         "harness_artifact": harness_artifact_payload(),
         "harness": {
             "state": asdict(harness_state),
@@ -470,7 +491,7 @@ def build_areal_joint_bridge_record(
         "credit_binding": {
             "status": "raw-terminal-outcome-only",
             "raw_terminal_reward": float(interaction.reward),
-            "policy_target_model_call_id": request_id,
+            "policy_target_model_call_id": binding["model_call_id"],
             "harness_target_decision_id": harness_decision.decision_id,
             "policy_advantage": None,
             "harness_advantage": None,
@@ -522,6 +543,26 @@ def validate_areal_joint_bridge_record(
     _require(
         record.get("joint_version_id") == joint_version.version_id,
         "JointVersion ID mismatch",
+    )
+
+    sidecar = record.get("interaction_adapter_sidecar")
+    _require(
+        isinstance(sidecar, Mapping),
+        "interaction adapter sidecar must be an object",
+    )
+    try:
+        sidecar_audit = validate_interaction_adapter_sidecar(sidecar)
+    except ValueError as exc:
+        raise ArealJointBridgeError(str(exc)) from exc
+    _require(
+        sidecar_audit["binding_count"] == 1,
+        "single-interaction bridge requires exactly one adapter binding",
+    )
+    binding = sidecar["bindings"][0]
+    _require(
+        sidecar_audit["episode_id"] == record.get("episode_id")
+        and sidecar_audit["joint_version_id"] == joint_version.version_id,
+        "interaction sidecar episode or JointVersion differs from bridge",
     )
 
     artifact = record.get("harness_artifact")
@@ -642,6 +683,11 @@ def validate_areal_joint_bridge_record(
         areal_trace["request_id"] == record.get("request_id")
         and areal_trace["task_id"] == record.get("task_id"),
         "AReaL trace identity differs from bridge identity",
+    )
+    _require(
+        areal_trace["interaction"]["interaction_id"]
+        == binding["interaction_id"],
+        "AReaL trace interaction differs from adapter sidecar",
     )
     _require(
         areal_trace["model_response"]["input_tokens"] == effective_tokens,
@@ -784,7 +830,7 @@ def validate_areal_joint_bridge_record(
         "bridge must not fabricate policy or Harness advantage",
     )
     _require(
-        credit.get("policy_target_model_call_id") == record.get("request_id")
+        credit.get("policy_target_model_call_id") == binding["model_call_id"]
         and credit.get("harness_target_decision_id") == decision.get("decision_id"),
         "credit targets are not bound to their decision types",
     )
@@ -800,6 +846,10 @@ def validate_areal_joint_bridge_record(
         "ok": True,
         "task_id": record["task_id"],
         "request_id": record["request_id"],
+        "episode_id": record["episode_id"],
+        "model_call_id": binding["model_call_id"],
+        "interaction_id": binding["interaction_id"],
+        "interaction_sidecar_sha256": sidecar_audit["sidecar_sha256"],
         "joint_version_id": joint_version.version_id,
         "policy_release_id": joint_version.policy,
         "generation_logprob_mode": generation_logprob_mode,

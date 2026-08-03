@@ -9,7 +9,7 @@
 3. [第四课：一次真实 AReaL rollout 怎样与 Harness 决策对齐](lesson-04-real-areal-harness-bridge.md)
 4. [第五课：从可信 AReaL rollout 到真正同时更新 policy 与 Harness](lesson-05-from-trusted-rollout-to-joint-update.md)
 
-第二课使用本地 `AReaL v2.0.0` 的固定提交和本项目 calculator smoke 作为唯一代码依据。课程中的 token ID 与 log-prob 数值均明确标为教学例子，不代表当前 mock 运行的真实产物。
+第二课使用本地 `AReaL v2.0.0` 的固定提交和本项目 calculator smoke 作为唯一代码依据。它同时对照已实现的 interaction sidecar 与 `individual/concat` 归档器，区分 `EpisodeTrace` 和 AReaL `InteractionCache`。课程中的 token ID 与 log-prob 数值均明确标为教学例子，不代表当前 mock 运行的真实产物。
 
 第三课对照 G1 synthetic CPU 控制面实现，讲解 policy token 与 Harness decision 的独立概率、mask、credit、版本、发布和恢复边界。它不把 toy updater 表述为真实 AReaL 联合训练。
 

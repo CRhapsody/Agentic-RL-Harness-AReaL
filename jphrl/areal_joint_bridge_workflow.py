@@ -20,6 +20,10 @@ from jphrl.trajectory.areal_joint_bridge import (
     prompt_context_chars,
     write_areal_joint_bridge_record,
 )
+from jphrl.trajectory.areal_interaction_sidecar import (
+    InteractionBinding,
+    build_interaction_adapter_sidecar,
+)
 
 
 class ArealJointBridgeWorkflow(RLVRWorkflow):
@@ -116,6 +120,24 @@ class ArealJointBridgeWorkflow(RLVRWorkflow):
                 inference_runtime_contract_sha256
             ),
         )
+        run_id = str(inference_runtime_contract["identity"]["run_id"])
+        episode_id = f"{run_id}:{request_id}"
+        model_call_id = f"{episode_id}:model:0"
+        interaction_sidecar = build_interaction_adapter_sidecar(
+            [
+                InteractionBinding(
+                    episode_id=episode_id,
+                    model_call_id=model_call_id,
+                    session_id=None,
+                    trajectory_id=None,
+                    interaction_id=interaction.interaction_id,
+                    parent_interaction_id=None,
+                    ordinal=0,
+                    joint_version_id=joint_version.version_id,
+                    route_kind="rlvr-workflow",
+                )
+            ]
+        )
         record = build_areal_joint_bridge_record(
             task_id=task_id,
             request_id=request_id,
@@ -139,6 +161,7 @@ class ArealJointBridgeWorkflow(RLVRWorkflow):
             sglang_version=os.environ["JPH_SGLANG_VERSION"],
             generation_logprob_mode=generation_logprob_mode,
             inference_runtime_contract=inference_runtime_contract,
+            interaction_adapter_sidecar=interaction_sidecar,
         )
         write_areal_joint_bridge_record(
             record,

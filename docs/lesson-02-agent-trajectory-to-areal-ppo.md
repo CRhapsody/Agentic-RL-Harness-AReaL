@@ -51,12 +51,13 @@ fee938eada49208a5aabdbc1095730a13076a349
 | 13 个事件的执行链 | `jphrl/runner.py` |
 | 联合版本与轨迹校验 | `jphrl/trajectory/schema.py` |
 | token 元数据校验 | `jphrl/trajectory/token_contract.py` |
+| model call 与 AReaL interaction 绑定、样本归档 | `jphrl/trajectory/areal_interaction_sidecar.py` |
 | 当前 mock 模型 | `jphrl/models/base.py` |
 
 有两个边界必须先说清：
 
 1. 本项目当前的 `MockStructuredModel` 是脚本策略。它明确返回 `token_metadata_status="not_applicable"`，并把 token ID、log-prob、loss mask 留空。因此，它能验证事件和 reward 数据面，不能直接形成 PPO 样本。
-2. 本项目已经有 `JointVersion`、可训练的 policy failure、不可训练的 invalid failure 和 token contract。invalid failure 又细分为基础设施异常与 trace contract 异常。目前 `jphrl` 中还没有 AReaL DataProxy adapter。下文给出的是经过代码对照的映射目标，不是宣称这条分布式链已经接通。
+2. 本项目已经有 `JointVersion`、可训练的 policy failure、不可训练的 invalid failure、token contract，以及显式的 `model_call_id <-> interaction_id` sidecar 和 `individual/concat` 样本归档器。invalid failure 又细分为基础设施异常与 trace contract 异常。目前仍没有把真实 Agent Service session 持续写入 DataProxy 训练队列的在线 adapter。下文既解释已实现的身份与归档契约，也明确标出尚未接通的在线分布式链。
 
 ## 1. 先分清五个对象
 
@@ -97,7 +98,21 @@ AReaL `SessionStore.start_session(task_id)` 会为这个 task 找一个未使用
 1. 模型生成工具调用 JSON。
 2. 模型读到 calculator 返回的 `42` 后，生成最终答案 JSON。
 
-本项目用 `model_call_id` 关联 `model_request`、`model_response`、`parse_result` 和最终 reward 的归因目标。AReaL 使用 OpenAI completion 或 response 的 ID 作为 `interaction_id`。未来 adapter 必须保存二者的一一映射，不能假定它们天然相等。
+本项目用 `model_call_id` 关联 `model_request`、`model_response`、`parse_result` 和最终 reward 的归因目标。AReaL 使用 OpenAI completion 或 response 的 ID 作为 `interaction_id`。`areal_interaction_sidecar.py` 现在显式保存二者的一一映射，不能假定它们天然相等。
+
+对每次调用，关联过程是：本项目先创建 `model_call_id`，向 AReaL 路由请求；AReaL 返回 `interaction_id` 后，adapter 写入同一条 binding：
+
+```text
+episode_id
+  + model_call_id                 # 本项目事件与 reward 使用
+  + session_id / trajectory_id    # Agent Service 路由使用
+  + interaction_id                # AReaL cache 与训练样本使用
+  + parent_interaction_id          # 多轮对话树使用
+  + ordinal                       # 本 episode 内的调用顺序
+  + joint_version_id              # policy 与 Harness 的冻结联合版本
+```
+
+sidecar 校验 `model_call_id` 和 `interaction_id` 分别唯一、调用顺序连续、parent 必须先于 child、同一 sidecar 只含一个 episode/session/trajectory/JointVersion。当前单轮 RLVR workflow 没有真实 Agent Service session，所以明确令 `session_id=None`、`trajectory_id=None`；这比伪造 session 标识更可审计。
 
 ### 1.4 tool observation 是环境返回，不是模型动作
 
@@ -139,6 +154,22 @@ AReaL 在线 session 可以持续存在。一次 `set_reward` 会给某个 inter
 4. 每个可训练 interaction 都有 token、log-prob 和版本。
 5. 数据通过安全与一致性检查。
 
+### 1.6 EpisodeTrace 和 InteractionCache 观察的是不同层
+
+`EpisodeTrace` 是本项目的一次完整 Agent episode 事件账本。它保存输入身份与随机种子、冻结的 `JointVersion`、Harness 决策、模型请求和响应、parser 结果、工具结果、verifier、reward、失败类型及事件父链。它回答的是：“整个 Agent 为什么采取这些步骤，结果能否归因给 policy 或 Harness？”
+
+`InteractionCache` 是 AReaL 在一次 session 中捕获的 LLM 调用缓存。每个 interaction 重点保存 messages、`ModelResponse` 的 token/log-prob/version、标量 reward，以及根据对话前缀识别出的 parent。它回答的是：“哪些模型输出 token 可以变成训练张量？”
+
+二者的关系不是替代，而是连接：
+
+| 对象 | 最小单位 | 包含工具、parser、Safety 事件吗 | 包含 AReaL token 级 behavior 数据吗 |
+|---|---|---|---|
+| `EpisodeTrace` | 一个 Agent 事件 | 是 | 只有 adapter 回填或真实模型响应提供时才有 |
+| `InteractionCache` | 一次 LLM interaction | 否 | 是 |
+| interaction sidecar | 一条身份 binding | 否 | 不复制 token，只连接两侧身份与版本 |
+
+因此，训练时从 `InteractionCache` 取六字段张量，从 `EpisodeTrace` 取 validity、credit、Harness action 和联合版本，再用 sidecar 证明二者指向同一次模型调用。只保存任意一侧都不足以审计联合训练。
+
 ## 2. calculator 成功样本的逐阶段数据表
 
 下面把 `add-17-25` 从任务开始一直追到权重同步。表中的 `add-17-25-0` 是根据 AReaL session 命名规则写出的教学实例。真实运行若已有同名 session，后缀会递增。`interaction_id` 也用占位名表示，真实值由 API 返回。版本 7 和版本 8 同样是后文沿用的教学数值。
@@ -178,7 +209,7 @@ reward_assigned
 episode_ended
 ```
 
-注意，13 个事件不等于 13 个 PPO 样本。这个成功例只有两次 LLM call。采用 Hermes v2.0.0 的 `export_style: individual` 时，通常导出两个 interaction 张量项。
+注意，13 个事件不等于 13 个 PPO 样本。这个成功例只有两次 LLM call。采用 AReaL v2.0.0 中 Hermes 示例的 `export_style: individual` 时，通常导出两个 interaction 张量项。
 
 ## 3. 从 ModelResponse 到六个 PPO 字段
 
@@ -268,7 +299,7 @@ exp(-1.10) = 0.333
 
 ## 4. reward 怎样从任务结果回到两次 LLM call
 
-Hermes v2.0.0 配置使用：
+AReaL v2.0.0 中的 Hermes 示例配置使用：
 
 ```yaml
 export_style: individual
@@ -292,11 +323,40 @@ current_reward = current_reward * turn_discount + interaction.reward
 
 AReaL v2.0.0 的 `to_tensor_dict()` 会把 `reward=None` 转成 `0.0`。因此，安全边界不能等张量化以后再做。基础设施故障若带着 `None` 进入这里，会被错误地伪装成 policy 的零分样本。本项目把 `infrastructure_invalid` 与 `trace_contract_invalid` 固定为 `reward=None`，adapter 必须在调用 AReaL export 或进入训练队列之前丢弃它们。
 
+### 4.1 `individual` 与 `concat` 是两种训练打包语义
+
+AReaL v2.0.0 已经实现两种导出方式，并非需要我们重新发明：`InteractionCache.export_interactions()` 负责选择 interaction，`InteractionWithTokenLogpReward.to_tensor_dict()` 负责构造张量。
+
+`individual` 返回所有完成的 interaction。对两次调用，它生成两个样本：
+
+```text
+样本 1 = prompt 1 + 模型输出 1，只有输出 1 的 mask 为 1
+样本 2 = 完整 prompt 2 + 模型输出 2，只有输出 2 的 mask 为 1
+```
+
+虽然 prompt 2 中包含第一轮模型输出，但那一段在样本 2 里是历史输入，mask 为 0；第一轮输出已经在样本 1 中单独训练。
+
+`concat` 先使用 messages 的最长严格前缀关系建立 parent/child 对话树，然后只返回叶节点。叶 interaction 的 `to_tensor_dict()` 会递归保留祖先 interaction 的 output log-prob、mask 与 policy version。用教学 token 表示：
+
+```text
+call 1: input=[10,11], output=[20,21]
+call 2: input=[10,11,20,21,30], output=[40]
+
+concat leaf input_ids = [10,11,20,21,30,40]
+concat leaf loss_mask = [ 0, 0, 1, 1, 0, 1]
+                         \____/ \__/  |  |
+                         prompt call1 观察 call2
+```
+
+本项目的 `export_bound_training_sample_archive()` 不复制这套算法，而是调用 AReaL 的原生 export，再做三件事：核验 AReaL parent 树与 sidecar 一致；记录每个 `model_call_id/interaction_id` 在样本中的 `[start,end)` 决策 token 区间；将六字段张量、导出方式和内容 hash 写成可审计归档。任何额外的 `loss_mask=1` 位置、错位 log-prob 或版本都会拒绝归档。
+
+`concat` 可以作为另一种训练样本保存方式，但它不是单纯把两个 JSON 文件压成一个。它改变了样本边界：一个叶样本同时训练根到叶的多次模型动作，而 `individual` 为每次调用产生独立样本。存在分支、interaction 级中间 reward、长度截断或按样本归一化时，两者的优化统计量可能不同，所以实验必须把 `export_style` 当成配置变量记录，不能混在同一结果中。
+
 ## 5. rollout 后，PPO 实际计算了什么
 
 先定义三个 policy。对某个 completion token `a_t`：
 
-| 符号 | 定义 | 在 Hermes v2.0.0 配置中的来源 |
+| 符号 | 定义 | 在 AReaL v2.0.0 Hermes 示例配置中的来源 |
 |---|---|---|
 | `pi_behave(a_t | x_t)` | rollout 时真正采样出 token 的 policy 概率 | 推理引擎返回的 `output_logprobs` |
 | `pi_prox(a_t | x_t)` | 训练批次开始时，用 actor 重算得到的近端 policy 概率 | `recompute_logprob: true` 产生的 `prox_logp` |
@@ -304,7 +364,7 @@ AReaL v2.0.0 的 `to_tensor_dict()` 会把 `reward=None` 转成 `0.0`。因此�
 
 `x_t` 是产生第 `t` 个动作 token 时已经可见的上下文。它包括 prompt 和之前的 token。
 
-Hermes v2.0.0 同时设置 `recompute_logprob: true` 和 `use_decoupled_loss: true`。因此导出的 behavior old log-prob 不会被重算值覆盖。PPO clipping 使用当前 policy 与近端 policy 的比值：
+AReaL v2.0.0 Hermes 示例同时设置 `recompute_logprob: true` 和 `use_decoupled_loss: true`。因此导出的 behavior old log-prob 不会被重算值覆盖。PPO clipping 使用当前 policy 与近端 policy 的比值：
 
 ```text
 r_t(theta) = exp(log pi_theta(a_t | x_t) - log pi_prox(a_t | x_t))
@@ -342,7 +402,7 @@ r_t = exp(-0.90 - (-1.05))
     = 1.162
 ```
 
-v2.0.0 Hermes 配置的 `eps_clip=0.4`，允许区间是 `[0.6, 1.4]`。`1.162` 在区间内，不触发 clipping。如果 current log-prob 变成 `-0.20`，则：
+AReaL v2.0.0 Hermes 示例配置的 `eps_clip=0.4`，允许区间是 `[0.6, 1.4]`。`1.162` 在区间内，不触发 clipping。如果 current log-prob 变成 `-0.20`，则：
 
 ```text
 exp(-0.20 - (-1.05)) = exp(0.85) = 2.340
@@ -359,7 +419,9 @@ PPO 更新后：new_version = 8
 历史样本：仍然保留 version 7
 ```
 
-Hermes v2.0.0 配置把 `max_head_offpolicyness` 设为 2。版本字段让 rollout 侧能够约束训练消费速度与生成版本之间的差距。不要把版本 7 的 `versions` 改写成 8，否则就失去了判断数据陈旧程度的依据。
+AReaL v2.0.0 Hermes 示例配置把 `max_head_offpolicyness` 设为 2。版本字段让 rollout 侧能够约束训练消费速度与生成版本之间的差距。不要把版本 7 的 `versions` 改写成 8，否则就失去了判断数据陈旧程度的依据。
+
+训练批次刚冻结时，`pi_theta` 与 `pi_prox` 可以暂时相同，因此第一次 forward 的 ratio 可以正好为 1；这不代表梯度为 0。只要 advantage 非零，loss 对 `log pi_theta` 的导数仍然非零。optimizer 更新参数后，后续 minibatch 或 epoch 的 `pi_theta` 才会偏离冻结的 `pi_prox`。如果配置只做一个 minibatch/一次 forward，这两个数在该步数值上可能相同，三者的定义仍然必须分开，因为 `pi_prox` 是固定参照，`pi_theta` 是求导对象。
 
 ### 5.2 advantage 把序列 reward 分到 token 上
 
@@ -388,7 +450,7 @@ L_t(theta) = min(
 
 `reward=1.0` 不等于每个 token 都应该更频繁。真正的更新方向还取决于 advantage、ratio、KL 项、mask 和 normalization。
 
-### 5.3 v2.0.0 Hermes 配置有一个不能照抄的细节
+### 5.3 AReaL v2.0.0 Hermes 示例配置有一个不能照抄的细节
 
 固定 tag 的 `examples/hermes/config.yaml` 同时设置 `n_samples: 1` 与 group 级 `reward_norm`。在 v2.0.0 的 normalization 实现中，单元素组的均值就是该元素本身，中心化后的 task reward 会变成 0。本地 AReaL 当前 `main` 已把 Hermes 的 `reward_norm` 和 `adv_norm` 设为 `null`，并在注释中说明 singleton centering 会擦除信号。
 
@@ -463,7 +525,7 @@ version 7 继续产生完整 rollout
 
 ### 7.2 进入 AReaL 前的最小 gate
 
-未来 adapter 在提交数据前至少应执行以下判断：
+在线 adapter 在提交数据前至少应执行以下判断。当前 sidecar 与样本归档器已经实现身份、parent 树和 token span 的 fail-closed 校验；validity gate 仍必须在调用它们之前执行：
 
 ```text
 if validity_class not in {valid, policy_failure}:
@@ -479,7 +541,7 @@ if any model call violates token length, log-prob, mask or version contract:
     discard entire episode
 
 otherwise:
-    correlate model_call_id with interaction_id
+    validate explicit model_call_id <-> interaction_id sidecar
     set reward
     export to AReaL
     keep JointVersion in sidecar
@@ -523,9 +585,9 @@ Hermes 代码适合参考 session 路由、每 session Agent 生命周期、hist
 | 问题 | 必须存在的证据 |
 |---|---|
 | 这是哪道题的哪次采样？ | `task_id`、`episode_id`、`session_id` |
-| 一共调用模型几次？ | 有序 `model_call_id` 与对应 `interaction_id` |
+| 一共调用模型几次？ | 已实现 sidecar 中有序且一一对应的 `model_call_id` 与 `interaction_id` |
 | 每次模型到底看到了什么？ | effective prompt hash，以及 AReaL `input_tokens` |
-| 哪些 token 是模型动作？ | `output_tokens` 与 completion mask |
+| 哪些 token 是模型动作？ | `output_tokens`、completion mask，以及归档中的 `[start,end)` decision span |
 | 这些动作由哪版 policy 采样？ | token 级 `output_versions` 与 sidecar 的 policy release ID |
 | 采样概率是多少？ | 每个 output token 的 behavior log-prob |
 | 工具返回了什么？ | `tool_result` 事件、结果 hash、tool schema version |

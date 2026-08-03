@@ -21,6 +21,10 @@ from jphrl.trajectory.areal_joint_bridge import (
     validate_areal_joint_bridge_record,
     write_areal_joint_bridge_record,
 )
+from jphrl.trajectory.areal_interaction_sidecar import (
+    InteractionBinding,
+    build_interaction_adapter_sidecar,
+)
 
 
 class ArealJointBridgeTests(unittest.TestCase):
@@ -103,7 +107,11 @@ class ArealJointBridgeTests(unittest.TestCase):
             output_versions=[0, 0],
             stop_reason="stop",
         )
-        interaction = SimpleNamespace(reward=1.0, chat_template_type=None)
+        interaction = SimpleNamespace(
+            interaction_id=request_id,
+            reward=1.0,
+            chat_template_type=None,
+        )
         tensor_dict = {
             "input_ids": [[9, 1, 2, 3, 4]],
             "loss_mask": [[0, 0, 0, 1, 1]],
@@ -125,6 +133,23 @@ class ArealJointBridgeTests(unittest.TestCase):
             inference_runtime_contract_sha256=(
                 inference_runtime_contract_sha256(runtime_contract)
             ),
+        )
+        episode_id = f"test-run:{request_id}"
+        model_call_id = f"{episode_id}:model:0"
+        interaction_sidecar = build_interaction_adapter_sidecar(
+            [
+                InteractionBinding(
+                    episode_id=episode_id,
+                    model_call_id=model_call_id,
+                    session_id=None,
+                    trajectory_id=None,
+                    interaction_id=request_id,
+                    parent_interaction_id=None,
+                    ordinal=0,
+                    joint_version_id=joint_version.version_id,
+                    route_kind="rlvr-workflow",
+                )
+            ]
         )
         return build_areal_joint_bridge_record(
             task_id=7,
@@ -149,6 +174,7 @@ class ArealJointBridgeTests(unittest.TestCase):
             sglang_version="0.5.10.post1",
             generation_logprob_mode="standard-log-of-softmax-v1",
             inference_runtime_contract=runtime_contract,
+            interaction_adapter_sidecar=interaction_sidecar,
         )
 
     def test_real_interaction_and_harness_prompt_are_bound(self) -> None:
@@ -183,6 +209,14 @@ class ArealJointBridgeTests(unittest.TestCase):
             record["harness"]["controller_checkpoint_before_decision"]["sample_count"],
             0,
         )
+        binding = record["interaction_adapter_sidecar"]["bindings"][0]
+        self.assertEqual(audit["model_call_id"], binding["model_call_id"])
+        self.assertEqual(audit["interaction_id"], binding["interaction_id"])
+        self.assertNotEqual(binding["model_call_id"], binding["interaction_id"])
+        self.assertEqual(
+            record["credit_binding"]["policy_target_model_call_id"],
+            binding["model_call_id"],
+        )
 
     def test_every_harness_action_changes_the_prompt(self) -> None:
         base = [{"role": "user", "content": "Compute 1 + 1."}]
@@ -198,6 +232,37 @@ class ArealJointBridgeTests(unittest.TestCase):
         record = self._record()
         record["prompt_binding"]["effective_input_tokens"][0] = 999
         with self.assertRaisesRegex(ArealJointBridgeError, "hash"):
+            validate_areal_joint_bridge_record(record, expected_policy_version=0)
+
+    def test_bridge_rejects_rehashed_interaction_sidecar_mismatch(self) -> None:
+        record = self._record()
+        sidecar = record["interaction_adapter_sidecar"]
+        sidecar["bindings"][0]["interaction_id"] = "crossed-interaction"
+        sidecar_unsigned = {
+            key: item for key, item in sidecar.items() if key != "sidecar_sha256"
+        }
+        sidecar["sidecar_sha256"] = hashlib.sha256(
+            json.dumps(
+                sidecar_unsigned,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        unsigned = {
+            key: item for key, item in record.items() if key != "record_sha256"
+        }
+        record["record_sha256"] = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        with self.assertRaisesRegex(ArealJointBridgeError, "trace interaction"):
             validate_areal_joint_bridge_record(record, expected_policy_version=0)
 
     def test_bridge_rejects_unbound_logprob_mode_or_dataset_selection(self) -> None:

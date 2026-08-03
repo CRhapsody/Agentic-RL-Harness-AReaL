@@ -45,6 +45,15 @@ bootstrap 会先检查 Hugging Face 镜像、清华 PyPI、GitHub、uv、Flash A
 
 AReaL 固定为 `v2.0.0@fee938eada49208a5aabdbc1095730a13076a349`，要求 Python `>=3.11,<3.13`。官方 SGLang 镜像的 amd64 digest 冻结为 `sha256:2c6cc290a04139deb94400db74274f1f106f59d018a0df3ec19d76f154574147`。官方容器虽然最省依赖冲突，但 Docker 镜像层默认写到 daemon 的 `/var/lib/docker`；在“所有依赖都位于 `/mnt/sdb/ljw/chizm`”的硬约束下，只有远程 `docker info` 证明 `DockerRootDir` 已位于目标根目录时才可使用，否则改用目标根目录内的 uv/venv 环境。
 
+## AReaL interaction 身份与训练样本归档
+
+`jphrl/trajectory/areal_interaction_sidecar.py` 提供两层显式契约：
+
+1. `build_interaction_adapter_sidecar()` 将本项目的 `model_call_id` 与 AReaL 的 `interaction_id` 一一绑定，并保存 episode、session、trajectory、parent、顺序与 `JointVersion`。
+2. `export_bound_training_sample_archive()` 调用 AReaL 原生 `InteractionCache.export_interactions()`，支持 `individual` 与 `concat`，同时核验每次模型动作在六字段训练张量中的 token 区间。
+
+归档器只证明“训练样本怎样形成以及属于哪次模型调用”，不会伪造 optimizer update 证据。当前 RLVR bridge 已使用单 interaction sidecar；真实 Hermes/Agent Service 的多轮在线 DataProxy 接线仍是后续工作。
+
 ## 成功条件
 
 一次 smoke 只有同时满足以下条件才通过：

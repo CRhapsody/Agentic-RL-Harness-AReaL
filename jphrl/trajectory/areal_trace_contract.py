@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-SCHEMA_VERSION = "jph.areal-model-response-roundtrip.v1"
+SCHEMA_VERSION = "jph.areal-model-response-roundtrip.v2"
 REQUIRED_TENSOR_FIELDS = (
     "input_ids",
     "loss_mask",
@@ -93,6 +93,7 @@ def build_areal_trace_record(
             "stop_reason": model_response.stop_reason,
         },
         "interaction": {
+            "interaction_id": interaction.interaction_id,
             "reward": float(interaction.reward),
             "chat_template_type": interaction.chat_template_type,
         },
@@ -251,6 +252,11 @@ def validate_areal_trace_record(
     )
     interaction = record.get("interaction")
     _require(isinstance(interaction, dict), "interaction must be an object")
+    _require(
+        isinstance(interaction.get("interaction_id"), str)
+        and bool(interaction["interaction_id"]),
+        "interaction ID must be a non-empty string",
+    )
     _require(
         float(rewards[0]) == float(interaction.get("reward")),
         "tensor reward differs from interaction reward",

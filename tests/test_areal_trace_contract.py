@@ -23,6 +23,7 @@ class ArealTraceContractTests(unittest.TestCase):
             stop_reason="stop",
         )
         interaction = SimpleNamespace(
+            interaction_id="interaction-7",
             reward=1.0,
             chat_template_type="hf",
         )

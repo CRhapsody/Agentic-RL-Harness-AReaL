@@ -35,6 +35,10 @@ from jphrl.trajectory.areal_joint_bridge import (
     prompt_context_chars,
     write_areal_joint_bridge_record,
 )
+from jphrl.trajectory.areal_interaction_sidecar import (
+    InteractionBinding,
+    build_interaction_adapter_sidecar,
+)
 from scripts.write_sglang_logprob_screen_pointer import write_pointer
 
 
@@ -250,7 +254,11 @@ def _build_cell(
             output_versions=[0, 0],
             stop_reason="stop",
         )
-        interaction = SimpleNamespace(reward=1.0, chat_template_type=None)
+        interaction = SimpleNamespace(
+            interaction_id=request_id,
+            reward=1.0,
+            chat_template_type=None,
+        )
         joint_version = build_joint_version(
             policy_release_id="areal-sglang@model:engine-v0",
             harness_controller_version=controller.version,
@@ -261,6 +269,22 @@ def _build_cell(
             sglang_version="0.5.10.post1",
             generation_logprob_mode=mode,
             inference_runtime_contract_sha256=runtime_hash,
+        )
+        episode_id = f"{runtime_contract['identity']['run_id']}:{request_id}"
+        interaction_sidecar = build_interaction_adapter_sidecar(
+            [
+                InteractionBinding(
+                    episode_id=episode_id,
+                    model_call_id=f"{episode_id}:model:0",
+                    session_id=None,
+                    trajectory_id=None,
+                    interaction_id=request_id,
+                    parent_interaction_id=None,
+                    ordinal=0,
+                    joint_version_id=joint_version.version_id,
+                    route_kind="rlvr-workflow",
+                )
+            ]
         )
         bridge = build_areal_joint_bridge_record(
             task_id=index,
@@ -285,6 +309,7 @@ def _build_cell(
             sglang_version="0.5.10.post1",
             generation_logprob_mode=mode,
             inference_runtime_contract=runtime_contract,
+            interaction_adapter_sidecar=interaction_sidecar,
         )
         write_areal_joint_bridge_record(
             bridge,

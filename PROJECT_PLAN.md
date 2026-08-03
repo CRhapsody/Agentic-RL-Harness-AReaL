@@ -119,7 +119,7 @@ Artifact 不原地修改；任何变化产生新版本。首轮只允许 skill �
 
 AReaL 2.0 已将训练、推理、Agent 与权重更新拆成服务；Agent workflow 可经 OpenAI-compatible proxy 发起模型调用，并捕获生成 token、log-prob、reward 和 policy version。它支持 SGLang/vLLM 推理以及 FSDP2/Megatron/Archon 训练，适合复用现有 policy 数据面。[官方仓库](https://github.com/areal-project/AReaL)、[Agentic RL 教程](https://github.com/areal-project/AReaL/blob/v2.0.0/docs/en/tutorial/agentic_rl.md)、[Online Proxy 教程](https://github.com/areal-project/AReaL/blob/v2.0.0/docs/en/tutorial/online_proxy.md)
 
-但 v2.0.0 的原生训练 tensor contract 只有 `input_ids`、`loss_mask`、`logprobs`、`versions`、`attention_mask`、`rewards` 六项。`ModelRequest.metadata` 不会自动进入训练 tensor，`rollout.dump_to_file=true` 的 JSONL 也不含 token IDs、log-probs 或 loss mask。因此 Harness action、old Harness log-prob、controller/artifact/tool/parser/context 版本必须写入可关联的 sidecar，或显式扩展 export；不能仅凭 rollout dump 宣称联合轨迹已闭环。
+但 v2.0.0 的原生训练 tensor contract 只有 `input_ids`、`loss_mask`、`logprobs`、`versions`、`attention_mask`、`rewards` 六项。`ModelRequest.metadata` 不会自动进入训练 tensor，`rollout.dump_to_file=true` 的 JSONL 也不含 token IDs、log-probs 或 loss mask。因此 Harness action、old Harness log-prob、controller/artifact/tool/parser/context 版本必须写入可关联的 sidecar，或显式扩展 export；不能仅凭 rollout dump 宣称联合轨迹已闭环。本项目现已实现 `model_call_id <-> interaction_id` 身份 sidecar，以及委托 AReaL 原生 `individual/concat` export 的可审计样本归档，但尚未把真实 Agent Service 多轮 session 接入在线 DataProxy 训练队列。
 
 AReaL 2.0 论文进一步提出 Agent Trajectory Data Plane 与 evolution control plane，并把 Harness、memory、skill、tool 与 policy 都放进可演化对象；但论文明确把当前 prototype 的实现范围收在 policy-weight-update 分支。因此本项目是在官方愿景内补一个尚未落地的分支，不是调用现成 API。[AReaL 2.0 论文](https://arxiv.org/abs/2607.01120)
 
@@ -239,6 +239,7 @@ jphrl/
 ├── harness/registry.py      # pool, lineage, active set
 ├── harness/controller.py    # kappa_omega and optimizer
 ├── trajectory/schema.py     # joint event fields and migration
+├── trajectory/areal_interaction_sidecar.py # model-call identity, tree and sample spans
 ├── evolution/controller.py  # macro-step, barrier, validation, publish
 ├── checkpoint/manifest.py   # composite state and atomic pointer
 ├── eval/cross_play.py       # M00/M10/M01/M11
