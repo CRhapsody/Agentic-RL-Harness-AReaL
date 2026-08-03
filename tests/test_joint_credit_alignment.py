@@ -14,6 +14,10 @@ from jphrl.harness.controller import HarnessDecision
 from jphrl.harness.spec import HarnessAction, HarnessSpec
 from jphrl.models.base import ModelResponse
 from jphrl.runner import run_calculator_smoke
+from jphrl.training.areal_policy_optimizer import (
+    build_areal_external_advantage_batch,
+    validate_areal_external_advantage_batch,
+)
 from jphrl.trajectory.areal_agent_service_adapter import (
     AgentServiceModelCallReceipt,
     AgentServiceSessionReceipt,
@@ -304,8 +308,21 @@ class JointCreditAlignmentTests(unittest.TestCase):
                     persisted,
                     active_joint_version=trace.joint_version,
                 )
+                policy_batch = build_areal_external_advantage_batch(
+                    persisted,
+                    active_joint_version=trace.joint_version,
+                )
+                policy_batch_audit = validate_areal_external_advantage_batch(
+                    json.loads(json.dumps(policy_batch)),
+                    active_joint_version=trace.joint_version,
+                )
 
                 self.assertEqual(audit["policy_sample_count"], expected_sample_count)
+                self.assertEqual(
+                    len(policy_batch_audit.samples),
+                    expected_sample_count,
+                )
+                self.assertEqual(policy_batch_audit.inference_engine_version, 7)
                 self.assertEqual(audit["policy_decision_span_count"], 2)
                 self.assertEqual(audit["harness_action_count"], 2)
                 self.assertEqual(
