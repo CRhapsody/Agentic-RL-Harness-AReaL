@@ -52,9 +52,17 @@ AReaL 固定为 `v2.0.0@fee938eada49208a5aabdbc1095730a13076a349`，要求 Pytho
 1. `build_interaction_adapter_sidecar()` 将本项目的 `model_call_id` 与 AReaL 的 `interaction_id` 一一绑定，并保存 episode、session、trajectory、parent、顺序与 `JointVersion`。
 2. `export_bound_training_sample_archive()` 调用 AReaL 原生 `InteractionCache.export_interactions()`，支持 `individual` 与 `concat`，同时核验每次模型动作在六字段训练张量中的 token 区间。
 
-归档器只证明“训练样本怎样形成以及属于哪次模型调用”，不会伪造 optimizer update 证据。当前 RLVR bridge 已使用单 interaction sidecar；多轮 Agent Service adapter 契约已实现，但真实 Hermes receipt 暴露和 DataProxy 部署 hook 仍是后续工作。
+归档器只证明“训练样本怎样形成以及属于哪次模型调用”，不会伪造 optimizer update 证据。当前 RLVR bridge 已使用单 interaction sidecar；多轮 Agent Service 的 N/O/P 接线也已经实现，但它只证明 receipt、轨迹和 pre-batch 样本身份闭合，仍不构成 policy 或 Harness optimizer 已更新的证据。
 
 `jphrl/trajectory/areal_agent_service_adapter.py` 进一步实现了多轮 Agent Service 接线契约：从 `rl/start_session` 提取不含凭据的 session receipt，从 OpenAI completion/response ID 捕获 interaction receipt，从 `rl/set_reward` 提取 ready trajectory receipt，并在 `EpisodeTrace`、session、trajectory、parent 树与 token 张量全部一致后生成训练记录。正确 hook 位于 AReaL `SessionData.export_trajectory()` 之后、`concat_padded_tensors()` 之前；公开 `/export_trajectories` 响应已经丢失逐 interaction 身份，不能事后用 batch 行号猜测绑定。
+
+N/O/P 的生产边界由以下三个模块组成：
+
+1. `jphrl.hermes_agent_service.HermesAgent` 是固定 AReaL Hermes 示例的显式子类入口。它锁定 `hermes-agent==0.19.0`，为每次真实上游响应暴露精确五字段 receipt：`model_call_id`、`interaction_id`、`ordinal`、`parent_model_call_id`、`session_id`。凭据字段和额外 metadata 不能进入 receipt。
+2. `patches/areal-v2.0.0-data-proxy-pre-batch-hook.patch` 给固定 AReaL 增加最薄 callback。部署时设置 `AREAL_PRE_BATCH_HOOK=jphrl.trajectory.areal_online_binding.pre_batch_bind_agent_service_training_record`；callback 在每条 trajectory export 后、merge/tensorize 前执行，异常直接终止导出。
+3. `stage_agent_service_training_binding()` 先把 Hermes receipts、完整 `EpisodeTrace`、session/trajectory receipts 与 `JointVersion` 写入项目外的私有 journal。pre-batch callback 再用真实 interaction mapping 调用既有 `prepare_agent_service_training_record()`，并 exactly-once 写入 training record 和 finalized marker。marker 明确保持 `policy_optimizer_update=false`、`harness_optimizer_update=false`。
+
+Hermes 运行依赖单独固定在 `requirements-hermes.txt`。self-evolution caller 必须把 `rl/start_session` 返回的非秘密 `session_id` 放入 `metadata.jphrl_inference_session_id`；`session_api_key` 只用于路由，不能代替 session identity，也不会持久化。
 
 固定 AReaL v2.0.0 的 CPU 集成验证入口是：
 
@@ -64,7 +72,7 @@ source scripts/remote_env.sh
   scripts/verify_areal_agent_service_adapter.py
 ```
 
-该验证同时覆盖真实 `SessionData` 的 `individual` 两样本与 `concat` 单叶样本，不初始化 CUDA，也不执行 optimizer。
+该验证沿完整 N/O/P journal + hook 路径覆盖真实 `SessionData` 的 `individual` 两样本与 `concat` 单叶样本，不初始化 CUDA，也不执行 optimizer。
 
 ## 成功条件
 

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import asyncio
 import json
+import tempfile
+from pathlib import Path
 
 from areal.api import ModelResponse as ArealModelResponse
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
@@ -13,13 +16,20 @@ from jphrl.harness.spec import HarnessSpec
 from jphrl.models.base import ModelResponse
 from jphrl.runner import run_calculator_smoke
 from jphrl.trajectory.areal_agent_service_adapter import (
-    AgentServiceModelCallReceipt,
     AgentServiceSessionReceipt,
     AgentServiceTrajectoryReceipt,
-    prepare_agent_service_training_record,
     validate_agent_service_training_record,
     validate_agent_service_training_trace,
 )
+from jphrl.trajectory.areal_data_proxy_pre_batch import (
+    VerifiedDataProxyPreBatchHook,
+    export_session_trajectory_with_pre_batch_hook,
+)
+from jphrl.trajectory.areal_online_binding import (
+    PersistentAgentServicePreBatchBinder,
+    stage_agent_service_training_binding,
+)
+from jphrl.trajectory.hermes_model_call_receipts import HermesModelCallReceipt
 
 
 class TokenBackedCalculatorModel:
@@ -132,42 +142,81 @@ def _run_style(style: str) -> dict[str, object]:
     reward_result = session_data.set_reward(None, 1.0)
     if reward_result.trajectory_id is None:
         raise RuntimeError("AReaL did not close the rewarded trajectory")
-    trajectory_id, exported = session_data.export_trajectory(
-        discount=1.0,
-        style=style,
+    session_receipt = AgentServiceSessionReceipt(
+        group_id=f"group-{style}",
+        session_id=session_id,
+    )
+    trajectory_receipt = AgentServiceTrajectoryReceipt(
+        session_id=session_id,
         trajectory_id=reward_result.trajectory_id,
+        interaction_count=reward_result.interaction_count,
+        ready_transition=reward_result.ready_transition,
     )
-    record = prepare_agent_service_training_record(
-        trace=trace,
-        session=AgentServiceSessionReceipt(
-            group_id=f"group-{style}",
+    hermes_receipts = [
+        HermesModelCallReceipt(
+            model_call_id=model_call_ids[0],
+            interaction_id="interaction-1",
+            ordinal=0,
+            parent_model_call_id=None,
             session_id=session_id,
         ),
-        model_calls=[
-            AgentServiceModelCallReceipt(
-                model_call_id=model_call_ids[0],
-                interaction_id="interaction-1",
-                ordinal=0,
-                parent_model_call_id=None,
-            ),
-            AgentServiceModelCallReceipt(
-                model_call_id=model_call_ids[1],
-                interaction_id="interaction-2",
-                ordinal=1,
-                parent_model_call_id=model_call_ids[0],
-            ),
-        ],
-        trajectory=AgentServiceTrajectoryReceipt(
+        HermesModelCallReceipt(
+            model_call_id=model_call_ids[1],
+            interaction_id="interaction-2",
+            ordinal=1,
+            parent_model_call_id=model_call_ids[0],
             session_id=session_id,
-            trajectory_id=trajectory_id,
-            interaction_count=reward_result.interaction_count,
-            ready_transition=reward_result.ready_transition,
         ),
-        exported_interactions=exported,
-        export_style=style,
-        turn_discount=1.0,
-    )
-    return validate_agent_service_training_record(record)
+    ]
+
+    with tempfile.TemporaryDirectory(prefix=f"jph-{style}-") as directory:
+        journal_root = Path(directory)
+        stage_agent_service_training_binding(
+            journal_root=journal_root,
+            trace=trace,
+            session=session_receipt,
+            model_calls=hermes_receipts,
+            trajectory=trajectory_receipt,
+            export_style=style,
+            turn_discount=1.0,
+        )
+        hook = VerifiedDataProxyPreBatchHook(
+            PersistentAgentServicePreBatchBinder(journal_root)
+        )
+        trajectory_id, exported = asyncio.run(
+            export_session_trajectory_with_pre_batch_hook(
+                session_data,
+                discount=1.0,
+                style=style,
+                trajectory_id=reward_result.trajectory_id,
+                hook=hook,
+            )
+        )
+        if trajectory_id != trajectory_receipt.trajectory_id:
+            raise RuntimeError("pre-batch hook observed the wrong trajectory")
+        if style == "individual" and list(exported) != [
+            "interaction-1",
+            "interaction-2",
+        ]:
+            raise RuntimeError("individual export lost interaction identity")
+        if style == "concat" and list(exported) != ["interaction-2"]:
+            raise RuntimeError("concat export did not expose its real leaf")
+
+        record_files = list((journal_root / "records").glob("*.json"))
+        marker_files = list((journal_root / "finalized").glob("*.json"))
+        if len(record_files) != 1 or len(marker_files) != 1:
+            raise RuntimeError("pre-batch binding was not finalized exactly once")
+        record_text = record_files[0].read_text(encoding="utf-8")
+        marker_text = marker_files[0].read_text(encoding="utf-8")
+        if "session_api_key" in record_text or "admin_api_key" in record_text:
+            raise RuntimeError("credential field entered the training record")
+        marker = json.loads(marker_text)
+        if marker["evidence_scope"]["policy_optimizer_update"]:
+            raise RuntimeError("pre-batch binding fabricated optimizer evidence")
+        if marker["evidence_scope"]["harness_optimizer_update"]:
+            raise RuntimeError("pre-batch binding fabricated harness update evidence")
+        record = json.loads(record_text)
+        return validate_agent_service_training_record(record)
 
 
 def main() -> None:

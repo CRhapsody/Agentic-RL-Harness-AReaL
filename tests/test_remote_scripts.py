@@ -1,10 +1,10 @@
-from pathlib import Path
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from jphrl.envs.calculator import TASKS
 from jphrl.harness.controller import SmokeHarnessController
@@ -24,9 +24,13 @@ class RemoteScriptContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("SessionData", text)
-        self.assertIn("session_data.export_trajectory", text)
-        self.assertIn("exported_interactions=exported", text)
-        self.assertIn("prepare_agent_service_training_record", text)
+        self.assertIn("export_session_trajectory_with_pre_batch_hook", text)
+        self.assertIn("stage_agent_service_training_binding", text)
+        self.assertIn("PersistentAgentServicePreBatchBinder", text)
+        self.assertIn("HermesModelCallReceipt", text)
+        self.assertIn('journal_root / "finalized"', text)
+        self.assertIn('"policy_optimizer_update"', text)
+        self.assertIn('"harness_optimizer_update"', text)
         self.assertIn('"gpu_used": False', text)
         self.assertNotIn("torch.cuda", text)
         self.assertNotIn("CUDA_VISIBLE_DEVICES", text)

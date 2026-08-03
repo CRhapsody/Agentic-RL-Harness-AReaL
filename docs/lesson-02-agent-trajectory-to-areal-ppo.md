@@ -52,12 +52,15 @@ fee938eada49208a5aabdbc1095730a13076a349
 | 联合版本与轨迹校验 | `jphrl/trajectory/schema.py` |
 | token 元数据校验 | `jphrl/trajectory/token_contract.py` |
 | model call 与 AReaL interaction 绑定、样本归档 | `jphrl/trajectory/areal_interaction_sidecar.py` |
+| Hermes 逐调用 receipt | `jphrl/trajectory/hermes_model_call_receipts.py`、`jphrl/hermes_agent_service.py` |
+| DataProxy pre-batch seam | `jphrl/trajectory/areal_data_proxy_pre_batch.py`、`patches/areal-v2.0.0-data-proxy-pre-batch-hook.patch` |
+| 在线持久接合 | `jphrl/trajectory/areal_online_binding.py` |
 | 当前 mock 模型 | `jphrl/models/base.py` |
 
 有两个边界必须先说清：
 
 1. 本项目当前的 `MockStructuredModel` 是脚本策略。它明确返回 `token_metadata_status="not_applicable"`，并把 token ID、log-prob、loss mask 留空。因此，它能验证事件和 reward 数据面，不能直接形成 PPO 样本。
-2. 本项目已经有 `JointVersion`、可训练的 policy failure、不可训练的 invalid failure、token contract、显式的 `model_call_id <-> interaction_id` sidecar、`individual/concat` 样本归档器，以及 Agent Service session/model-call/ready-trajectory receipt 与 pre-batch adapter。invalid failure 又细分为基础设施异常与 trace contract 异常。尚未完成的是把 hook 注入真实 Hermes/DataProxy 部署并让 Hermes 暴露每次上游模型调用 receipt；下文既解释已实现契约，也明确标出尚未接通的进程间传输。
+2. 本项目已经有 `JointVersion`、可训练的 policy failure、不可训练的 invalid failure、token contract、显式的 `model_call_id <-> interaction_id` sidecar、`individual/concat` 样本归档器，以及 Agent Service session/model-call/ready-trajectory receipt。N/O/P 又补上了固定 Hermes 0.19.0 的逐上游调用 receipt、export 后且 merge 前的 DataProxy callback，以及项目外私有 journal 中的 staged/finalized 持久接合。invalid failure 仍细分为基础设施异常与 trace contract 异常，两者都不能进入 staged record。这个闭环只证明训练数据身份可信；真实 policy/Harness 样本准入、advantage 和 optimizer 更新属于后续 Q/R/S/T/U，不能提前宣称完成。
 
 ## 1. 先分清五个对象
 
@@ -100,7 +103,7 @@ AReaL `SessionStore.start_session(task_id)` 会为这个 task 找一个未使用
 
 本项目用 `model_call_id` 关联 `model_request`、`model_response`、`parse_result` 和最终 reward 的归因目标。AReaL 使用 OpenAI completion 或 response 的 ID 作为 `interaction_id`。`areal_interaction_sidecar.py` 现在显式保存二者的一一映射，不能假定它们天然相等。
 
-对每次调用，关联过程是：本项目先创建 `model_call_id`，向 AReaL 路由请求；AReaL 返回 `interaction_id` 后，adapter 写入同一条 binding：
+对每次 Hermes 内部调用，receipt-aware Agent 先创建 `model_call_id`，再从 AReaL gateway 的真实 upstream response 读取 `interaction_id`；同一条五字段 receipt 还带 ordinal、parent 与非秘密 session ID。在线 `EpisodeTrace` 必须沿用这个 `model_call_id`，而不能自己再生成一套 ID。持久 binder 随后把两者写入同一条 binding：
 
 ```text
 episode_id
@@ -352,6 +355,18 @@ concat leaf loss_mask = [ 0, 0, 1, 1, 0, 1]
 
 在线 Agent Service 的正确调用窗口还要更精确。AReaL `SessionData.export_trajectory()` 返回带 interaction 对象的 styled mapping；紧接着 `/export_trajectories` 会用 `concat_padded_tensors()` 把它们合并为 batch。合并后只剩张量行，不再有可靠的 interaction ID。因此本项目的 `prepare_agent_service_training_record()` 支持在这两个调用之间接收 mapping，沿 concat 叶节点的 `parent` 指针恢复完整树并完成 sidecar 校验。不能等 HTTP export 返回后再把第 0 行猜成 call 1。
 
+现在这个窗口由一个固定 AReaL commit 的小补丁真实暴露。callback 的顺序是：
+
+```text
+SessionData.export_trajectory()
+  -> pre_batch_bind_agent_service_training_record()
+  -> merged.update(interactions)
+  -> to_tensor_dict()
+  -> concat_padded_tensors()
+```
+
+callback 按真实 `(session_id, trajectory_id)` 读取先前 staged 的 Hermes receipts、完整 `EpisodeTrace`、session/trajectory receipt 和 JointVersion，再把原始 interaction mapping 交给既有 `prepare_agent_service_training_record()`。缺 staged record、ID 交叉、parent/ordinal/version 不一致、secret 字段、invalid episode 或持久化失败都会让 export fail closed。若传入的是合并后的六字段 padded batch，validator 明确失败；它不会猜 row-to-interaction 映射。
+
 `concat` 可以作为另一种训练样本保存方式，但它不是单纯把两个 JSON 文件压成一个。它改变了样本边界：一个叶样本同时训练根到叶的多次模型动作，而 `individual` 为每次调用产生独立样本。存在分支、interaction 级中间 reward、长度截断或按样本归一化时，两者的优化统计量可能不同，所以实验必须把 `export_style` 当成配置变量记录，不能混在同一结果中。
 
 ## 5. rollout 后，PPO 实际计算了什么
@@ -555,16 +570,18 @@ otherwise:
 
 Hermes 不是 PPO trainer，也不是 AReaL 的替代品。它是 Agent runtime：维护 Agent 行为，决定何时调用 LLM、如何执行工具、怎样把工具结果放回上下文。
 
-AReaL v2.0.0 的 Hermes 接入链可以按六步读：
+AReaL v2.0.0 加本项目 N/O/P 的 Hermes 接入链可以按八步读：
 
 1. `start_session.py` 向 inference gateway 请求 session，取得 session ID 与 session key。
-2. `hermes_loop.py` 把 inference base URL、model 和 session key 发给 Agent Service。
+2. caller 把 inference base URL、model、session key，以及非秘密 `session_id` 放入 `metadata.jphrl_inference_session_id` 后发给 Agent Service。
 3. Agent Service 的 DataProxy 把这些路由信息注入 `metadata["areal_inference"]`。
-4. `examples/hermes/hermes.py` 为每个 session 建一个进程内 `AIAgent`，并让它的上游 LLM 调用经过 AReaL inference gateway。
-5. Hermes 在内部循环中执行工具。每次上游 LLM call 都被 AReaL 按同一 session key 捕获。
-6. episode 完成后调用 set reward。AReaL 导出 interaction，PPO trainer 消费张量并同步新 policy 权重。
+4. `jphrl.hermes_agent_service.HermesAgent` 显式子类化固定示例，为每个 session 建一个进程内 `AIAgent`，并让它的上游 LLM 调用经过 AReaL inference gateway。
+5. Hermes 在内部循环中执行工具。每次成功上游调用都返回一个严格五字段 receipt；response 自带的 `api_key/session_api_key` 或额外 metadata 不会进入 receipt。
+6. caller 用 receipts 的 `model_call_id` 形成 EpisodeTrace，完成 validity gate 与 set reward，得到 ready trajectory receipt；随后把全套非秘密身份写入私有 staged journal。
+7. AReaL 导出 trajectory 时，在 interaction 仍可识别的 pre-batch seam 调用 persistent binder。binder exactly-once 写入 training record 与 finalized marker。
+8. 后续 Q/T 才允许 PPO trainer 消费准入后的张量并执行 policy 更新；N/O/P marker 始终把 policy/Harness optimizer evidence 记为 `false`。
 
-Hermes adapter 把 DataProxy replay 的 history 当作会话事实来源，并关闭自己的持久 memory 与 context files。这样可以避免 Hermes 私有状态与 AReaL 捕获上下文不一致。
+Hermes adapter 把 DataProxy replay 的 history 当作会话事实来源，并关闭自己的持久 memory 与 context files。这样可以避免 Hermes 私有状态与 AReaL 捕获上下文不一致。receipt collector 只保存消息的 SHA-256 fingerprint 来重现 AReaL 的 longest-prefix parent 规则，不保存 prompt 或 response 正文；同 session turn 还用额外异步锁串行化完整 receipt cursor 窗口。
 
 对我们的 calculator 项目，最小可行接法是保留 Hermes 的 session 与工具循环，并实现一个明确的桥：
 
