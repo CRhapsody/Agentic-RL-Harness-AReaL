@@ -1,6 +1,6 @@
 # JPH-RL
 
-JPH-RL 是 `PROJECT_PLAN.md` 的最小可执行实现。当前阶段只覆盖 B0：在一个确定性 calculator 工具任务上验证 Harness、模型调用、工具执行、评价器、联合版本和轨迹记录能够端到端工作。
+JPH-RL 是 `PROJECT_PLAN.md` 的增量可执行实现。当前代码已经覆盖 calculator B0 控制流、真实 AReaL interaction 身份、Hermes/DataProxy 在线接合，以及 Q/R/S 的双路训练样本准入和冻结 credit 对齐；真实 Policy 与 Harness optimizer、候选 checkpoint 和联合发布仍未接入。
 
 ## 本地无依赖检查
 
@@ -52,7 +52,7 @@ AReaL 固定为 `v2.0.0@fee938eada49208a5aabdbc1095730a13076a349`，要求 Pytho
 1. `build_interaction_adapter_sidecar()` 将本项目的 `model_call_id` 与 AReaL 的 `interaction_id` 一一绑定，并保存 episode、session、trajectory、parent、顺序与 `JointVersion`。
 2. `export_bound_training_sample_archive()` 调用 AReaL 原生 `InteractionCache.export_interactions()`，支持 `individual` 与 `concat`，同时核验每次模型动作在六字段训练张量中的 token 区间。
 
-归档器只证明“训练样本怎样形成以及属于哪次模型调用”，不会伪造 optimizer update 证据。当前 RLVR bridge 已使用单 interaction sidecar；多轮 Agent Service 的 N/O/P 接线也已经实现，但它只证明 receipt、轨迹和 pre-batch 样本身份闭合，仍不构成 policy 或 Harness optimizer 已更新的证据。
+归档器只证明“训练样本怎样形成以及属于哪次模型调用”，不会伪造 optimizer update 证据。当前 RLVR bridge 已使用单 interaction sidecar；多轮 Agent Service 的 N/O/P 接线和 Q/R/S 的样本/credit 准入均已实现。它们证明 receipt、轨迹、pre-batch 样本、行为时概率与冻结 advantage 的身份闭合，仍不构成 policy 或 Harness optimizer 已更新的证据。
 
 `jphrl/trajectory/areal_agent_service_adapter.py` 进一步实现了多轮 Agent Service 接线契约：从 `rl/start_session` 提取不含凭据的 session receipt，从 OpenAI completion/response ID 捕获 interaction receipt，从 `rl/set_reward` 提取 ready trajectory receipt，并在 `EpisodeTrace`、session、trajectory、parent 树与 token 张量全部一致后生成训练记录。正确 hook 位于 AReaL `SessionData.export_trajectory()` 之后、`concat_padded_tensors()` 之前；公开 `/export_trajectories` 响应已经丢失逐 interaction 身份，不能事后用 batch 行号猜测绑定。
 
@@ -73,6 +73,33 @@ source scripts/remote_env.sh
 ```
 
 该验证沿完整 N/O/P journal + hook 路径覆盖真实 `SessionData` 的 `individual` 两样本与 `concat` 单叶样本，不初始化 CUDA，也不执行 optimizer。
+
+## Q/R/S：真实样本准入与冻结双路 credit
+
+N/O/P finalized training record 之后有三个独立的 fail-closed 边界：
+
+1. `areal_policy_admission.py` 重验 P record、interaction archive 和 lag-zero `JointVersion`，保留 AReaL 六字段张量以及每个 `model_call_id` 的精确 decision span。一个 span 内只能有一个真实 inference engine version；trainable old log-prob 必须有限且非正。
+2. `harness_action_admission.py` 从同一 `EpisodeTrace` 和同一 P record 准入真实 Harness decision，保存完整 `HarnessState`、固定五动作 schema、action mask、mask 前 logits、可重算 old log-prob、loss mask 和 behavior version。`infrastructure_invalid` 与 `trace_contract_invalid` episode 不能进入该边界。
+3. `joint_credit_alignment.py` 把持久 Q/R admission 固定到同一 episode、P record 与 `JointVersion`。当前显式 estimator 是“terminal return 减去两份冻结 baseline”；Policy 与 Harness 的 source、baseline snapshot 和 target map 必须分开，synthetic/placeholder provenance 会被拒绝。Policy advantage 只写入 decision span 且严格等于 loss mask；Harness masked advantage 只受自己的 loss mask 控制。
+
+S record 内嵌完整 Q/R admission 并保存 canonical SHA-256，因此 JSON 落盘后会重新验证来源记录、目标、版本、张量、mask 和 advantage，而不是只相信散列标签。`individual` 与 `concat` 都经过同一验证入口：
+
+```python
+policy = build_policy_training_admission(p_record, active_joint_version=version)
+harness = admit_real_harness_action_samples(
+    trace=trace,
+    active_joint_version=version,
+    pre_batch_training_record=p_record,
+)
+credit_record = build_frozen_joint_credit_alignment(
+    policy_admission=policy,
+    harness_admission=harness.to_record(),
+    active_joint_version=version,
+    estimator=frozen_dual_baseline,
+)
+```
+
+上述入口只构造 optimizer-ready 的受审数据对象，不调用 optimizer。所有 Q/R/S evidence 仍固定为 `policy_optimizer_update=false`、`harness_optimizer_update=false`；后续 T/U 才能产生真实参数更新证据。
 
 ## 成功条件
 

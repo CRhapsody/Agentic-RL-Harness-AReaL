@@ -3,7 +3,7 @@ title: "JPH-RL：基于 AReaL 的 Policy–Harness 联合强化学习计划"
 aliases: [JPH-RL, Joint Policy Harness RL, AReaL Agentic RL Harness]
 type: project-plan
 created: 2026-08-02
-updated: 2026-08-02
+updated: 2026-08-03
 status: in-progress
 tags: [agentic-rl, harness, areal, joint-learning, experiment-plan]
 ---
@@ -119,7 +119,7 @@ Artifact 不原地修改；任何变化产生新版本。首轮只允许 skill �
 
 AReaL 2.0 已将训练、推理、Agent 与权重更新拆成服务；Agent workflow 可经 OpenAI-compatible proxy 发起模型调用，并捕获生成 token、log-prob、reward 和 policy version。它支持 SGLang/vLLM 推理以及 FSDP2/Megatron/Archon 训练，适合复用现有 policy 数据面。[官方仓库](https://github.com/areal-project/AReaL)、[Agentic RL 教程](https://github.com/areal-project/AReaL/blob/v2.0.0/docs/en/tutorial/agentic_rl.md)、[Online Proxy 教程](https://github.com/areal-project/AReaL/blob/v2.0.0/docs/en/tutorial/online_proxy.md)
 
-但 v2.0.0 的原生训练 tensor contract 只有 `input_ids`、`loss_mask`、`logprobs`、`versions`、`attention_mask`、`rewards` 六项。`ModelRequest.metadata` 不会自动进入训练 tensor，`rollout.dump_to_file=true` 的 JSONL 也不含 token IDs、log-probs 或 loss mask。因此 Harness action、old Harness log-prob、controller/artifact/tool/parser/context 版本必须写入可关联的 sidecar，或显式扩展 export；不能仅凭 rollout dump 宣称联合轨迹已闭环。本项目现已实现 `model_call_id <-> interaction_id` 身份 sidecar、委托 AReaL 原生 `individual/concat` export 的可审计样本归档、多轮 Agent Service session/model-call/ready-trajectory receipt、固定 Hermes 0.19.0 的逐调用 receipt 入口、AReaL pre-batch 小型补丁，以及项目外私有 journal 的持久 exactly-once 接合。所有绑定都发生在 `export_trajectory()` 后、batch merge 前；post-batch 数据明确拒绝。下一阶段 Q/R/S 才构造两路真实训练样本和 credit/advantage，当前 N/O/P 记录不声称 optimizer 已更新。
+但 v2.0.0 的原生训练 tensor contract 只有 `input_ids`、`loss_mask`、`logprobs`、`versions`、`attention_mask`、`rewards` 六项。`ModelRequest.metadata` 不会自动进入训练 tensor，`rollout.dump_to_file=true` 的 JSONL 也不含 token IDs、log-probs 或 loss mask。因此 Harness action、old Harness log-prob、controller/artifact/tool/parser/context 版本必须写入可关联的 sidecar，或显式扩展 export；不能仅凭 rollout dump 宣称联合轨迹已闭环。本项目现已实现 `model_call_id <-> interaction_id` 身份 sidecar、委托 AReaL 原生 `individual/concat` export 的可审计样本归档、多轮 Agent Service session/model-call/ready-trajectory receipt、固定 Hermes 0.19.0 的逐调用 receipt 入口、AReaL pre-batch 小型补丁，以及项目外私有 journal 的持久 exactly-once 接合。所有绑定都发生在 `export_trajectory()` 后、batch merge 前；post-batch 数据明确拒绝。Q/R 又分别完成 AReaL Policy tensor 与真实 Harness action 的 lag-zero 准入；S 将两者与同一 P record、episode 和 `JointVersion` 持久接合，并用两份独立冻结 baseline 形成逐动作 advantage 与严格 mask。Q/R/S 的 record 仍明确把两个 optimizer update 证据记为 `false`；下一阶段 T/U 才允许执行真实参数更新。
 
 AReaL 2.0 论文进一步提出 Agent Trajectory Data Plane 与 evolution control plane，并把 Harness、memory、skill、tool 与 policy 都放进可演化对象；但论文明确把当前 prototype 的实现范围收在 policy-weight-update 分支。因此本项目是在官方愿景内补一个尚未落地的分支，不是调用现成 API。[AReaL 2.0 论文](https://arxiv.org/abs/2607.01120)
 

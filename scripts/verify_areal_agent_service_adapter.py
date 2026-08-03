@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import tempfile
 from pathlib import Path
 
@@ -11,8 +12,8 @@ from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.v2.inference_service.data_proxy.session import SessionData
 
 from jphrl.envs.calculator import TASKS
-from jphrl.harness.controller import SmokeHarnessController
-from jphrl.harness.spec import HarnessSpec
+from jphrl.harness.controller import HarnessDecision
+from jphrl.harness.spec import HarnessAction, HarnessSpec
 from jphrl.models.base import ModelResponse
 from jphrl.runner import run_calculator_smoke
 from jphrl.trajectory.areal_agent_service_adapter import (
@@ -29,7 +30,19 @@ from jphrl.trajectory.areal_online_binding import (
     PersistentAgentServicePreBatchBinder,
     stage_agent_service_training_binding,
 )
+from jphrl.trajectory.areal_policy_admission import (
+    build_policy_training_admission,
+)
+from jphrl.trajectory.harness_action_admission import (
+    admit_real_harness_action_samples,
+)
 from jphrl.trajectory.hermes_model_call_receipts import HermesModelCallReceipt
+from jphrl.trajectory.joint_credit_alignment import (
+    ESTIMATOR_VERSION,
+    DualCreditEstimatorSpec,
+    build_frozen_joint_credit_alignment,
+    validate_frozen_joint_credit_alignment,
+)
 
 
 class TokenBackedCalculatorModel:
@@ -71,11 +84,48 @@ class TokenBackedCalculatorModel:
         return response
 
 
+class LiveCalculatorHarnessController:
+    """Non-degenerate behavior distribution for CPU-only Q/R/S verification."""
+
+    version = "live-calculator-harness-v1"
+
+    def __init__(self) -> None:
+        self.ordinal = 0
+
+    def choose(self, state):
+        action_ids = tuple(action.value for action in HarnessAction)
+        action = (
+            HarnessAction.DIRECT
+            if state.verifier_status == "not-run"
+            else HarnessAction.VERIFY
+        )
+        action_index = action_ids.index(action.value)
+        logits = tuple(
+            1.25 if index == action_index else -0.25 for index in range(len(action_ids))
+        )
+        maximum = max(logits)
+        normalizer = maximum + math.log(
+            sum(math.exp(value - maximum) for value in logits)
+        )
+        decision = HarnessDecision(
+            decision_id=f"live-session-decision-{self.ordinal}",
+            action=action,
+            old_harness_logprob=logits[action_index] - normalizer,
+            controller_version=self.version,
+            action_ids=action_ids,
+            action_mask=(True,) * len(action_ids),
+            pre_mask_logits=logits,
+            harness_loss_mask=1,
+        )
+        self.ordinal += 1
+        return decision
+
+
 def _trace():
     result = run_calculator_smoke(
         model=TokenBackedCalculatorModel(),
         task=TASKS["add-17-25"],
-        controller=SmokeHarnessController(),
+        controller=LiveCalculatorHarnessController(),
         harness_spec=HarnessSpec(),
     )
     if not result.success:
@@ -216,7 +266,47 @@ def _run_style(style: str) -> dict[str, object]:
         if marker["evidence_scope"]["harness_optimizer_update"]:
             raise RuntimeError("pre-batch binding fabricated harness update evidence")
         record = json.loads(record_text)
-        return validate_agent_service_training_record(record)
+        binding_audit = validate_agent_service_training_record(record)
+        policy_admission = build_policy_training_admission(
+            record,
+            active_joint_version=trace.joint_version,
+        )
+        harness_admission = admit_real_harness_action_samples(
+            trace=trace,
+            active_joint_version=trace.joint_version,
+            pre_batch_training_record=record,
+        )
+        estimator = DualCreditEstimatorSpec(
+            estimator_version=ESTIMATOR_VERSION,
+            parent_joint_version_id=trace.joint_version.version_id,
+            policy_source="policy-session-terminal-baseline-v1",
+            harness_source="harness-session-terminal-baseline-v1",
+            policy_baseline_snapshot_id="policy-session-baseline-snapshot-v1",
+            harness_baseline_snapshot_id="harness-session-baseline-snapshot-v1",
+            policy_baselines={
+                model_call_id: 0.25 + 0.25 * index
+                for index, model_call_id in enumerate(model_call_ids)
+            },
+            harness_baselines={
+                action.decision_id: 0.1 + 0.1 * index
+                for index, action in enumerate(harness_admission.actions)
+            },
+        )
+        credit_record = build_frozen_joint_credit_alignment(
+            policy_admission=policy_admission,
+            harness_admission=harness_admission.to_record(),
+            active_joint_version=trace.joint_version,
+            estimator=estimator,
+        )
+        credit_audit = validate_frozen_joint_credit_alignment(
+            json.loads(json.dumps(credit_record)),
+            active_joint_version=trace.joint_version,
+        )
+        if credit_record["evidence_scope"]["policy_optimizer_update"]:
+            raise RuntimeError("Q/R/S fabricated a policy optimizer update")
+        if credit_record["evidence_scope"]["harness_optimizer_update"]:
+            raise RuntimeError("Q/R/S fabricated a Harness optimizer update")
+        return {**binding_audit, "qrs_credit_alignment": credit_audit}
 
 
 def main() -> None:
@@ -234,6 +324,7 @@ def main() -> None:
                 "ok": True,
                 "areal_hook": "after-export-trajectory-before-concat-padded-tensors",
                 "gpu_used": False,
+                "optimizer_used": False,
                 "audits": audits,
             },
             ensure_ascii=False,

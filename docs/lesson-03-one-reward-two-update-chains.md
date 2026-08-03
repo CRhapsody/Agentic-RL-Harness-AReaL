@@ -11,17 +11,17 @@
 
 两类动作的样本位置、行为概率、可训练掩码、信用归属和参数集合都不同。因此, 同一个 episode reward 必须先被转换成两组与动作一一对应的 credit, 再进入两条彼此独立、最终同步发布的更新链。
 
-本文严格对应项目提交 `01909d15b672b040ea16b9afc8b875d067e63b18`。这一限定很重要, 因为我们要区分代码现在已经证明的事情, 与目标系统将来需要完成的事情。
+本文的 synthetic 控制面例子对应项目提交 `01909d15b672b040ea16b9afc8b875d067e63b18`；文末证据边界仍按该实验解释。当前项目已经额外完成 Q/R/S 的真实样本准入与冻结 credit 数据对象，但仍没有真实 optimizer update。这个区分很重要，因为“credit 已对齐”和“参数已更新”是两个不同证据层级。
 
 ## 1. 先划清三个证据层级
 
 | 层级 | 输入来自哪里 | 更新了什么 | 当前状态 |
 | --- | --- | --- | --- |
 | synthetic CPU fixture | 本地确定性构造的 trace、credit 和版本事件 | toy policy 参数与 toy Harness 参数 | 已实现并有测试证据 |
-| 真实 AReaL interaction sidecar | AReaL 推理引擎产生的真实 token、logprob、输出版本, 再加真实 Harness 决策 | 应向两个真实优化器提供可消费样本 | 尚未接通。现在只有 sidecar 数据契约和 synthetic 填充 |
+| 真实 AReaL Q/R/S admission | AReaL 推理引擎产生的 token、logprob、输出版本，加同一 episode 的真实 Harness 决策与两份冻结 baseline | 两路 optimizer-ready 样本与 advantage，不执行更新 | 已实现，并通过 `individual/concat`、lag0、mask 与持久 record 重验 |
 | 真实 optimizer update | 真实 policy 模型参数、真实 Harness 可学习参数及各自 optimizer state | policy 与 Harness 的生产级联合学习 | 尚未完成 |
 
-这里的 `sidecar` 是和主训练样本并排保存的一组附加字段。当前 `JointDecisionBatch` 记录 policy token 与 Harness decision 的决策和 credit, 但它不是完整的 AReaL PPO batch。它没有完整 prompt、`input_ids`、`attention_mask` 等 AReaL policy optimizer 所需张量。
+这里的 `sidecar` 是和主训练样本并排保存的一组附加字段。早期 `JointDecisionBatch` 只记录 policy token 与 Harness decision 的决策和 synthetic credit，不是完整 AReaL PPO batch。现在 `areal_policy_admission.py` 保留六字段 AReaL sample 和精确 decision span，`harness_action_admission.py` 保留行为时 Harness state/distribution，`joint_credit_alignment.py` 把两者与同一 P record 和 `JointVersion` 持久连接。它们已经形成完整训练输入，但不包含任何 optimizer 执行结果。
 
 因此, 本课讲的不是一次已经完成的真实 AReaL 联合训练。它讲的是: 当前提交已经把两条更新链的边界、版本约束、失败条件和本地最小闭环写成了可执行契约。
 

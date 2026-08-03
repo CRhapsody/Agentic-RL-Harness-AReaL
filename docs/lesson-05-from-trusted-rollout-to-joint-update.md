@@ -345,7 +345,7 @@ A^H_{e,d}=C^H_e(d).
 
 `A` 表示 advantage，也就是某个具体动作相对参照值多带来的估计回报。它不是 reward 的另一个名字。
 
-当前真实 bridge 只保存：
+早期真实 bridge 只保存：
 
 ```text
 raw_terminal_reward
@@ -360,7 +360,17 @@ policy_advantage = None
 harness_advantage = None
 ```
 
-这说明 target 已经绑定，但 credit estimator 还没有接入。项目 G1 中出现的 `synthetic-policy-credit-fixture-v1` 和 `synthetic-harness-credit-fixture-v1` 只是控制面测试输入，不能拿来训练真实 AReaL 模型。
+这说明当时 target 已经绑定，但 credit estimator 还没有接入。项目 G1 中出现的 `synthetic-policy-credit-fixture-v1` 和 `synthetic-harness-credit-fixture-v1` 只是控制面测试输入，不能拿来训练真实 AReaL 模型。
+
+现在 Q/R/S 已补上这段数据面：Q 保存真实 AReaL 六字段样本和每个 model call 的 decision span；R 保存完整 Harness state、五动作 logits/mask、old log-prob 与 behavior version；S 要求它们来自同一 P record、episode 和 lag-zero `JointVersion`，然后分别执行
+
+\[
+A^\pi_{e,i}=R_e-b^\pi_i,
+\qquad
+A^H_{e,d}=R_e-b^H_d.
+\]
+
+这里的两份 baseline map、snapshot ID、source 和 estimator version 都在 batch 冻结前明确保存。Policy advantage 只铺到对应 decision span，credit mask 必须与 AReaL loss mask 完全一致；Harness advantage 则只乘自己的 `harness_loss_mask`。S 明确拒绝 synthetic/placeholder source。它完成的是可持久重验的 credit alignment，仍没有执行 Policy 或 Harness optimizer。
 
 ### 3.1 两路 credit 必须分开保存 source
 
@@ -944,9 +954,9 @@ C0/C1 已经以 `2/4` 和 `mechanism_supported=false` 结束。C2 也已完成�
 
 进入下一轮运行前，应先选择可识别的 estimand，并据此设计确定性 replay 或分布级实验。不能先决定运行 C3，再事后为已有输出寻找问题定义。
 
-### 步骤 2：构造真实 `FrozenJointBatch`
+### 步骤 2：构造真实 `FrozenJointBatch`（Q/R/S 已完成数据对象）
 
-把通过审计的 AReaL 原生 tensor batch 与 Harness sidecar 通过 request/model-call ID 连接，写入批次 digest，并在训练入口执行 lag0 admission。
+`areal_policy_admission.py`、`harness_action_admission.py` 与 `joint_credit_alignment.py` 已把通过审计的 AReaL 原生 tensor sample 和 Harness action 通过 P record/model-call ID 接合，写入完整 Q/R admission、批次 digest、两路 estimator provenance，并执行 lag0 admission。`individual` 与 `concat` 都会从 JSON 持久 record 重新验证；post-batch 绑定、跨 episode/P record、混合版本、缺失 target 与 mask 错位会失败。
 
 必须加入负向测试：
 
@@ -956,6 +966,8 @@ C0/C1 已经以 `2/4` 和 `mechanism_supported=false` 结束。C2 也已完成�
 - policy 与 Harness episode 集不同。
 - credit target 缺失、重复或跨类型。
 - audit 后 artifact 被修改。
+
+当前步骤 2 的边界是“冻结 optimizer-ready 数据”，不是“optimizer 已运行”。`policy_optimizer_update` 与 `harness_optimizer_update` 仍固定为 `false`。
 
 ### 步骤 3：接入真实 policy optimizer，但暂不发布
 

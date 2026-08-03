@@ -29,9 +29,9 @@ flowchart TD
         N["N. Hermes 暴露每次上游 response receipt<br/>已完成：严格五字段、固定审计版本"]
         O["O. DataProxy pre-batch callback/hook<br/>已完成：export 后、merge 前、fail closed"]
         P["P. 在线 EpisodeTrace 与 AReaL trajectory 持久接合<br/>已完成：私有 journal、exactly-once finalization"]
-        Q["Q. 真实 Policy 训练样本构造与准入<br/>未完成"]
-        R["R. 真实 Harness action 样本构造与准入<br/>未完成"]
-        S["S. 双路 credit/advantage 与 mask 对齐<br/>未完成"]
+        Q["Q. 真实 Policy 训练样本构造与准入<br/>已完成：六字段、decision span、lag-zero"]
+        R["R. 真实 Harness action 样本构造与准入<br/>已完成：state、五动作分布、行为版本"]
+        S["S. 双路 credit/advantage 与 mask 对齐<br/>已完成：持久 Q/R join、冻结双 baseline"]
     end
 
     subgraph P3["阶段 3：两个优化器与联合版本发布"]
@@ -115,9 +115,9 @@ flowchart TD
     AF --> AG
     AG --> AH
 
-    class A,B,C,D,F,G,H,K,L,M,N,O,P done
+    class A,B,C,D,F,G,H,K,L,M,N,O,P,Q,R,S done
     class E,I,J partial
-    class Q,R,S,T,U,V,W,X,Y,Z,AB,AC,AD,AE,AF,AG,AH todo
+    class T,U,V,W,X,Y,Z,AB,AC,AD,AE,AF,AG,AH todo
     class AA blocked
 
     classDef done fill:#dcfce7,stroke:#15803d,color:#14532d,stroke-width:2px
