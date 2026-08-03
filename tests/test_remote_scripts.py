@@ -130,6 +130,9 @@ class RemoteScriptContractTests(unittest.TestCase):
         pipeline = (SCRIPTS / "run_m0_live_pipeline.sh").read_text(
             encoding="utf-8"
         )
+        waiter = (SCRIPTS / "wait_and_run_m0_live_pipeline.sh").read_text(
+            encoding="utf-8"
+        )
         entry = (
             PROJECT_ROOT / "jphrl" / "experiments" / "m0_live_joint.py"
         ).read_text(encoding="utf-8")
@@ -175,6 +178,15 @@ class RemoteScriptContractTests(unittest.TestCase):
             pipeline.index("run_areal_joint_bridge.sh"),
             pipeline.index("run_m0_live_joint.sh"),
         )
+        self.assertIn('JPH_M0_POLL_SECONDS:-60', waiter)
+        self.assertIn('JPH_M0_MAX_WAIT_SECONDS:-604800', waiter)
+        self.assertIn("--query-gpu=memory.used,memory.free", waiter)
+        self.assertIn("--query-compute-apps", waiter)
+        self.assertIn("MAX_USED_MEMORY_MIB=10240", waiter)
+        self.assertIn("MIN_FREE_MEMORY_MIB=65536", waiter)
+        self.assertIn("run_m0_live_pipeline.sh", waiter)
+        self.assertNotIn("pkill", waiter)
+        self.assertNotIn("kill ", waiter)
         self.assertNotIn("optimizer.step", launcher + entry)
 
     def test_sglang_logprob_screen_is_unseen_single_variable_and_bounded(self) -> None:
