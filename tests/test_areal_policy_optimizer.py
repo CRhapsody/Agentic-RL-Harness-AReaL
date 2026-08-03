@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import unittest
 from copy import deepcopy
 from dataclasses import replace
@@ -266,6 +267,80 @@ class ArealPolicyOptimizerAdapterTests(unittest.TestCase):
                 active_joint_version=_version(),
                 device="cpu",
             )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch") and importlib.util.find_spec("areal"),
+        "pinned AReaL CPU dependencies are unavailable",
+    )
+    def test_pinned_areal_ppo_actor_consumes_injected_external_advantage(self) -> None:
+        import torch
+        from areal.api.cli_args import OptimizerConfig, PPOActorConfig
+        from areal.trainer.ppo.actor import PPOActor
+
+        class RecordingEngine:
+            def __init__(self) -> None:
+                self.version = 7
+                self.seen_advantages = None
+                self.loss = None
+
+            def get_version(self) -> int:
+                return self.version
+
+            def train(self) -> None:
+                return None
+
+            def train_batch(self, input_, loss_fn, loss_weight_fn):
+                self.seen_advantages = input_["advantages"].detach().clone()
+                self.asserted_loss_weight = int(loss_weight_fn(input_).item())
+                current_logprobs = input_["logprobs"].detach().clone()
+                current_logprobs.requires_grad_(True)
+                entropy = torch.zeros_like(current_logprobs)
+                loss = loss_fn(current_logprobs, entropy, input_)
+                loss.backward()
+                self.loss = float(loss.detach().item())
+                return {
+                    "update_successful": 1.0,
+                    "grad_norm": float(current_logprobs.grad.norm().item()),
+                    "lr": 1e-5,
+                }
+
+        config = PPOActorConfig(
+            experiment_name="external-advantage-contract",
+            trial_name="cpu",
+            backend="fsdp:d1",
+            optimizer=OptimizerConfig(lr=1e-5, lr_scheduler_type="constant"),
+            disable_dropout=True,
+            ppo_n_minibatches=1,
+            kl_ctl=0.0,
+            adv_norm=None,
+            reward_norm=None,
+            use_decoupled_loss=False,
+            recompute_logprob=False,
+            log_agent_stats=False,
+        )
+        engine = RecordingEngine()
+        native_actor = PPOActor(config, engine)
+        facade = SimpleNamespace(
+            config=config,
+            compute_advantages=native_actor.compute_advantages,
+            get_version=engine.get_version,
+        )
+        prepared = materialize_areal_ppo_update_tensors(
+            self._build(),
+            actor=facade,
+            active_joint_version=_version(),
+            device="cpu",
+        )
+
+        native_actor.ppo_update(prepared)
+
+        self.assertEqual(engine.asserted_loss_weight, 2)
+        self.assertEqual(
+            engine.seen_advantages.tolist(),
+            [[0.0, 0.75, 0.75, 0.0]],
+        )
+        self.assertTrue(math.isfinite(engine.loss))
+        self.assertNotEqual(engine.loss, 0.0)
 
 
 if __name__ == "__main__":
