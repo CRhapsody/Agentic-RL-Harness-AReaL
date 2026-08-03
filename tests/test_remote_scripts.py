@@ -19,6 +19,19 @@ SCRIPTS = PROJECT_ROOT / "scripts"
 
 
 class RemoteScriptContractTests(unittest.TestCase):
+    def test_agent_service_adapter_verifier_is_cpu_only_and_uses_premerge_hook(self) -> None:
+        text = (SCRIPTS / "verify_areal_agent_service_adapter.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("SessionData", text)
+        self.assertIn("session_data.export_trajectory", text)
+        self.assertIn("exported_interactions=exported", text)
+        self.assertIn("prepare_agent_service_training_record", text)
+        self.assertIn('"gpu_used": False', text)
+        self.assertNotIn("torch.cuda", text)
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", text)
+        self.assertNotIn("optimizer.step", text)
+
     def test_areal_joint_bridge_is_real_bounded_and_prompt_effective(self) -> None:
         launcher = (SCRIPTS / "run_areal_joint_bridge.sh").read_text(
             encoding="utf-8"

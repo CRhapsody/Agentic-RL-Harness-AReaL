@@ -119,7 +119,7 @@ Artifact 不原地修改；任何变化产生新版本。首轮只允许 skill �
 
 AReaL 2.0 已将训练、推理、Agent 与权重更新拆成服务；Agent workflow 可经 OpenAI-compatible proxy 发起模型调用，并捕获生成 token、log-prob、reward 和 policy version。它支持 SGLang/vLLM 推理以及 FSDP2/Megatron/Archon 训练，适合复用现有 policy 数据面。[官方仓库](https://github.com/areal-project/AReaL)、[Agentic RL 教程](https://github.com/areal-project/AReaL/blob/v2.0.0/docs/en/tutorial/agentic_rl.md)、[Online Proxy 教程](https://github.com/areal-project/AReaL/blob/v2.0.0/docs/en/tutorial/online_proxy.md)
 
-但 v2.0.0 的原生训练 tensor contract 只有 `input_ids`、`loss_mask`、`logprobs`、`versions`、`attention_mask`、`rewards` 六项。`ModelRequest.metadata` 不会自动进入训练 tensor，`rollout.dump_to_file=true` 的 JSONL 也不含 token IDs、log-probs 或 loss mask。因此 Harness action、old Harness log-prob、controller/artifact/tool/parser/context 版本必须写入可关联的 sidecar，或显式扩展 export；不能仅凭 rollout dump 宣称联合轨迹已闭环。本项目现已实现 `model_call_id <-> interaction_id` 身份 sidecar，以及委托 AReaL 原生 `individual/concat` export 的可审计样本归档，但尚未把真实 Agent Service 多轮 session 接入在线 DataProxy 训练队列。
+但 v2.0.0 的原生训练 tensor contract 只有 `input_ids`、`loss_mask`、`logprobs`、`versions`、`attention_mask`、`rewards` 六项。`ModelRequest.metadata` 不会自动进入训练 tensor，`rollout.dump_to_file=true` 的 JSONL 也不含 token IDs、log-probs 或 loss mask。因此 Harness action、old Harness log-prob、controller/artifact/tool/parser/context 版本必须写入可关联的 sidecar，或显式扩展 export；不能仅凭 rollout dump 宣称联合轨迹已闭环。本项目现已实现 `model_call_id <-> interaction_id` 身份 sidecar、委托 AReaL 原生 `individual/concat` export 的可审计样本归档，以及多轮 Agent Service session/model-call/ready-trajectory receipt 与 pre-batch adapter。剩余在线工作是把这个 hook 注入实际 DataProxy 部署并让 Hermes 暴露每次上游模型调用 receipt，而不是再从已合并 batch 反推 ID。
 
 AReaL 2.0 论文进一步提出 Agent Trajectory Data Plane 与 evolution control plane，并把 Harness、memory、skill、tool 与 policy 都放进可演化对象；但论文明确把当前 prototype 的实现范围收在 policy-weight-update 分支。因此本项目是在官方愿景内补一个尚未落地的分支，不是调用现成 API。[AReaL 2.0 论文](https://arxiv.org/abs/2607.01120)
 
@@ -176,6 +176,10 @@ SWE/Terminal 和开放 Web 留到联合数据面稳定后。它们的环境构�
 | 4 臂 × 3 seeds 决定性实验 | 4–9 连续天 | 约 800–1600 | 以 pilot 实测重估后再批准 |
 
 环境和 simulator 延迟可能使 wall-clock 更长而 GPU 利用率更低。运行前必须取得 A100 显存、P2P 拓扑、CPU/RAM、NVMe、Docker/网络边界。
+
+### 6.3 临时共享 GPU 边界
+
+当前每张 A100 只允许本项目新增使用最多 30 GiB，不能按 80 GiB 物理总显存配置进程。任何 GPU 命令启动前都必须重新读取 `memory.used` 与 `memory.free`；若其他进程已占约 50 GiB，则官方 8-GPU B0 和需要独占 GPU 的训练保持关闭。只有模型、KV cache、activation、CUDA Graph 与运行时余量的保守合计低于 30 GiB，且实际空闲显存仍留有安全余量时，才允许单卡 inference-only smoke。该临时边界不改变实验配置的长期目标，也不能通过降低检查阈值绕过。
 
 ## 7. 实施里程碑
 
@@ -240,6 +244,7 @@ jphrl/
 ├── harness/controller.py    # kappa_omega and optimizer
 ├── trajectory/schema.py     # joint event fields and migration
 ├── trajectory/areal_interaction_sidecar.py # model-call identity, tree and sample spans
+├── trajectory/areal_agent_service_adapter.py # session/trajectory receipts and pre-batch hook
 ├── evolution/controller.py  # macro-step, barrier, validation, publish
 ├── checkpoint/manifest.py   # composite state and atomic pointer
 ├── eval/cross_play.py       # M00/M10/M01/M11

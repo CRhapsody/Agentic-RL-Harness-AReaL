@@ -481,20 +481,12 @@ def _sample_id(
     return f"jph-sample-{hashlib.sha256(_canonical_json(payload)).hexdigest()[:32]}"
 
 
-def export_bound_training_sample_archive(
+def _validate_export_arguments(
     *,
-    interaction_cache: Any,
     interaction_sidecar: Mapping[str, object],
     export_style: str,
     turn_discount: float | None,
 ) -> dict[str, object]:
-    """Export AReaL samples while preserving every model-call identity.
-
-    The AReaL cache remains the source of truth for reward discounting, tree
-    construction, and tensorization. This wrapper validates its output and records
-    which Agent model calls occupy each trainable token span.
-    """
-
     sidecar_audit = validate_interaction_adapter_sidecar(interaction_sidecar)
     _require(export_style in EXPORT_STYLES, "unknown AReaL export style")
     _require(
@@ -505,23 +497,57 @@ def export_bound_training_sample_archive(
         ),
         "turn discount must be null or a finite value in [0, 1]",
     )
-    _require(
-        hasattr(interaction_cache, "export_interactions"),
-        "interaction cache has no export_interactions method",
-    )
+    return sidecar_audit
 
-    by_interaction = _bindings_by_interaction(interaction_sidecar)
-    cache_ids = list(interaction_cache.keys())
+
+def _collect_interaction_tree(
+    *,
+    exported_interactions: Mapping[str, Any],
+    interaction_sidecar: Mapping[str, object],
+    export_style: str,
+) -> dict[str, Any]:
+    expected_export_ids = _expected_export_ids(interaction_sidecar, export_style)
     _require(
-        cache_ids == list(sidecar_audit["interaction_ids"]),
-        "interaction cache order or membership differs from sidecar",
+        list(exported_interactions) == expected_export_ids,
+        "AReaL exported interaction set differs from sidecar tree",
     )
-    for interaction_id, binding in by_interaction.items():
-        interaction = interaction_cache[interaction_id]
+    discovered: dict[str, Any] = {}
+    for exported_id, leaf in exported_interactions.items():
         _require(
-            getattr(interaction, "interaction_id", None) == interaction_id,
-            "AReaL cache key differs from interaction identity",
+            getattr(leaf, "interaction_id", None) == exported_id,
+            "AReaL export key differs from interaction identity",
         )
+        current = leaf
+        while current is not None:
+            current_id = getattr(current, "interaction_id", None)
+            _require(
+                _is_non_empty_string(current_id),
+                "AReaL interaction tree contains an object without an ID",
+            )
+            if current_id in discovered:
+                _require(
+                    discovered[current_id] is current,
+                    "AReaL interaction tree reuses an ID for different objects",
+                )
+                break
+            discovered[str(current_id)] = current
+            current = getattr(current, "parent", None)
+
+    expected_all_ids = [
+        str(binding["interaction_id"])
+        for binding in interaction_sidecar["bindings"]
+    ]
+    _require(
+        set(discovered) == set(expected_all_ids),
+        "pre-merge interaction tree differs from sidecar membership",
+    )
+    interactions = {
+        interaction_id: discovered[interaction_id]
+        for interaction_id in expected_all_ids
+    }
+    by_interaction = _bindings_by_interaction(interaction_sidecar)
+    for interaction_id, binding in by_interaction.items():
+        interaction = interactions[interaction_id]
         _require(
             _actual_parent_interaction_id(interaction)
             == binding["parent_interaction_id"],
@@ -532,23 +558,30 @@ def export_bound_training_sample_archive(
                 getattr(interaction, "chat_template_type", None) == "concat",
                 "concat export requires chat_template_type=concat",
             )
+    return interactions
 
-    exported = interaction_cache.export_interactions(
-        style=export_style,
-        reward_discount=turn_discount,
+
+def _build_archive_from_exported_interactions(
+    *,
+    exported_interactions: Mapping[str, Any],
+    interaction_sidecar: Mapping[str, object],
+    export_style: str,
+    turn_discount: float | None,
+) -> dict[str, object]:
+    sidecar_audit = _validate_export_arguments(
+        interaction_sidecar=interaction_sidecar,
+        export_style=export_style,
+        turn_discount=turn_discount,
     )
-    _require(
-        isinstance(exported, Mapping),
-        "AReaL interaction export must return a mapping",
+    interactions = _collect_interaction_tree(
+        exported_interactions=exported_interactions,
+        interaction_sidecar=interaction_sidecar,
+        export_style=export_style,
     )
-    expected_ids = _expected_export_ids(interaction_sidecar, export_style)
-    _require(
-        list(exported) == expected_ids,
-        "AReaL exported interaction set differs from sidecar tree",
-    )
+    by_interaction = _bindings_by_interaction(interaction_sidecar)
 
     samples: list[dict[str, object]] = []
-    for leaf_interaction_id, interaction in exported.items():
+    for leaf_interaction_id, interaction in exported_interactions.items():
         chain = (
             [by_interaction[leaf_interaction_id]]
             if export_style == "individual"
@@ -569,7 +602,7 @@ def export_bound_training_sample_archive(
         sequence_length = _validate_tensor_dict(tensors)
         spans = _decision_spans(
             chain=chain,
-            interactions=interaction_cache,
+            interactions=interactions,
             tensors=tensors,
         )
         samples.append(
@@ -610,6 +643,100 @@ def export_bound_training_sample_archive(
     record["record_sha256"] = _record_sha256(record, "record_sha256")
     validate_bound_training_sample_archive(record)
     return record
+
+
+def archive_premerged_exported_interactions(
+    *,
+    exported_interactions: Mapping[str, Any],
+    interaction_sidecar: Mapping[str, object],
+    export_style: str,
+    turn_discount: float | None,
+) -> dict[str, object]:
+    """Archive AReaL's styled interactions before padded batch concatenation.
+
+    The supported hook point is immediately after
+    ``SessionData.export_trajectory()`` and before ``concat_padded_tensors()``.
+    In concat mode, ancestor objects are recovered from each leaf's ``parent``
+    chain and checked against the full sidecar.
+    """
+
+    _require(
+        isinstance(exported_interactions, Mapping),
+        "pre-merge AReaL interactions must be a mapping",
+    )
+    return _build_archive_from_exported_interactions(
+        exported_interactions=exported_interactions,
+        interaction_sidecar=interaction_sidecar,
+        export_style=export_style,
+        turn_discount=turn_discount,
+    )
+
+
+def export_bound_training_sample_archive(
+    *,
+    interaction_cache: Any,
+    interaction_sidecar: Mapping[str, object],
+    export_style: str,
+    turn_discount: float | None,
+) -> dict[str, object]:
+    """Export AReaL samples while preserving every model-call identity.
+
+    The AReaL cache remains the source of truth for reward discounting, tree
+    construction, and tensorization. This wrapper validates its output and records
+    which Agent model calls occupy each trainable token span.
+    """
+
+    sidecar_audit = _validate_export_arguments(
+        interaction_sidecar=interaction_sidecar,
+        export_style=export_style,
+        turn_discount=turn_discount,
+    )
+    _require(
+        hasattr(interaction_cache, "export_interactions"),
+        "interaction cache has no export_interactions method",
+    )
+
+    by_interaction = _bindings_by_interaction(interaction_sidecar)
+    cache_ids = list(interaction_cache.keys())
+    _require(
+        cache_ids == list(sidecar_audit["interaction_ids"]),
+        "interaction cache order or membership differs from sidecar",
+    )
+    for interaction_id, binding in by_interaction.items():
+        interaction = interaction_cache[interaction_id]
+        _require(
+            getattr(interaction, "interaction_id", None) == interaction_id,
+            "AReaL cache key differs from interaction identity",
+        )
+        _require(
+            _actual_parent_interaction_id(interaction)
+            == binding["parent_interaction_id"],
+            "AReaL parent relation differs from sidecar",
+        )
+        if export_style == "concat":
+            _require(
+                getattr(interaction, "chat_template_type", None) == "concat",
+                "concat export requires chat_template_type=concat",
+            )
+
+    exported = interaction_cache.export_interactions(
+        style=export_style,
+        reward_discount=turn_discount,
+    )
+    _require(
+        isinstance(exported, Mapping),
+        "AReaL interaction export must return a mapping",
+    )
+    _require(
+        sidecar_audit["interaction_ids"] == cache_ids,
+        "interaction cache identity changed during export",
+    )
+    return _build_archive_from_exported_interactions(
+        exported_interactions=exported,
+        interaction_sidecar=interaction_sidecar,
+        export_style=export_style,
+        turn_discount=turn_discount,
+    )
 
 
 def validate_bound_training_sample_archive(

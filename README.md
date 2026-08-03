@@ -52,7 +52,19 @@ AReaL 固定为 `v2.0.0@fee938eada49208a5aabdbc1095730a13076a349`，要求 Pytho
 1. `build_interaction_adapter_sidecar()` 将本项目的 `model_call_id` 与 AReaL 的 `interaction_id` 一一绑定，并保存 episode、session、trajectory、parent、顺序与 `JointVersion`。
 2. `export_bound_training_sample_archive()` 调用 AReaL 原生 `InteractionCache.export_interactions()`，支持 `individual` 与 `concat`，同时核验每次模型动作在六字段训练张量中的 token 区间。
 
-归档器只证明“训练样本怎样形成以及属于哪次模型调用”，不会伪造 optimizer update 证据。当前 RLVR bridge 已使用单 interaction sidecar；真实 Hermes/Agent Service 的多轮在线 DataProxy 接线仍是后续工作。
+归档器只证明“训练样本怎样形成以及属于哪次模型调用”，不会伪造 optimizer update 证据。当前 RLVR bridge 已使用单 interaction sidecar；多轮 Agent Service adapter 契约已实现，但真实 Hermes receipt 暴露和 DataProxy 部署 hook 仍是后续工作。
+
+`jphrl/trajectory/areal_agent_service_adapter.py` 进一步实现了多轮 Agent Service 接线契约：从 `rl/start_session` 提取不含凭据的 session receipt，从 OpenAI completion/response ID 捕获 interaction receipt，从 `rl/set_reward` 提取 ready trajectory receipt，并在 `EpisodeTrace`、session、trajectory、parent 树与 token 张量全部一致后生成训练记录。正确 hook 位于 AReaL `SessionData.export_trajectory()` 之后、`concat_padded_tensors()` 之前；公开 `/export_trajectories` 响应已经丢失逐 interaction 身份，不能事后用 batch 行号猜测绑定。
+
+固定 AReaL v2.0.0 的 CPU 集成验证入口是：
+
+```bash
+source scripts/remote_env.sh
+/mnt/sdb/ljw/chizm/venvs/areal-v2.0.0/bin/python \
+  scripts/verify_areal_agent_service_adapter.py
+```
+
+该验证同时覆盖真实 `SessionData` 的 `individual` 两样本与 `concat` 单叶样本，不初始化 CUDA，也不执行 optimizer。
 
 ## 成功条件
 

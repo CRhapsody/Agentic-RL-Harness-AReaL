@@ -57,7 +57,7 @@ fee938eada49208a5aabdbc1095730a13076a349
 有两个边界必须先说清：
 
 1. 本项目当前的 `MockStructuredModel` 是脚本策略。它明确返回 `token_metadata_status="not_applicable"`，并把 token ID、log-prob、loss mask 留空。因此，它能验证事件和 reward 数据面，不能直接形成 PPO 样本。
-2. 本项目已经有 `JointVersion`、可训练的 policy failure、不可训练的 invalid failure、token contract，以及显式的 `model_call_id <-> interaction_id` sidecar 和 `individual/concat` 样本归档器。invalid failure 又细分为基础设施异常与 trace contract 异常。目前仍没有把真实 Agent Service session 持续写入 DataProxy 训练队列的在线 adapter。下文既解释已实现的身份与归档契约，也明确标出尚未接通的在线分布式链。
+2. 本项目已经有 `JointVersion`、可训练的 policy failure、不可训练的 invalid failure、token contract、显式的 `model_call_id <-> interaction_id` sidecar、`individual/concat` 样本归档器，以及 Agent Service session/model-call/ready-trajectory receipt 与 pre-batch adapter。invalid failure 又细分为基础设施异常与 trace contract 异常。尚未完成的是把 hook 注入真实 Hermes/DataProxy 部署并让 Hermes 暴露每次上游模型调用 receipt；下文既解释已实现契约，也明确标出尚未接通的进程间传输。
 
 ## 1. 先分清五个对象
 
@@ -349,6 +349,8 @@ concat leaf loss_mask = [ 0, 0, 1, 1, 0, 1]
 ```
 
 本项目的 `export_bound_training_sample_archive()` 不复制这套算法，而是调用 AReaL 的原生 export，再做三件事：核验 AReaL parent 树与 sidecar 一致；记录每个 `model_call_id/interaction_id` 在样本中的 `[start,end)` 决策 token 区间；将六字段张量、导出方式和内容 hash 写成可审计归档。任何额外的 `loss_mask=1` 位置、错位 log-prob 或版本都会拒绝归档。
+
+在线 Agent Service 的正确调用窗口还要更精确。AReaL `SessionData.export_trajectory()` 返回带 interaction 对象的 styled mapping；紧接着 `/export_trajectories` 会用 `concat_padded_tensors()` 把它们合并为 batch。合并后只剩张量行，不再有可靠的 interaction ID。因此本项目的 `prepare_agent_service_training_record()` 支持在这两个调用之间接收 mapping，沿 concat 叶节点的 `parent` 指针恢复完整树并完成 sidecar 校验。不能等 HTTP export 返回后再把第 0 行猜成 call 1。
 
 `concat` 可以作为另一种训练样本保存方式，但它不是单纯把两个 JSON 文件压成一个。它改变了样本边界：一个叶样本同时训练根到叶的多次模型动作，而 `individual` 为每次调用产生独立样本。存在分支、interaction 级中间 reward、长度截断或按样本归一化时，两者的优化统计量可能不同，所以实验必须把 `export_style` 当成配置变量记录，不能混在同一结果中。
 
