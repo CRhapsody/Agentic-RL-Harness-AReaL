@@ -1,0 +1,127 @@
+# Agentic RL + Harness 项目完成 DAG
+
+这张图给出“真实同时更新 Policy 与 Harness”所需组件的依赖顺序。绿色表示已完成，黄色表示只完成了 toy、合成验证或部分基础设施，灰色表示未完成，红色表示当前还受共享 GPU 资源门限制。
+
+```mermaid
+flowchart TD
+    START(["目标：真实同时更新 Policy 与 Harness"])
+
+    subgraph P0["阶段 0：研究契约与可复现基础"]
+        A["A. 操作性定义、验收指标、非目标<br/>已完成"]
+        B["B. Git 同步、代码/数据分离、路径安全<br/>已完成"]
+        C["C. AReaL v2.0.0 固定提交、远端环境<br/>已完成"]
+        D["D. 30 GiB/GPU 门禁与资源画像<br/>已完成"]
+        E["E. 官方 AReaL policy 基线、恢复与吞吐画像<br/>部分完成：8 GPU 正式基线受资源门限制"]
+    end
+
+    subgraph P1["阶段 1：环境、轨迹与版本数据面"]
+        F["F. Calculator 环境、解析器、工具 Safety boundary<br/>已完成"]
+        G["G. EpisodeTrace、失败分类、reward 归因<br/>已完成"]
+        H["H. Token、old logprob、loss mask、policy version 契约<br/>已完成"]
+        I["I. Harness 五动作 schema 与可学习控制器<br/>部分完成：toy/tabular 已验证"]
+        J["J. JointVersion、二维 lag、复合 checkpoint、原子发布<br/>部分完成：合成完整性验证已通过"]
+        K["K. model_call_id 与 interaction_id sidecar<br/>已完成"]
+        L["L. individual/concat 树与 token span 归档<br/>已完成"]
+        M["M. Agent Service session/model-call/trajectory adapter<br/>已完成并通过真实 SessionData 验证"]
+    end
+
+    subgraph P2["阶段 2：真实 Hermes 与 AReaL 在线接线"]
+        N["N. Hermes 暴露每次上游 response receipt<br/>未完成"]
+        O["O. DataProxy pre-batch callback/hook<br/>未完成"]
+        P["P. 在线 EpisodeTrace 与 AReaL trajectory 持久接合<br/>未完成"]
+        Q["Q. 真实 Policy 训练样本构造与准入<br/>未完成"]
+        R["R. 真实 Harness action 样本构造与准入<br/>未完成"]
+        S["S. 双路 credit/advantage 与 mask 对齐<br/>未完成"]
+    end
+
+    subgraph P3["阶段 3：两个优化器与联合版本发布"]
+        T["T. AReaL Policy optimizer 接线<br/>未完成"]
+        U["U. 生产 Harness optimizer 接线<br/>未完成"]
+        V["V. 同一训练步的双 optimizer 协调器与 barrier<br/>未完成"]
+        W["W. 生产复合 checkpoint 与精确恢复<br/>未完成"]
+        X["X. Policy/Harness candidate 联合验收<br/>未完成"]
+        Y["Y. JointVersion 原子发布、推理同步、整对回滚<br/>未完成"]
+        Z["Z. 在线二维 staleness admission 与重采<br/>未完成"]
+    end
+
+    subgraph P4["阶段 4：端到端实验与研究证据"]
+        AA["AA. M0 单步真实联合更新调试<br/>未完成：单进程预算先控制在 24–26 GiB"]
+        AB["AB. M0 同步训练 pilot 与故障注入<br/>未完成"]
+        AC["AC. 四个因果对照：M00/M10/M01/M11<br/>未完成"]
+        AD["AD. 慢速 artifact 候选、shadow、canary、回滚<br/>未完成"]
+        AE["AE. 2×2 cross-play、3 seeds、置信区间<br/>未完成"]
+        AF["AF. 有界异步与二维 lag 消融<br/>未完成"]
+        AG["AG. tau2 held-out 主实验<br/>未完成"]
+        AH["AH. 可复现实验包、课程与论文证据<br/>未完成"]
+    end
+
+    START --> A
+    A --> B
+    A --> F
+    B --> C
+    C --> D
+    D --> E
+
+    F --> G
+    G --> H
+    F --> I
+    G --> J
+    I --> J
+    H --> K
+    J --> K
+    K --> L
+    L --> M
+
+    M --> N
+    M --> O
+    N --> P
+    O --> P
+    P --> Q
+    P --> R
+    H --> Q
+    I --> R
+    J --> Q
+    J --> R
+    Q --> S
+    R --> S
+
+    E --> T
+    Q --> T
+    R --> U
+    S --> T
+    S --> U
+    T --> V
+    U --> V
+    J --> W
+    V --> W
+    V --> X
+    W --> X
+    X --> Y
+    P --> Z
+    J --> Z
+    Y --> Z
+
+    D --> AA
+    Y --> AA
+    Z --> AA
+    AA --> AB
+    AB --> AC
+    AB --> AD
+    AC --> AE
+    AD --> AE
+    AB --> AF
+    Z --> AF
+    AE --> AG
+    AF --> AG
+    AG --> AH
+
+    class A,B,C,D,F,G,H,K,L,M done
+    class E,I,J partial
+    class N,O,P,Q,R,S,T,U,V,W,X,Y,Z,AB,AC,AD,AE,AF,AG,AH todo
+    class AA blocked
+
+    classDef done fill:#dcfce7,stroke:#15803d,color:#14532d,stroke-width:2px
+    classDef partial fill:#fef3c7,stroke:#d97706,color:#78350f,stroke-width:2px
+    classDef todo fill:#e2e8f0,stroke:#475569,color:#0f172a,stroke-width:1.5px
+    classDef blocked fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+```
