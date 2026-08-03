@@ -19,6 +19,9 @@ from .areal_interaction_sidecar import (
 from .schema import JointVersion
 
 POLICY_ADMISSION_SCHEMA_VERSION = "jph.areal-policy-training-admission.v1"
+RLVR_WORKFLOW_POLICY_ADMISSION_SCHEMA_VERSION = (
+    "jph.rlvr-workflow-policy-training-admission.v1"
+)
 
 _SOURCE_RECORD_FIELDS = frozenset(
     {
@@ -36,6 +39,17 @@ _SOURCE_IDENTITY_FIELDS = frozenset(
         "episode_id",
         "task_id",
         "group_id",
+        "session_id",
+        "trajectory_id",
+        "joint_version_id",
+    }
+)
+_RLVR_SOURCE_IDENTITY_FIELDS = frozenset(
+    {
+        "route_kind",
+        "episode_id",
+        "task_id",
+        "request_id",
         "session_id",
         "trajectory_id",
         "joint_version_id",
@@ -89,6 +103,14 @@ _SOURCE_FIELDS = frozenset(
         "agent_service_training_record_sha256",
         "training_archive_sha256",
         "interaction_sidecar_sha256",
+    }
+)
+_RLVR_SOURCE_FIELDS = frozenset(
+    {
+        "rlvr_pre_batch_record_sha256",
+        "training_archive_sha256",
+        "interaction_sidecar_sha256",
+        "bridge_record_sha256",
     }
 )
 _SUMMARY_FIELDS = frozenset(
@@ -250,6 +272,7 @@ class ValidatedPolicyTrainingAdmission:
     source_training_record_sha256: str
     source_archive_sha256: str
     record_sha256: str
+    route_kind: str
 
     @property
     def digest(self) -> str:
@@ -506,8 +529,13 @@ def validate_policy_training_admission(
     """Validate a stable Q admission record without claiming an optimizer step."""
 
     _require_exact_fields(record, _ADMISSION_FIELDS, "Policy admission")
+    schema_version = record.get("schema_version")
     _require(
-        record.get("schema_version") == POLICY_ADMISSION_SCHEMA_VERSION,
+        schema_version
+        in {
+            POLICY_ADMISSION_SCHEMA_VERSION,
+            RLVR_WORKFLOW_POLICY_ADMISSION_SCHEMA_VERSION,
+        },
         "unknown Policy admission schema",
     )
     _require(
@@ -522,25 +550,53 @@ def validate_policy_training_admission(
             "Policy admission JointVersion differs from lag-zero active version",
         )
 
-    identity = _require_exact_fields(
-        record.get("identity"), _SOURCE_IDENTITY_FIELDS, "Policy admission identity"
-    )
-    _require(
-        all(
-            _is_non_empty_string(identity.get(field))
-            for field in (
-                "episode_id",
-                "task_id",
-                "group_id",
-                "session_id",
-            )
-        ),
-        "Policy admission route identity is incomplete",
-    )
-    _require(
-        _is_int(identity.get("trajectory_id")) and int(identity["trajectory_id"]) >= 0,
-        "Policy admission trajectory ID is invalid",
-    )
+    if schema_version == POLICY_ADMISSION_SCHEMA_VERSION:
+        identity = _require_exact_fields(
+            record.get("identity"),
+            _SOURCE_IDENTITY_FIELDS,
+            "Policy admission identity",
+        )
+        _require(
+            all(
+                _is_non_empty_string(identity.get(field))
+                for field in (
+                    "episode_id",
+                    "task_id",
+                    "group_id",
+                    "session_id",
+                )
+            ),
+            "Policy admission route identity is incomplete",
+        )
+        _require(
+            _is_int(identity.get("trajectory_id"))
+            and int(identity["trajectory_id"]) >= 0,
+            "Policy admission trajectory ID is invalid",
+        )
+        route_kind = "agent-service-session"
+    else:
+        identity = _require_exact_fields(
+            record.get("identity"),
+            _RLVR_SOURCE_IDENTITY_FIELDS,
+            "RLVR Policy admission identity",
+        )
+        _require(
+            identity.get("route_kind") == "rlvr-workflow",
+            "RLVR Policy admission route kind is invalid",
+        )
+        _require(
+            all(
+                _is_non_empty_string(identity.get(field))
+                for field in ("episode_id", "task_id", "request_id")
+            ),
+            "RLVR Policy admission route identity is incomplete",
+        )
+        _require(
+            identity.get("session_id") is None
+            and identity.get("trajectory_id") is None,
+            "RLVR Policy admission cannot fabricate session or trajectory IDs",
+        )
+        route_kind = "rlvr-workflow"
     _require(
         identity.get("joint_version_id") == joint_version.version_id,
         "Policy admission identity differs from its JointVersion",
@@ -555,8 +611,13 @@ def validate_policy_training_admission(
     )
     model_call_ids = tuple(str(item) for item in raw_model_calls)
 
+    source_fields = (
+        _SOURCE_FIELDS
+        if schema_version == POLICY_ADMISSION_SCHEMA_VERSION
+        else _RLVR_SOURCE_FIELDS
+    )
     source = _require_exact_fields(
-        record.get("source"), _SOURCE_FIELDS, "Policy admission source"
+        record.get("source"), source_fields, "Policy admission source"
     )
     _require(
         all(_is_sha256(value) for value in source.values()),
@@ -585,10 +646,15 @@ def validate_policy_training_admission(
         export_style=str(export_style),
         samples=samples,
         source_training_record_sha256=str(
-            source["agent_service_training_record_sha256"]
+            source[
+                "agent_service_training_record_sha256"
+                if route_kind == "agent-service-session"
+                else "rlvr_pre_batch_record_sha256"
+            ]
         ),
         source_archive_sha256=str(source["training_archive_sha256"]),
         record_sha256=str(record["record_sha256"]),
+        route_kind=route_kind,
     )
 
 

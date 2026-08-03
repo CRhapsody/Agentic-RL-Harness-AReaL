@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import hashlib
-from importlib.metadata import version as distribution_version
 import json
 import math
 import os
 import platform
 import sys
+from collections.abc import Mapping
+from importlib.metadata import version as distribution_version
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
+import torch
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GRPOConfig, SGLangConfig, load_expr_config, vLLMConfig
 from areal.dataset import get_custom_dataset
@@ -20,13 +22,16 @@ from areal.utils import logging, seeding
 from areal.utils.dataloader import create_dataloader
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.printing import tabulate_stats
-import torch
 
 from jphrl.areal_sglang_compat import JPHRemoteSGLangEngine
 from jphrl.trajectory.areal_joint_bridge import (
     inference_runtime_contract_sha256,
 )
-
+from jphrl.trajectory.rlvr_workflow_admission import (
+    load_rlvr_workflow_runner_admission_file,
+    rlvr_runner_admission_path_for_request,
+)
+from jphrl.trajectory.schema import JointVersion
 
 logger = logging.getLogger("JPHAReaLJointBridgeEval")
 
@@ -131,9 +136,7 @@ def _build_inference_runtime_contract(
         raise TypeError("effective SGLang server args must be an object")
     disable_cuda_graph = normalized_server_args.get("disable_cuda_graph")
     if type(disable_cuda_graph) is not bool:
-        raise ValueError(
-            "effective SGLang server args must declare disable_cuda_graph"
-        )
+        raise ValueError("effective SGLang server args must declare disable_cuda_graph")
     contract: dict[str, object] = {
         "schema_version": "jph.sglang-inference-runtime.v2",
         "identity": {
@@ -144,9 +147,7 @@ def _build_inference_runtime_contract(
             "areal_commit": os.environ["JPH_AREAL_COMMIT"],
             "areal_version": distribution_version("areal"),
             "behavior_revision": os.environ["JPH_BEHAVIOR_REVISION"],
-            "clean_environment_policy": os.environ[
-                "JPH_CLEAN_ENVIRONMENT_POLICY"
-            ],
+            "clean_environment_policy": os.environ["JPH_CLEAN_ENVIRONMENT_POLICY"],
             "cuda_runtime_version": str(torch.version.cuda),
             "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
             "dataset_revision": os.environ["JPH_DATASET_REVISION"],
@@ -167,6 +168,9 @@ def _build_inference_runtime_contract(
             "sglang_environment": {
                 "SGLANG_CACHE_DIR": os.environ["SGLANG_CACHE_DIR"],
             },
+            "sglang_mem_fraction_static": float(
+                os.environ["JPH_SGLANG_MEM_FRACTION_STATIC"]
+            ),
             "sglang_version": os.environ["JPH_SGLANG_VERSION"],
             "torch_version": distribution_version("torch"),
             "transformers_version": distribution_version("transformers"),
@@ -271,9 +275,7 @@ def _write_same_backend_scores(
                 "behavior_revision": os.environ["JPH_BEHAVIOR_REVISION"],
                 "areal_commit": os.environ["JPH_AREAL_COMMIT"],
                 "project_commit": os.environ["JPH_PROJECT_COMMIT"],
-                "generation_logprob_mode": os.environ[
-                    "JPH_SGLANG_LOGPROB_MODE"
-                ],
+                "generation_logprob_mode": os.environ["JPH_SGLANG_LOGPROB_MODE"],
                 "dataset_selection": os.environ["JPH_DATASET_SELECTION"],
                 "sglang_version": os.environ["JPH_SGLANG_VERSION"],
                 "inference_runtime_contract_sha256": os.environ[
@@ -287,9 +289,7 @@ def _write_same_backend_scores(
             "versions": _plain(trajectory["versions"]),
         }
         record["record_sha256"] = hashlib.sha256(_canonical(record)).hexdigest()
-        identity = hashlib.sha256(
-            request_id.encode("utf-8")
-        ).hexdigest()[:20]
+        identity = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:20]
         path = score_dir / f"same-backend-score-{identity}.json"
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
@@ -310,7 +310,9 @@ def _write_same_backend_scores(
             if fd >= 0:
                 os.close(fd)
     if consumed_bridge_paths != set(bridge_paths):
-        raise RuntimeError("not every bridge record was consumed by same-backend scoring")
+        raise RuntimeError(
+            "not every bridge record was consumed by same-backend scoring"
+        )
 
 
 def _task_limit() -> int:
@@ -338,10 +340,25 @@ def _task_offset() -> int:
         ) from exc
     if value < 0 or value > 1024:
         raise ValueError(
-            "JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET must be between 0 and 1024: "
-            f"{value}"
+            f"JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET must be between 0 and 1024: {value}"
         )
     return value
+
+
+def _harness_workflow_config() -> tuple[str, int]:
+    kind = os.environ.get("JPH_HARNESS_CONTROLLER_KIND", "tabular")
+    if kind not in {"tabular", "torch"}:
+        raise ValueError(f"unknown JPH_HARNESS_CONTROLLER_KIND: {kind}")
+    raw_hidden_size = os.environ.get("JPH_HARNESS_HIDDEN_SIZE", "32")
+    try:
+        hidden_size = int(raw_hidden_size)
+    except ValueError as exc:
+        raise ValueError(
+            f"JPH_HARNESS_HIDDEN_SIZE must be an integer: {raw_hidden_size}"
+        ) from exc
+    if hidden_size < 1 or hidden_size > 1024:
+        raise ValueError("JPH_HARNESS_HIDDEN_SIZE must be between 1 and 1024")
+    return kind, hidden_size
 
 
 def main(args: list[str]) -> None:
@@ -415,9 +432,7 @@ def main(args: list[str]) -> None:
         sort_keys=True,
         separators=(",", ":"),
     )
-    os.environ[
-        "JPH_INFERENCE_RUNTIME_CONTRACT_SHA256"
-    ] = runtime_contract_sha256
+    os.environ["JPH_INFERENCE_RUNTIME_CONTRACT_SHA256"] = runtime_contract_sha256
     _write_launch_manifest(bridge_dir, inference_runtime_contract)
 
     controller = engine_cls.as_controller(config.rollout, scheduler)
@@ -425,12 +440,15 @@ def main(args: list[str]) -> None:
     results = []
     try:
         controller.initialize(role="jph-joint-bridge-rollout", server_args=server_args)
+        harness_kind, harness_hidden_size = _harness_workflow_config()
         workflow_kwargs = {
             "reward_fn": "areal.reward.gsm8k.gsm8k_reward_fn",
             "gconfig": config.gconfig,
             "tokenizer": config.tokenizer_path,
             "enable_thinking": False,
             "harness_seed": config.seed,
+            "harness_kind": harness_kind,
+            "harness_hidden_size": harness_hidden_size,
         }
         limit = _task_limit()
         offset = _task_offset()
@@ -443,8 +461,7 @@ def main(args: list[str]) -> None:
                 controller.submit(
                     item,
                     workflow=(
-                        "jphrl.areal_joint_bridge_workflow."
-                        "ArealJointBridgeWorkflow"
+                        "jphrl.areal_joint_bridge_workflow.ArealJointBridgeWorkflow"
                     ),
                     workflow_kwargs=workflow_kwargs,
                     group_size=1,
@@ -456,7 +473,9 @@ def main(args: list[str]) -> None:
             if submitted >= limit:
                 break
         if submitted != limit:
-            raise RuntimeError(f"requested {limit} tasks but dataset yielded {submitted}")
+            raise RuntimeError(
+                f"requested {limit} tasks but dataset yielded {submitted}"
+            )
         results = controller.wait(submitted, timeout=900.0)
         if len(results) != submitted or any(result is None for result in results):
             raise RuntimeError(
@@ -496,9 +515,52 @@ def main(args: list[str]) -> None:
         raise RuntimeError(
             f"expected {submitted} bridge files, found {len(bridge_files)} in {bridge_dir}"
         )
+    admission_mode = os.environ.get("JPH_RLVR_RUNNER_ADMISSION_MODE") or None
+    runner_admission_count = 0
+    if admission_mode is not None:
+        if admission_mode != "m0-torch-joint-v1":
+            raise RuntimeError(f"unknown RLVR runner admission mode: {admission_mode}")
+        runner_dir = Path(os.environ["JPH_RLVR_RUNNER_ADMISSION_DIR"])
+        rlvr_runner_admission_path_for_request(
+            output_dir=runner_dir,
+            request_id="post-rollout-directory-audit",
+            allowed_root=configured_root,
+        )
+        runner_files = sorted(runner_dir.glob("rlvr-runner-admission-*.json"))
+        unexpected = [path for path in runner_dir.iterdir() if path not in runner_files]
+        if unexpected:
+            raise RuntimeError(
+                f"unexpected files in RLVR runner admission directory: {unexpected}"
+            )
+        if len(runner_files) != len(results) or len(runner_files) != len(bridge_files):
+            raise RuntimeError(
+                "RLVR runner admission count differs from successful results or "
+                f"bridges: runners={len(runner_files)} results={len(results)} "
+                f"bridges={len(bridge_files)}"
+            )
+        bridge_hashes = {
+            json.loads(path.read_text(encoding="utf-8"))["record_sha256"]
+            for path in bridge_files
+        }
+        runner_bridge_hashes: set[str] = set()
+        for path in runner_files:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            joint_version = JointVersion(**raw["bridge_record"]["joint_version"])
+            loaded = load_rlvr_workflow_runner_admission_file(
+                path,
+                allowed_root=configured_root,
+                active_joint_version=joint_version,
+            )
+            runner_bridge_hashes.add(loaded.bridge_record_sha256)
+        if runner_bridge_hashes != bridge_hashes:
+            raise RuntimeError(
+                "RLVR runner admissions and successful bridge records are not one-to-one"
+            )
+        runner_admission_count = len(runner_files)
     print(
         f"AReaL joint bridge complete: submitted={submitted} "
-        f"accepted={len(results)} bridge_records={len(bridge_files)}"
+        f"accepted={len(results)} bridge_records={len(bridge_files)} "
+        f"rlvr_runner_admissions={runner_admission_count}"
     )
 
 

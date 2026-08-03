@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-
 REMOTE_ROOT = Path("/mnt/sdb/ljw/chizm")
 
 
@@ -22,6 +21,28 @@ def require_within_configured_root(path: str | Path) -> Path:
     return destination
 
 
+def repository_root() -> Path:
+    """Resolve the real source checkout instead of trusting a caller path."""
+
+    source = Path(__file__).resolve()
+    for candidate in source.parents:
+        if (candidate / ".git").exists():
+            return candidate
+    raise RuntimeError(f"cannot locate the Git checkout containing {source}")
+
+
+def require_outside_repository(path: str | Path) -> Path:
+    """Require a runtime artifact path to be outside this actual checkout."""
+
+    destination = require_within_configured_root(path)
+    project = repository_root()
+    if destination == project or project in destination.parents:
+        raise ValueError(
+            f"runtime artifact {destination} must be outside Git checkout {project}"
+        )
+    return destination
+
+
 def assert_remote_environment() -> None:
     root = configured_root()
     if root is None:
@@ -31,7 +52,9 @@ def assert_remote_environment() -> None:
     forbidden_home = Path("/home/ljw").resolve()
     home = Path.home().resolve()
     if home == forbidden_home or forbidden_home in home.parents:
-        raise RuntimeError("HOME still points to /home/ljw; source scripts/remote_env.sh")
+        raise RuntimeError(
+            "HOME still points to /home/ljw; source scripts/remote_env.sh"
+        )
     for variable in (
         "HOME",
         "XDG_CACHE_HOME",

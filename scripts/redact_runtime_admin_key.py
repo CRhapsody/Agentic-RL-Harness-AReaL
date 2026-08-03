@@ -5,9 +5,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import time
-
+from pathlib import Path
 
 SECRET_ENV = "JPH_AREAL_ADMIN_API_KEY"
 REPLACEMENT = b"<redacted-runtime-admin-key>"
@@ -55,10 +54,32 @@ def _redact(targets: list[Path], secret: bytes) -> int:
     return changed
 
 
+def _verify_absent(targets: list[Path], secret: bytes) -> None:
+    matches: list[str] = []
+    for target in targets:
+        for candidate in _candidates(target):
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            data = candidate.read_bytes()
+            if (
+                candidate.suffix.lower() not in TEXT_SUFFIXES
+                and b"\x00" in data[:8192]
+            ):
+                continue
+            if secret in data or DEFAULT_AREAL_ADMIN_KEY in data:
+                matches.append(str(candidate))
+    if matches:
+        raise RuntimeError(
+            "runtime admin key remains in persisted text artifacts: "
+            + ", ".join(matches)
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("targets", nargs="+", type=Path)
     parser.add_argument("--watch-seconds", type=float, default=0.0)
+    parser.add_argument("--verify-absent", action="store_true")
     args = parser.parse_args()
 
     if args.watch_seconds < 0:
@@ -76,6 +97,8 @@ def main() -> int:
     deadline = time.monotonic() + args.watch_seconds
     while True:
         _redact(targets, secret)
+        if args.verify_absent:
+            _verify_absent(targets, secret)
         if args.watch_seconds == 0:
             return 0
         if time.monotonic() >= deadline:

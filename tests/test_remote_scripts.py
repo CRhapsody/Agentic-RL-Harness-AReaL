@@ -19,7 +19,9 @@ SCRIPTS = PROJECT_ROOT / "scripts"
 
 
 class RemoteScriptContractTests(unittest.TestCase):
-    def test_agent_service_adapter_verifier_is_cpu_only_and_uses_premerge_hook(self) -> None:
+    def test_agent_service_adapter_verifier_is_cpu_only_and_uses_premerge_hook(
+        self,
+    ) -> None:
         text = (SCRIPTS / "verify_areal_agent_service_adapter.py").read_text(
             encoding="utf-8"
         )
@@ -40,9 +42,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertNotIn("optimizer.step", text)
 
     def test_areal_joint_bridge_is_real_bounded_and_prompt_effective(self) -> None:
-        launcher = (SCRIPTS / "run_areal_joint_bridge.sh").read_text(
-            encoding="utf-8"
-        )
+        launcher = (SCRIPTS / "run_areal_joint_bridge.sh").read_text(encoding="utf-8")
         runner = (SCRIPTS / "run_areal_joint_bridge_eval.py").read_text(
             encoding="utf-8"
         )
@@ -50,11 +50,44 @@ class RemoteScriptContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('TASK_COUNT="${JPH_AREAL_JOINT_BRIDGE_TASKS:-4}"', launcher)
-        self.assertIn('TASK_OFFSET="${JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET:-0}"', launcher)
+        self.assertIn(
+            'TASK_OFFSET="${JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET:-0}"', launcher
+        )
         self.assertIn("formal-v1 requires count=4 offset=0", launcher)
+        self.assertIn("m0-torch-joint-v1 requires count=4 offset=0", launcher)
+        self.assertIn(
+            'JPH_HARNESS_CONTROLLER_KIND="${HARNESS_CONTROLLER_KIND}"',
+            launcher,
+        )
+        self.assertIn("_harness_workflow_config", runner)
+        self.assertIn('"harness_kind": harness_kind', runner)
         self.assertIn("gconfig.max_new_tokens=64", launcher)
         self.assertIn("rollout.max_concurrent_rollouts=1", launcher)
-        self.assertIn("sglang.mem_fraction_static=0.35", launcher)
+        self.assertIn('SGLANG_MEM_FRACTION_STATIC="0.35"', launcher)
+        self.assertIn('SGLANG_MEM_FRACTION_STATIC="0.29"', launcher)
+        self.assertIn(
+            'sglang.mem_fraction_static="${SGLANG_MEM_FRACTION_STATIC}"',
+            launcher,
+        )
+        self.assertIn("JPH_SGLANG_MEM_FRACTION_STATIC", launcher + runner)
+        self.assertGreaterEqual(
+            launcher.count("--query-gpu=memory.used,memory.free"), 2
+        )
+        self.assertGreaterEqual(launcher.count("--query-compute-apps"), 2)
+        self.assertIn("GPU_MEMORY_USED_AT_LAUNCH", launcher)
+        self.assertIn("MAX_NEW_GPU_MEMORY_MIB=26624", launcher)
+        self.assertIn("REQUIRE_EMPTY_COMPUTE_PROCESSES=true", launcher)
+        self.assertIn("gained a compute process before launch", launcher)
+        self.assertIn("audit_gpu_memory_envelope.py", launcher)
+        self.assertIn('>> "${MEMORY_SAMPLES}"', launcher)
+        self.assertIn("setsid", launcher)
+        self.assertIn("GPU memory watchdog", launcher)
+        self.assertIn("stop_run_session", launcher)
+        self.assertIn("redact_and_check_secret", launcher)
+        self.assertIn("assert_no_run_gpu_processes", launcher)
+        self.assertIn("--verify-absent", launcher)
+        self.assertNotIn("rg -", launcher)
+        self.assertIn("audit_gpu_memory", launcher)
         self.assertIn('--expected-count "${TASK_COUNT}"', launcher)
         self.assertIn("--expected-dataset-selection", launcher)
         self.assertIn("--expected-generation-logprob-mode", launcher)
@@ -92,16 +125,64 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("--same-backend-score-dir", launcher + verifier)
         self.assertNotIn("optimizer.step", launcher + runner + verifier)
 
-    def test_sglang_logprob_screen_is_unseen_single_variable_and_bounded(self) -> None:
-        wrapper = (SCRIPTS / "run_sglang_logprob_screen.sh").read_text(
+    def test_m0_live_launcher_is_sequential_bounded_and_fail_closed(self) -> None:
+        launcher = (SCRIPTS / "run_m0_live_joint.sh").read_text(encoding="utf-8")
+        pipeline = (SCRIPTS / "run_m0_live_pipeline.sh").read_text(
             encoding="utf-8"
         )
-        pair_runner = (
-            SCRIPTS / "run_sglang_logprob_screen_pair.sh"
+        entry = (
+            PROJECT_ROOT / "jphrl" / "experiments" / "m0_live_joint.py"
         ).read_text(encoding="utf-8")
-        launcher = (SCRIPTS / "run_areal_joint_bridge.sh").read_text(
+        self.assertIn("umask 077", launcher)
+        self.assertIn('MAX_NEW_GPU_MEMORY_MIB=26624', launcher)
+        self.assertIn('MAX_USED_MEMORY_MIB=10240', launcher)
+        self.assertIn('MIN_FREE_MEMORY_MIB=65536', launcher)
+        self.assertGreaterEqual(
+            launcher.count("--query-gpu=memory.used,memory.free"),
+            1,
+        )
+        self.assertIn("--query-compute-apps", launcher)
+        self.assertIn('require_idle_gpu "preflight"', launcher)
+        self.assertIn('require_idle_gpu "immediately-before-python"', launcher)
+        self.assertIn("gpu-memory.csv", launcher)
+        self.assertIn("audit_gpu_memory_envelope.py", launcher)
+        self.assertIn("setsid", launcher)
+        self.assertIn("26 GiB GPU memory watchdog", launcher)
+        self.assertIn("stop_run_process_group", launcher)
+        self.assertIn("redact_and_check_secret", launcher)
+        self.assertIn("assert_no_run_processes", launcher)
+        self.assertIn("--verify-absent", launcher)
+        self.assertNotIn("rg -", launcher)
+        self.assertIn("verify_m0_live_joint.py", launcher)
+        self.assertIn("redact_runtime_admin_key.py", launcher)
+        self.assertIn("JPH_AREAL_ADMIN_API_KEY", launcher + entry)
+        self.assertIn("RLVRM0JointUpdateRunner", entry)
+        self.assertIn("RealRlvrM0CandidateEvaluator", entry)
+        self.assertIn("LiveM0GPULaunchGuard", entry)
+        self.assertIn("production-sglang", entry)
+        self.assertIn("training-actor", entry)
+        self.assertIn("LocalScheduler", entry)
+        self.assertIn("InferenceEngineConfig", entry)
+        self.assertIn('backend="sglang:d1"', entry)
+        self.assertIn('rollout_sglang_mem_fraction_static=0.29', entry)
+        self.assertIn('max_new_gpu_memory_gib=26.0', entry)
+        self.assertIn("write_m0_rlvr_estimator_template.py", pipeline)
+        self.assertIn("m0-torch-joint-v1", pipeline)
+        self.assertIn("JPH_RLVR_FROZEN_ESTIMATOR_TEMPLATE_PATH", pipeline)
+        self.assertIn("run_areal_joint_bridge.sh", pipeline)
+        self.assertIn("run_m0_live_joint.sh", pipeline)
+        self.assertLess(
+            pipeline.index("run_areal_joint_bridge.sh"),
+            pipeline.index("run_m0_live_joint.sh"),
+        )
+        self.assertNotIn("optimizer.step", launcher + entry)
+
+    def test_sglang_logprob_screen_is_unseen_single_variable_and_bounded(self) -> None:
+        wrapper = (SCRIPTS / "run_sglang_logprob_screen.sh").read_text(encoding="utf-8")
+        pair_runner = (SCRIPTS / "run_sglang_logprob_screen_pair.sh").read_text(
             encoding="utf-8"
         )
+        launcher = (SCRIPTS / "run_areal_joint_bridge.sh").read_text(encoding="utf-8")
         runner = (SCRIPTS / "run_areal_joint_bridge_eval.py").read_text(
             encoding="utf-8"
         )
@@ -129,7 +210,9 @@ class RemoteScriptContractTests(unittest.TestCase):
         compare_position = pair_runner.index("compare_sglang_logprob_screen.py")
         self.assertLess(c0_position, c1_position)
         self.assertLess(c1_position, compare_position)
-        self.assertIn('RUN_ID="${RUN_STAMP}-${SGLANG_LOGPROB_MODE}-${RUN_NONCE}"', launcher)
+        self.assertIn(
+            'RUN_ID="${RUN_STAMP}-${SGLANG_LOGPROB_MODE}-${RUN_NONCE}"', launcher
+        )
         self.assertIn("joint-bridge-${RUN_ID}", launcher)
         self.assertIn("JPH_SGLANG_DISABLE_CUDA_GRAPH=false", wrapper)
         self.assertNotIn("JPH_SGLANG_DISABLE_CUDA_GRAPH=true", wrapper)
@@ -139,18 +222,16 @@ class RemoteScriptContractTests(unittest.TestCase):
         wrapper = (SCRIPTS / "run_sglang_cuda_graph_screen.sh").read_text(
             encoding="utf-8"
         )
-        pair_runner = (
-            SCRIPTS / "run_sglang_cuda_graph_screen_pair.sh"
-        ).read_text(encoding="utf-8")
-        launcher = (SCRIPTS / "run_areal_joint_bridge.sh").read_text(
+        pair_runner = (SCRIPTS / "run_sglang_cuda_graph_screen_pair.sh").read_text(
             encoding="utf-8"
         )
-        comparator = (
-            SCRIPTS / "compare_sglang_cuda_graph_screen.py"
-        ).read_text(encoding="utf-8")
-        config_preflight = (
-            SCRIPTS / "validate_sglang_cuda_graph_config.py"
-        ).read_text(encoding="utf-8")
+        launcher = (SCRIPTS / "run_areal_joint_bridge.sh").read_text(encoding="utf-8")
+        comparator = (SCRIPTS / "compare_sglang_cuda_graph_screen.py").read_text(
+            encoding="utf-8"
+        )
+        config_preflight = (SCRIPTS / "validate_sglang_cuda_graph_config.py").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET=64", wrapper)
         self.assertIn("JPH_SGLANG_LOGPROB_MODE=standard-log-of-softmax-v1", wrapper)
         self.assertIn("JPH_EXPERIMENTAL_AXIS=cuda-graph-v1", wrapper)
@@ -158,7 +239,9 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("DISABLE_CUDA_GRAPH=true", wrapper)
         self.assertIn("exec /usr/bin/env -i", wrapper)
         self.assertIn("cuda-graph-mechanism-screen-v1", wrapper + launcher)
-        self.assertIn('+sglang.disable_cuda_graph="${SGLANG_DISABLE_CUDA_GRAPH}"', launcher)
+        self.assertIn(
+            '+sglang.disable_cuda_graph="${SGLANG_DISABLE_CUDA_GRAPH}"', launcher
+        )
         self.assertIn('f"+sglang.disable_cuda_graph={value}"', config_preflight)
         c2a_position = pair_runner.index('"${GPU_ID}" c2a')
         c2b_position = pair_runner.index('"${GPU_ID}" c2b')
@@ -173,9 +256,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("torch.cuda.is_initialized()", config_preflight)
         self.assertIn("os.O_EXCL", config_preflight)
         self.assertIn("config-preflight.json", pair_runner)
-        preflight_position = pair_runner.index(
-            "validate_sglang_cuda_graph_config.py"
-        )
+        preflight_position = pair_runner.index("validate_sglang_cuda_graph_config.py")
         self.assertLess(preflight_position, c2a_position)
         self.assertNotIn(
             "optimizer.step",
@@ -207,7 +288,9 @@ class RemoteScriptContractTests(unittest.TestCase):
             'export PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"',
             text,
         )
-        self.assertIn('export JPH_DATALOADER_WORKERS="${JPH_DATALOADER_WORKERS:-2}"', text)
+        self.assertIn(
+            'export JPH_DATALOADER_WORKERS="${JPH_DATALOADER_WORKERS:-2}"', text
+        )
         self.assertIn('export UV_PYTHON_INSTALL_DIR="${JPH_ROOT}/runtime/python"', text)
         self.assertIn('export UV_PYTHON_BIN_DIR="${JPH_ROOT}/bin"', text)
         self.assertIn('export UV_PYTHON_PREFERENCE="only-managed"', text)
@@ -215,12 +298,14 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertNotIn("UV_MANAGED_PYTHON", text)
         self.assertNotIn("UV_DEFAULT_INDEX", text)
 
-    def test_areal_bootstrap_is_pinned_and_installs_flash_after_exact_sync(self) -> None:
+    def test_areal_bootstrap_is_pinned_and_installs_flash_after_exact_sync(
+        self,
+    ) -> None:
         text = (SCRIPTS / "bootstrap_areal_v2.sh").read_text(encoding="utf-8")
         self.assertIn("fee938eada49208a5aabdbc1095730a13076a349", text)
         self.assertIn('UV_VERSION="0.11.26"', text)
         self.assertIn('UV_BIN="${JPH_ROOT}/bin/uv"', text)
-        self.assertIn("UV_UNMANAGED_INSTALL=\"${JPH_ROOT}/bin\"", text)
+        self.assertIn('UV_UNMANAGED_INSTALL="${JPH_ROOT}/bin"', text)
         self.assertNotIn("python3 -m venv", text)
         sync_position = text.index('"${UV_BIN}" sync')
         flash_install_position = text.rindex('"${UV_BIN}" pip install')
@@ -257,16 +342,14 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("umask 077", text)
         self.assertIn("redact_runtime_admin_key.py", text)
         self.assertNotIn("set -x", text)
-        self.assertIn('JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6', text)
+        self.assertIn("JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6", text)
         self.assertIn('export CUDACXX="${CUDA_HOME}/bin/nvcc"', text)
         self.assertIn('export PATH="${AREAL_VENV}/bin:${CUDA_HOME}/bin:${PATH}"', text)
         self.assertIn("-std=c++20", text)
 
     def test_areal_trace_is_real_bounded_and_recomputed(self) -> None:
         launcher = (SCRIPTS / "run_areal_trace_b0.sh").read_text(encoding="utf-8")
-        eval_runner = (SCRIPTS / "run_areal_trace_eval.py").read_text(
-            encoding="utf-8"
-        )
+        eval_runner = (SCRIPTS / "run_areal_trace_eval.py").read_text(encoding="utf-8")
         workflow = (PROJECT_ROOT / "jphrl" / "areal_trace_workflow.py").read_text(
             encoding="utf-8"
         )
@@ -275,7 +358,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("interaction.to_tensor_dict()", workflow)
         self.assertIn("return {request.rid: interaction}", workflow)
         self.assertIn("JPH_AREAL_TRACE_TASKS=1", launcher)
-        self.assertIn('JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6', launcher)
+        self.assertIn("JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6", launcher)
         self.assertIn('export CUDACXX="${CUDA_HOME}/bin/nvcc"', launcher)
         self.assertIn(
             'export PATH="${AREAL_VENV}/bin:${CUDA_HOME}/bin:${PATH}"',
@@ -316,23 +399,21 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn('require_within_configured_root(entry["filename"])', text)
 
     def test_model_snapshot_validation_is_local_and_cuda_backed(self) -> None:
-        text = (SCRIPTS / "validate_hf_model_snapshot.py").read_text(
-            encoding="utf-8"
-        )
+        text = (SCRIPTS / "validate_hf_model_snapshot.py").read_text(encoding="utf-8")
         self.assertIn("local_files_only=True", text)
         self.assertIn('require_within_configured_root(metadata["snapshot_path"])', text)
-        self.assertIn('model.generate(', text)
-        self.assertIn('torch.cuda.synchronize()', text)
+        self.assertIn("model.generate(", text)
+        self.assertIn("torch.cuda.synchronize()", text)
         self.assertIn('"peak_memory_bytes"', text)
 
     def test_b0_waiter_is_bounded_and_never_kills_gpu_processes(self) -> None:
         text = (SCRIPTS / "wait_and_run_areal_b0.sh").read_text(encoding="utf-8")
-        self.assertIn('JPH_B0_MAX_WAIT_SECONDS:-86400', text)
-        self.assertIn('JPH_B0_POLL_SECONDS:-60', text)
-        self.assertIn('JPH_B0_MIN_FREE_MEMORY_MIB:-71680', text)
-        self.assertIn('JPH_B0_MAX_USED_MEMORY_MIB:-10240', text)
-        self.assertIn('GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB', text)
-        self.assertIn('GPU_MEMORY_USED > MAX_USED_MEMORY_MIB', text)
+        self.assertIn("JPH_B0_MAX_WAIT_SECONDS:-86400", text)
+        self.assertIn("JPH_B0_POLL_SECONDS:-60", text)
+        self.assertIn("JPH_B0_MIN_FREE_MEMORY_MIB:-71680", text)
+        self.assertIn("JPH_B0_MAX_USED_MEMORY_MIB:-10240", text)
+        self.assertIn("GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB", text)
+        self.assertIn("GPU_MEMORY_USED > MAX_USED_MEMORY_MIB", text)
         self.assertIn('exec /bin/bash "${SCRIPT_DIR}/run_areal_official_b0.sh"', text)
         self.assertNotIn("pkill", text)
         self.assertNotIn("kill -", text)
@@ -360,7 +441,12 @@ class RemoteScriptContractTests(unittest.TestCase):
                 "JPH_AREAL_ADMIN_API_KEY": secret,
             }
             subprocess.run(
-                [sys.executable, str(redactor), str(root / "run")],
+                [
+                    sys.executable,
+                    str(redactor),
+                    "--verify-absent",
+                    str(root / "run"),
+                ],
                 check=True,
                 env=env,
                 capture_output=True,
@@ -396,17 +482,18 @@ class RemoteScriptContractTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 )
-    def test_b0_launcher_rechecks_memory_headroom(self) -> None:
-        text = (SCRIPTS / "run_areal_official_b0.sh").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn('JPH_B0_MIN_FREE_MEMORY_MIB:-71680', text)
-        self.assertIn('JPH_B0_MAX_USED_MEMORY_MIB:-10240', text)
-        self.assertIn('--query-gpu=memory.used,memory.free', text)
-        self.assertIn('GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB', text)
-        self.assertIn('GPU_MEMORY_USED > MAX_USED_MEMORY_MIB', text)
 
-    def test_real_trace_audit_rejects_scripted_and_accepts_valid_hf_metadata(self) -> None:
+    def test_b0_launcher_rechecks_memory_headroom(self) -> None:
+        text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
+        self.assertIn("JPH_B0_MIN_FREE_MEMORY_MIB:-71680", text)
+        self.assertIn("JPH_B0_MAX_USED_MEMORY_MIB:-10240", text)
+        self.assertIn("--query-gpu=memory.used,memory.free", text)
+        self.assertIn("GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB", text)
+        self.assertIn("GPU_MEMORY_USED > MAX_USED_MEMORY_MIB", text)
+
+    def test_real_trace_audit_rejects_scripted_and_accepts_valid_hf_metadata(
+        self,
+    ) -> None:
         result = run_calculator_smoke(
             model=MockStructuredModel(),
             task=TASKS["add-17-25"],
@@ -422,7 +509,9 @@ class RemoteScriptContractTests(unittest.TestCase):
             payload = json.loads(path.read_text(encoding="utf-8"))
             commit = "a" * 40
             payload["joint_version"]["policy"] = f"hf:test-policy@{commit}:config"
-            payload["joint_version"]["tokenizer"] = f"hf:test-tokenizer@{commit}:tokenizer"
+            payload["joint_version"]["tokenizer"] = (
+                f"hf:test-tokenizer@{commit}:tokenizer"
+            )
             version_id = JointVersion(**payload["joint_version"]).version_id
             for event in payload["events"]:
                 event["joint_version_id"] = version_id

@@ -1,33 +1,31 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 import hashlib
 import json
 import math
 import os
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from jphrl.harness.controller import HarnessDecision, HarnessState
 from jphrl.harness.learning import TabularHarnessController
 from jphrl.harness.spec import HarnessAction
 
+from .areal_interaction_sidecar import (
+    validate_interaction_adapter_sidecar,
+)
 from .areal_trace_contract import (
     ArealTraceContractError,
     build_areal_trace_record,
     validate_areal_trace_record,
 )
-from .areal_interaction_sidecar import (
-    validate_interaction_adapter_sidecar,
-)
 from .schema import EpisodeTrace, JointVersion
-
 
 SCHEMA_VERSION = "jph.areal-joint-interaction-bridge.v3"
 INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = "jph.sglang-inference-runtime.v2"
-LEGACY_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = (
-    "jph.sglang-inference-runtime.v1"
-)
+LEGACY_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = "jph.sglang-inference-runtime.v1"
 CONTEXT_BUILDER_VERSION = "gsm8k-harness-prompt-v1"
 HARNESS_ARTIFACT_VERSION = "gsm8k-bounded-prompt-actions-v1"
 GENERATION_LOGPROB_MODES = frozenset(
@@ -167,8 +165,7 @@ def inference_runtime_contract_sha256(
         _require(
             isinstance(server_args, Mapping)
             and type(server_args.get("disable_cuda_graph")) is bool
-            and server_args["disable_cuda_graph"]
-            is treatment["disable_cuda_graph"],
+            and server_args["disable_cuda_graph"] is treatment["disable_cuda_graph"],
             "CUDA Graph treatment differs from effective server args",
         )
         _require(
@@ -305,9 +302,7 @@ def build_joint_version(
         harness_artifact=f"{HARNESS_ARTIFACT_VERSION}@{artifact['sha256']}",
         tool_schema="no-tools-single-turn-v1",
         parser=f"areal-gsm8k-reward@{areal_commit}",
-        environment=(
-            f"gsm8k-test@{dataset_revision}:selection={dataset_selection}"
-        ),
+        environment=(f"gsm8k-test@{dataset_revision}:selection={dataset_selection}"),
         evaluator=f"areal-gsm8k-reward@{areal_commit}",
         tokenizer=f"hf-tokenizer@{behavior_revision}",
         context_builder=CONTEXT_BUILDER_VERSION,
@@ -329,8 +324,7 @@ def _validate_harness_decision(
     joint_version: JointVersion,
 ) -> None:
     _require(
-        isinstance(decision.get("decision_id"), str)
-        and bool(decision["decision_id"]),
+        isinstance(decision.get("decision_id"), str) and bool(decision["decision_id"]),
         "Harness decision ID must be a non-empty string",
     )
     _require(
@@ -347,11 +341,15 @@ def _validate_harness_decision(
             controller_version=decision["controller_version"],
             action_ids=tuple(decision["action_ids"]),
             action_mask=tuple(decision["action_mask"]),
-            pre_mask_logits=tuple(float(value) for value in decision["pre_mask_logits"]),
+            pre_mask_logits=tuple(
+                float(value) for value in decision["pre_mask_logits"]
+            ),
             harness_loss_mask=decision["harness_loss_mask"],
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise ArealJointBridgeError("invalid Harness state or decision payload") from exc
+        raise ArealJointBridgeError(
+            "invalid Harness state or decision payload"
+        ) from exc
     trace = EpisodeTrace(
         episode_id="bridge-decision-validation",
         task_id="bridge",
@@ -511,7 +509,9 @@ def validate_areal_joint_bridge_record(
     expected_policy_version: int | None = None,
 ) -> dict[str, object]:
     _require(record.get("schema_version") == SCHEMA_VERSION, "unknown schema version")
-    _require(record.get("record_sha256") == _record_sha256(record), "record hash mismatch")
+    _require(
+        record.get("record_sha256") == _record_sha256(record), "record hash mismatch"
+    )
 
     scope = record.get("evidence_scope")
     _require(isinstance(scope, Mapping), "evidence_scope must be an object")
@@ -523,7 +523,9 @@ def validate_areal_joint_bridge_record(
         "harness_optimizer_update": False,
         "joint_learning_claim": False,
     }
-    _require(dict(scope) == expected_scope, "evidence scope differs from bridge contract")
+    _require(
+        dict(scope) == expected_scope, "evidence scope differs from bridge contract"
+    )
     origin = record.get("origin")
     _require(isinstance(origin, Mapping), "origin must be an object")
     project_commit = origin.get("project_commit")
@@ -587,11 +589,29 @@ def validate_areal_joint_bridge_record(
     _validate_harness_decision(decision, state, joint_version)
     action = HarnessAction(str(decision["action"]))
     try:
-        restored_controller = TabularHarnessController.from_checkpoint(
-            controller_checkpoint
-        )
+        if (
+            controller_checkpoint.get("schema_version")
+            == TabularHarnessController.schema_version
+        ):
+            restored_controller = TabularHarnessController.from_checkpoint(
+                controller_checkpoint
+            )
+        else:
+            from jphrl.harness.torch_learning import (
+                ROLLOUT_CHECKPOINT_SCHEMA_VERSION,
+                load_torch_harness_rollout_checkpoint,
+            )
+
+            _require(
+                controller_checkpoint.get("schema_version")
+                == ROLLOUT_CHECKPOINT_SCHEMA_VERSION,
+                "unknown Harness rollout checkpoint schema",
+            )
+            restored_controller = load_torch_harness_rollout_checkpoint(
+                controller_checkpoint
+            )
         replayed_decision = restored_controller.choose(HarnessState(**state))
-    except (KeyError, TypeError, ValueError) as exc:
+    except (ImportError, KeyError, TypeError, ValueError) as exc:
         raise ArealJointBridgeError(
             "Harness controller checkpoint cannot replay the decision"
         ) from exc
@@ -632,7 +652,9 @@ def validate_areal_joint_bridge_record(
         "prompt messages must be lists",
     )
     expected_effective, instruction = inject_harness_instruction(base_messages, action)
-    _require(effective_messages == expected_effective, "Harness prompt transform mismatch")
+    _require(
+        effective_messages == expected_effective, "Harness prompt transform mismatch"
+    )
     _require(
         prompt.get("base_messages_sha256") == _sha256(base_messages)
         and prompt.get("effective_messages_sha256") == _sha256(effective_messages),
@@ -648,12 +670,19 @@ def validate_areal_joint_bridge_record(
         "base and effective input tokens must be non-empty lists",
     )
     _require(
-        all(type(token) is int and token >= 0 for token in base_tokens + effective_tokens),
+        all(
+            type(token) is int and token >= 0
+            for token in base_tokens + effective_tokens
+        ),
         "prompt token IDs must be non-negative integers",
     )
-    _require(base_tokens != effective_tokens, "Harness action did not change prompt tokens")
+    _require(
+        base_tokens != effective_tokens, "Harness action did not change prompt tokens"
+    )
     _require(prompt.get("prompt_tokens_changed") is True, "prompt change flag is false")
-    _require(instruction == harness["applied_instruction"], "instruction binding mismatch")
+    _require(
+        instruction == harness["applied_instruction"], "instruction binding mismatch"
+    )
     _require(
         type(state.get("turn")) is int
         and state["turn"] == 0
@@ -685,8 +714,7 @@ def validate_areal_joint_bridge_record(
         "AReaL trace identity differs from bridge identity",
     )
     _require(
-        areal_trace["interaction"]["interaction_id"]
-        == binding["interaction_id"],
+        areal_trace["interaction"]["interaction_id"] == binding["interaction_id"],
         "AReaL trace interaction differs from adapter sidecar",
     )
     _require(
@@ -783,10 +811,7 @@ def validate_areal_joint_bridge_record(
         is (generation_logprob_mode == "original-log-softmax-v1"),
         "inference runtime treatment differs from generation mode",
     )
-    if (
-        runtime_contract["schema_version"]
-        == INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION
-    ):
+    if runtime_contract["schema_version"] == INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION:
         _require(
             runtime_treatment["disable_cuda_graph"]
             is runtime_server_args.get("disable_cuda_graph"),
@@ -888,11 +913,14 @@ def write_areal_joint_bridge_record(
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     request_id = str(audit["request_id"])
     _require(
-        request_id and all(character.isalnum() or character in "._-" for character in request_id),
+        request_id
+        and all(character.isalnum() or character in "._-" for character in request_id),
         "unsafe request ID",
     )
     path = directory / f"bridge-task{audit['task_id']}-{request_id}.json"
-    _require(Path(os.path.commonpath((path.resolve(), root))) == root, "output escapes root")
+    _require(
+        Path(os.path.commonpath((path.resolve(), root))) == root, "output escapes root"
+    )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     fd = os.open(path, flags, 0o600)
     try:

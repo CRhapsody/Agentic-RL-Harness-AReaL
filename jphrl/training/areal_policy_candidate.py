@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from jphrl.paths import require_within_configured_root
+from jphrl.paths import require_outside_repository, require_within_configured_root
 from jphrl.trajectory.schema import JointVersion
 
 from .areal_policy_optimizer import (
@@ -105,17 +105,9 @@ def _exact_mapping(
     return value
 
 
-def _path_within(path: Path, root: Path) -> bool:
-    return path == root or root in path.parents
-
-
 def _prepare_run_root(candidate_root: str | Path, project_root: str | Path) -> Path:
-    root = require_within_configured_root(candidate_root)
-    project = Path(project_root).expanduser().resolve()
-    _require(
-        not _path_within(root, project),
-        "Policy checkpoints and evidence must be outside the Git project",
-    )
+    del project_root  # the actual checkout boundary is not caller-controlled
+    root = require_outside_repository(candidate_root)
     root.mkdir(parents=True, exist_ok=True)
     _require(root.is_dir() and not root.is_symlink(), "candidate root is invalid")
     return root

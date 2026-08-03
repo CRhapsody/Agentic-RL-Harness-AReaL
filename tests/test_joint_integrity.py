@@ -1,8 +1,8 @@
-from dataclasses import replace
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from dataclasses import replace
+from pathlib import Path
 
 from jphrl.experiments.g1_integrity import (
     build_contract_episode,
@@ -157,7 +157,9 @@ class JointIntegrityTests(unittest.TestCase):
                 harness=harness,
                 expected_active_release_id=None,
             )
-            with self.assertRaisesRegex(ConcurrentPublishError, "active release changed"):
+            with self.assertRaisesRegex(
+                ConcurrentPublishError, "active release changed"
+            ):
                 store.publish(
                     joint_version=checkpoint.joint_version,
                     policy=policy,
@@ -165,6 +167,48 @@ class JointIntegrityTests(unittest.TestCase):
                     expected_active_release_id="stale-release",
                 )
             self.assertEqual(store.read_active(), release)
+
+    def test_release_records_reject_credentials_nonfinite_loose_and_symlink_json(
+        self,
+    ) -> None:
+        checkpoint = initial_checkpoint()
+        with self.assertRaisesRegex(ValueError, "credential field"):
+            CandidateArtifact(
+                "policy",
+                checkpoint.policy.version,
+                {"nested": {"refresh_token": "must-not-persist"}},
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "JSON"):
+            CandidateArtifact(
+                "policy",
+                checkpoint.policy.version,
+                {"loss": float("nan")},
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "version"):
+            CandidateArtifact("policy", 7, {"ok": True}).validate()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = JointReleaseStore(Path(directory) / "release")
+            release = store.publish(
+                joint_version=checkpoint.joint_version,
+                policy=CandidateArtifact(
+                    "policy", checkpoint.policy.version, checkpoint.policy.to_dict()
+                ),
+                harness=CandidateArtifact(
+                    "harness", checkpoint.harness.version, checkpoint.harness.to_dict()
+                ),
+                expected_active_release_id=None,
+            )
+            active = json.loads(store.active_path.read_text(encoding="utf-8"))
+            active["unexpected"] = True
+            store.active_path.write_text(json.dumps(active), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "field set"):
+                store.read_active()
+
+            store.active_path.unlink()
+            store.active_path.symlink_to(store.manifests / f"{release.release_id}.json")
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                store.read_active()
 
     def test_full_g1_integrity_experiment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -178,9 +222,7 @@ class JointIntegrityTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertTrue(audit["passed"])
         self.assertEqual(result["mixed_version"]["mixed_version_episodes"], 0)
-        self.assertEqual(
-            result["mixed_version"]["synthetic_fixtures_ended"], 1000
-        )
+        self.assertEqual(result["mixed_version"]["synthetic_fixtures_ended"], 1000)
         self.assertEqual(result["mixed_version"]["straddled_publish"], 100)
         self.assertEqual(result["mixed_version"]["stale_accepted_at_lag_0"], 0)
         self.assertEqual(len(result["atomic_publish"]["cases"]), 6)
@@ -188,9 +230,7 @@ class JointIntegrityTests(unittest.TestCase):
         self.assertTrue(
             result["checkpoint_replay"]["tabular_harness"]["exact_next_decision"]
         )
-        self.assertTrue(
-            result["credit_separation"]["update_interventions"]["passed"]
-        )
+        self.assertTrue(result["credit_separation"]["update_interventions"]["passed"])
 
 
 if __name__ == "__main__":

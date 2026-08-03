@@ -22,7 +22,9 @@ if torch is not None:
         TorchHarnessLearningError,
         TorchHarnessOptimizer,
         TorchHarnessPolicy,
+        build_torch_harness_rollout_checkpoint,
         load_torch_harness_checkpoint,
+        load_torch_harness_rollout_checkpoint,
         validate_torch_harness_update_evidence,
     )
 
@@ -285,6 +287,80 @@ def _real_s_record(policy, *, baseline: float = 0.2, loss_mask: int = 1):
     "torch is required for production Harness tests",
 )
 class TorchHarnessLearningTests(unittest.TestCase):
+    def test_json_rollout_checkpoint_replays_next_decision_and_rejects_tamper(
+        self,
+    ) -> None:
+        policy = TorchHarnessPolicy(seed=23, hidden_size=16)
+        state = HarnessState(
+            turn=1,
+            remaining_tool_calls=1,
+            remaining_model_retries=0,
+            context_chars=128,
+            last_error=None,
+            retrieval_hit=False,
+            verifier_status="not-run",
+            task_domain="calculator",
+        )
+        checkpoint = build_torch_harness_rollout_checkpoint(policy)
+        self.assertEqual(
+            checkpoint["record_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    {
+                        key: value
+                        for key, value in checkpoint.items()
+                        if key != "record_sha256"
+                    },
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        expected = policy.choose(state)
+        restored = load_torch_harness_rollout_checkpoint(
+            json.loads(json.dumps(checkpoint))
+        )
+        actual = restored.choose(state)
+
+        self.assertEqual(actual.action, expected.action)
+        self.assertEqual(actual.old_harness_logprob, expected.old_harness_logprob)
+        self.assertEqual(actual.pre_mask_logits, expected.pre_mask_logits)
+        self.assertEqual(actual.controller_version, expected.controller_version)
+
+        tampered = deepcopy(checkpoint)
+        first_name = next(
+            name
+            for name in sorted(tampered["model_state"])
+            if isinstance(tampered["model_state"][name]["values"][0], list)
+        )
+        tensor_values = tampered["model_state"][first_name]["values"]
+        tensor_values[0] = [0.0] * len(tensor_values[0])
+        with self.assertRaisesRegex(
+            TorchHarnessLearningError,
+            "schema differs",
+        ):
+            load_torch_harness_rollout_checkpoint(tampered)
+
+        unsigned = {
+            key: value for key, value in tampered.items() if key != "record_sha256"
+        }
+        tampered["record_sha256"] = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        with self.assertRaisesRegex(
+            TorchHarnessLearningError,
+            "identity differs",
+        ):
+            load_torch_harness_rollout_checkpoint(tampered)
+
     def test_choose_emits_complete_stable_five_action_decision(self) -> None:
         policy = TorchHarnessPolicy(seed=17, hidden_size=16)
         state = HarnessState(

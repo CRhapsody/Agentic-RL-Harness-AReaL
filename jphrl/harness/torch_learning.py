@@ -26,6 +26,7 @@ from .spec import HarnessAction
 ACTION_IDS = tuple(action.value for action in HarnessAction)
 POLICY_SCHEMA_VERSION = "torch-harness-categorical-v1"
 CHECKPOINT_SCHEMA_VERSION = "jph.torch-harness-checkpoint.v1"
+ROLLOUT_CHECKPOINT_SCHEMA_VERSION = "jph.torch-harness-rollout-checkpoint.v1"
 HARNESS_CANDIDATE_SCHEMA_VERSION = "jph.torch-harness-candidate.v1"
 _STATE_FEATURE_SCHEMA_VERSION = "jph.harness-state-features.v1"
 _STATE_FEATURE_DIM = 32
@@ -337,6 +338,187 @@ class TorchHarnessPolicy(nn.Module):
         candidate._generator.set_state(self._generator.get_state().clone())
         candidate.train(self.training)
         return candidate
+
+
+def _json_tensor_record(value: Tensor) -> dict[str, object]:
+    tensor = value.detach().cpu().contiguous()
+    _require(
+        not tensor.is_floating_point() or bool(torch.isfinite(tensor).all()),
+        "Harness rollout checkpoint tensor is non-finite",
+    )
+    return {
+        "dtype": str(tensor.dtype),
+        "shape": list(tensor.shape),
+        "values": tensor.tolist(),
+    }
+
+
+def build_torch_harness_rollout_checkpoint(
+    policy: TorchHarnessPolicy,
+) -> dict[str, object]:
+    """Serialize the behavior policy needed to replay its next sampled action.
+
+    This JSON-only checkpoint is intentionally model/RNG-only. Optimizer state
+    remains in the production ``.pt`` checkpoint used by U/W.
+    """
+
+    _require(
+        type(policy) is TorchHarnessPolicy,
+        "rollout checkpoint requires TorchHarnessPolicy",
+    )
+    record: dict[str, object] = {
+        "schema_version": ROLLOUT_CHECKPOINT_SCHEMA_VERSION,
+        "policy_schema_version": policy.schema_version,
+        "state_feature_schema_version": policy.state_feature_schema_version,
+        "action_ids": list(ACTION_IDS),
+        "policy_config": {
+            "seed": policy.seed,
+            "hidden_size": policy.hidden_size,
+        },
+        "policy_metadata": {
+            "update_step": policy.update_step,
+            "sample_count": policy.sample_count,
+            "version": policy.version,
+            "parameter_digest": policy.parameter_digest,
+        },
+        "model_state": {
+            name: _json_tensor_record(value)
+            for name, value in sorted(policy.state_dict().items())
+        },
+        "policy_generator_state": policy._generator.get_state().cpu().tolist(),
+    }
+    _assert_no_secret_fields(record)
+    record["record_sha256"] = _record_sha256(record)
+    _canonical_json(record)
+    return record
+
+
+def _dtype_from_record(value: object) -> torch.dtype:
+    _require(isinstance(value, str), "rollout checkpoint dtype must be a string")
+    name = value.removeprefix("torch.")
+    dtype = getattr(torch, name, None)
+    _require(
+        isinstance(dtype, torch.dtype),
+        "rollout checkpoint tensor dtype is unsupported",
+    )
+    return dtype
+
+
+def load_torch_harness_rollout_checkpoint(
+    record: Mapping[str, object],
+    *,
+    device: str | torch.device = "cpu",
+) -> TorchHarnessPolicy:
+    """Restore and self-validate a JSON behavior checkpoint for exact replay."""
+
+    required = {
+        "schema_version",
+        "policy_schema_version",
+        "state_feature_schema_version",
+        "action_ids",
+        "policy_config",
+        "policy_metadata",
+        "model_state",
+        "policy_generator_state",
+        "record_sha256",
+    }
+    _require(set(record) == required, "rollout checkpoint field set differs")
+    _assert_no_secret_fields(record)
+    _canonical_json(record)
+    _require(
+        record.get("record_sha256") == _record_sha256(record)
+        and record.get("schema_version") == ROLLOUT_CHECKPOINT_SCHEMA_VERSION
+        and record.get("policy_schema_version") == POLICY_SCHEMA_VERSION
+        and record.get("state_feature_schema_version") == _STATE_FEATURE_SCHEMA_VERSION
+        and tuple(record.get("action_ids", ())) == ACTION_IDS,
+        "rollout checkpoint schema differs",
+    )
+    config = record.get("policy_config")
+    metadata = record.get("policy_metadata")
+    model_state = record.get("model_state")
+    generator_state = record.get("policy_generator_state")
+    _require(
+        isinstance(config, Mapping)
+        and set(config) == {"seed", "hidden_size"}
+        and type(config.get("seed")) is int
+        and config["seed"] >= 0
+        and type(config.get("hidden_size")) is int
+        and config["hidden_size"] > 0,
+        "rollout checkpoint policy config differs",
+    )
+    _require(
+        isinstance(metadata, Mapping)
+        and set(metadata)
+        == {"update_step", "sample_count", "version", "parameter_digest"}
+        and type(metadata.get("update_step")) is int
+        and metadata["update_step"] >= 0
+        and type(metadata.get("sample_count")) is int
+        and metadata["sample_count"] >= 0
+        and isinstance(metadata.get("version"), str)
+        and _is_sha256(metadata.get("parameter_digest")),
+        "rollout checkpoint policy metadata differs",
+    )
+    _require(
+        isinstance(model_state, Mapping),
+        "rollout checkpoint model state is missing",
+    )
+    _require(
+        isinstance(generator_state, list)
+        and bool(generator_state)
+        and all(type(value) is int and 0 <= value <= 255 for value in generator_state),
+        "rollout checkpoint policy RNG is invalid",
+    )
+    policy = TorchHarnessPolicy(
+        seed=config["seed"],
+        hidden_size=config["hidden_size"],
+    )
+    expected_state = policy.state_dict()
+    _require(
+        set(model_state) == set(expected_state),
+        "rollout checkpoint model parameter names differ",
+    )
+    restored_state: dict[str, Tensor] = {}
+    for name, expected in expected_state.items():
+        tensor_record = model_state[name]
+        _require(
+            isinstance(tensor_record, Mapping)
+            and set(tensor_record) == {"dtype", "shape", "values"},
+            f"rollout checkpoint tensor {name} field set differs",
+        )
+        shape = tensor_record.get("shape")
+        _require(
+            isinstance(shape, list)
+            and all(type(dimension) is int and dimension >= 0 for dimension in shape)
+            and shape == list(expected.shape),
+            f"rollout checkpoint tensor {name} shape differs",
+        )
+        dtype = _dtype_from_record(tensor_record.get("dtype"))
+        _require(
+            dtype == expected.dtype, f"rollout checkpoint tensor {name} dtype differs"
+        )
+        try:
+            tensor = torch.tensor(tensor_record.get("values"), dtype=dtype).reshape(
+                shape
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise TorchHarnessLearningError(
+                f"rollout checkpoint tensor {name} values are invalid"
+            ) from exc
+        _require(
+            not tensor.is_floating_point() or bool(torch.isfinite(tensor).all()),
+            f"rollout checkpoint tensor {name} is non-finite",
+        )
+        restored_state[name] = tensor
+    policy.load_state_dict(restored_state, strict=True)
+    policy.update_step = metadata["update_step"]
+    policy.sample_count = metadata["sample_count"]
+    policy._generator.set_state(torch.tensor(generator_state, dtype=torch.uint8))
+    _require(
+        policy.parameter_digest == metadata["parameter_digest"]
+        and policy.version == metadata["version"],
+        "rollout checkpoint policy identity differs from restored state",
+    )
+    return policy.to(device)
 
 
 @dataclass(frozen=True)
@@ -1037,12 +1219,15 @@ __all__ = [
     "CHECKPOINT_SCHEMA_VERSION",
     "HARNESS_CANDIDATE_SCHEMA_VERSION",
     "POLICY_SCHEMA_VERSION",
+    "ROLLOUT_CHECKPOINT_SCHEMA_VERSION",
     "TorchHarnessLearningError",
     "TorchHarnessOptimizer",
     "TorchHarnessPolicy",
     "TorchHarnessUpdateEvidence",
     "TorchHarnessUpdateResult",
+    "build_torch_harness_rollout_checkpoint",
     "encode_harness_state",
     "load_torch_harness_checkpoint",
+    "load_torch_harness_rollout_checkpoint",
     "validate_torch_harness_update_evidence",
 ]

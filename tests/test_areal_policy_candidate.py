@@ -8,10 +8,12 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from jphrl.paths import repository_root
 from jphrl.training.areal_policy_candidate import (
     AREAL_POLICY_CANDIDATE_SCHEMA,
     PINNED_AREAL_COMMIT,
     ArealPolicyCandidateError,
+    _prepare_run_root,
     checkpoint_manifest,
     validate_areal_policy_candidate,
 )
@@ -150,6 +152,13 @@ def _resign(record: dict[str, object]) -> None:
 
 
 class ArealPolicyCandidateTests(unittest.TestCase):
+    def test_candidate_root_uses_actual_checkout_not_caller_claim(self) -> None:
+        with self.assertRaisesRegex(ValueError, "outside Git checkout"):
+            _prepare_run_root(
+                repository_root() / "must-not-be-created" / "policy-candidate",
+                "/tmp/caller-supplied-fake-project",
+            )
+
     def test_valid_evidence_replays_candidate_identity_and_parent_version(self) -> None:
         audit = validate_areal_policy_candidate(
             json.loads(json.dumps(_record())),

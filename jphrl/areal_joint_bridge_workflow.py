@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import json
 import os
+from dataclasses import replace
 from typing import Any
 
 from areal import workflow_context
@@ -12,6 +12,10 @@ from areal.workflow.rlvr import RLVRWorkflow
 
 from jphrl.harness.controller import HarnessState
 from jphrl.harness.learning import TabularHarnessController
+from jphrl.trajectory.areal_interaction_sidecar import (
+    InteractionBinding,
+    build_interaction_adapter_sidecar,
+)
 from jphrl.trajectory.areal_joint_bridge import (
     build_areal_joint_bridge_record,
     build_joint_version,
@@ -20,18 +24,31 @@ from jphrl.trajectory.areal_joint_bridge import (
     prompt_context_chars,
     write_areal_joint_bridge_record,
 )
-from jphrl.trajectory.areal_interaction_sidecar import (
-    InteractionBinding,
-    build_interaction_adapter_sidecar,
-)
 
 
 class ArealJointBridgeWorkflow(RLVRWorkflow):
     """Make one Harness decision affect a real AReaL request and save both streams."""
 
-    def __init__(self, *args: Any, harness_seed: int = 0, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        harness_seed: int = 0,
+        harness_kind: str = "tabular",
+        harness_hidden_size: int = 32,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
-        self.harness_controller = TabularHarnessController(seed=harness_seed)
+        if harness_kind == "tabular":
+            self.harness_controller = TabularHarnessController(seed=harness_seed)
+        elif harness_kind == "torch":
+            from jphrl.harness.torch_learning import TorchHarnessPolicy
+
+            self.harness_controller = TorchHarnessPolicy(
+                seed=harness_seed,
+                hidden_size=harness_hidden_size,
+            )
+        else:
+            raise ValueError(f"unknown Harness controller kind: {harness_kind}")
 
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
@@ -61,7 +78,16 @@ class ArealJointBridgeWorkflow(RLVRWorkflow):
             dataset_selection=os.environ["JPH_DATASET_SELECTION"],
             base_messages=base_messages,
         )
-        controller_checkpoint = self.harness_controller.checkpoint()
+        if type(self.harness_controller) is TabularHarnessController:
+            controller_checkpoint = self.harness_controller.checkpoint()
+        else:
+            from jphrl.harness.torch_learning import (
+                build_torch_harness_rollout_checkpoint,
+            )
+
+            controller_checkpoint = build_torch_harness_rollout_checkpoint(
+                self.harness_controller
+            )
         decision = replace(
             self.harness_controller.choose(state),
             decision_id=f"{request_id}:harness:0",
@@ -116,9 +142,7 @@ class ArealJointBridgeWorkflow(RLVRWorkflow):
             dataset_selection=os.environ["JPH_DATASET_SELECTION"],
             sglang_version=os.environ["JPH_SGLANG_VERSION"],
             generation_logprob_mode=generation_logprob_mode,
-            inference_runtime_contract_sha256=(
-                inference_runtime_contract_sha256
-            ),
+            inference_runtime_contract_sha256=(inference_runtime_contract_sha256),
         )
         run_id = str(inference_runtime_contract["identity"]["run_id"])
         episode_id = f"{run_id}:{request_id}"
@@ -168,4 +192,66 @@ class ArealJointBridgeWorkflow(RLVRWorkflow):
             trace_dir=os.environ["JPH_AREAL_JOINT_BRIDGE_DIR"],
             allowed_root=os.environ["JPH_ROOT"],
         )
+        admission_mode = os.environ.get("JPH_RLVR_RUNNER_ADMISSION_MODE") or None
+        estimator_template_path = (
+            os.environ.get("JPH_RLVR_FROZEN_ESTIMATOR_TEMPLATE_PATH") or None
+        )
+        runner_admission_dir = os.environ.get("JPH_RLVR_RUNNER_ADMISSION_DIR") or None
+        admission_settings = (
+            admission_mode,
+            estimator_template_path,
+            runner_admission_dir,
+        )
+        if any(value is not None for value in admission_settings):
+            if not all(
+                isinstance(value, str) and value for value in admission_settings
+            ):
+                raise ValueError(
+                    "RLVR runner admission mode, frozen estimator path, and output "
+                    "path must be configured together"
+                )
+            if admission_mode != "m0-torch-joint-v1":
+                raise ValueError("unknown RLVR runner admission mode")
+            if (
+                controller_checkpoint.get("schema_version")
+                != "jph.torch-harness-rollout-checkpoint.v1"
+            ):
+                raise ValueError(
+                    "m0-torch-joint-v1 requires a Torch Harness rollout checkpoint"
+                )
+            from jphrl.trajectory.rlvr_workflow_admission import (
+                load_frozen_dual_credit_estimator_template_file,
+                materialize_dual_credit_estimator_from_template,
+                prepare_rlvr_workflow_joint_admission,
+                rlvr_runner_admission_path_for_request,
+                write_rlvr_workflow_runner_admission,
+            )
+
+            estimator_template = load_frozen_dual_credit_estimator_template_file(
+                estimator_template_path,
+                allowed_root=os.environ["JPH_ROOT"],
+            )
+            estimator = materialize_dual_credit_estimator_from_template(
+                estimator_template,
+                joint_version=joint_version,
+                model_call_id=model_call_id,
+                harness_decision_id=decision.decision_id,
+            )
+            admission = prepare_rlvr_workflow_joint_admission(
+                record,
+                pre_batch_interaction=interaction,
+                estimator=estimator,
+                active_joint_version=joint_version,
+            )
+            runner_admission_path = rlvr_runner_admission_path_for_request(
+                output_dir=runner_admission_dir,
+                request_id=request_id,
+                allowed_root=os.environ["JPH_ROOT"],
+            )
+            write_rlvr_workflow_runner_admission(
+                admission.runner_admission,
+                output_path=runner_admission_path,
+                allowed_root=os.environ["JPH_ROOT"],
+                active_joint_version=joint_version,
+            )
         return {request_id: interaction}

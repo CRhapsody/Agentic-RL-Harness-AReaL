@@ -1,15 +1,21 @@
-from dataclasses import replace
+from __future__ import annotations
+
 import hashlib
+import importlib.util
 import json
-import os
-from pathlib import Path
-from types import SimpleNamespace
 import tempfile
 import unittest
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
 from jphrl.harness.controller import HarnessState
 from jphrl.harness.learning import TabularHarnessController
 from jphrl.harness.spec import HarnessAction
+from jphrl.trajectory.areal_interaction_sidecar import (
+    InteractionBinding,
+    build_interaction_adapter_sidecar,
+)
 from jphrl.trajectory.areal_joint_bridge import (
     ArealJointBridgeError,
     build_areal_joint_bridge_record,
@@ -20,10 +26,6 @@ from jphrl.trajectory.areal_joint_bridge import (
     prompt_context_chars,
     validate_areal_joint_bridge_record,
     write_areal_joint_bridge_record,
-)
-from jphrl.trajectory.areal_interaction_sidecar import (
-    InteractionBinding,
-    build_interaction_adapter_sidecar,
 )
 
 
@@ -71,7 +73,7 @@ class ArealJointBridgeTests(unittest.TestCase):
             },
         }
 
-    def _record(self) -> dict[str, object]:
+    def _record(self, controller: object | None = None) -> dict[str, object]:
         state = HarnessState(
             turn=0,
             remaining_tool_calls=0,
@@ -84,8 +86,15 @@ class ArealJointBridgeTests(unittest.TestCase):
             verifier_status="not-run",
             task_domain="gsm8k",
         )
-        controller = TabularHarnessController(seed=3)
-        controller_checkpoint = controller.checkpoint()
+        controller = controller or TabularHarnessController(seed=3)
+        if type(controller) is TabularHarnessController:
+            controller_checkpoint = controller.checkpoint()
+        else:
+            from jphrl.harness.torch_learning import (
+                build_torch_harness_rollout_checkpoint,
+            )
+
+            controller_checkpoint = build_torch_harness_rollout_checkpoint(controller)
         decision = replace(
             controller.choose(state),
             decision_id="request-1:harness:0",
@@ -179,9 +188,7 @@ class ArealJointBridgeTests(unittest.TestCase):
 
     def test_real_interaction_and_harness_prompt_are_bound(self) -> None:
         record = self._record()
-        audit = validate_areal_joint_bridge_record(
-            record, expected_policy_version=0
-        )
+        audit = validate_areal_joint_bridge_record(record, expected_policy_version=0)
         self.assertTrue(audit["ok"])
         self.assertTrue(audit["prompt_tokens_changed"])
         self.assertEqual(audit["harness_loss_mask"], 1)
@@ -218,6 +225,32 @@ class ArealJointBridgeTests(unittest.TestCase):
             binding["model_call_id"],
         )
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch") is not None,
+        "torch is required for Torch Harness bridge replay",
+    )
+    def test_torch_harness_rollout_checkpoint_replays_bound_decision(self) -> None:
+        from jphrl.harness.torch_learning import TorchHarnessPolicy
+
+        record = self._record(TorchHarnessPolicy(seed=3, hidden_size=16))
+        audit = validate_areal_joint_bridge_record(
+            record,
+            expected_policy_version=0,
+        )
+
+        self.assertTrue(audit["ok"])
+        self.assertEqual(
+            record["harness"]["controller_checkpoint_before_decision"][
+                "schema_version"
+            ],
+            "jph.torch-harness-rollout-checkpoint.v1",
+        )
+        self.assertTrue(
+            record["joint_version"]["harness_controller"].startswith(
+                "torch-harness-categorical-v1-step000000-"
+            )
+        )
+
     def test_every_harness_action_changes_the_prompt(self) -> None:
         base = [{"role": "user", "content": "Compute 1 + 1."}]
         for action in HarnessAction:
@@ -250,9 +283,7 @@ class ArealJointBridgeTests(unittest.TestCase):
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
-        unsigned = {
-            key: item for key, item in record.items() if key != "record_sha256"
-        }
+        unsigned = {key: item for key, item in record.items() if key != "record_sha256"}
         record["record_sha256"] = hashlib.sha256(
             json.dumps(
                 unsigned,
@@ -274,9 +305,7 @@ class ArealJointBridgeTests(unittest.TestCase):
                 record = self._record()
                 record["policy_binding"][field] = value
                 unsigned = {
-                    key: item
-                    for key, item in record.items()
-                    if key != "record_sha256"
+                    key: item for key, item in record.items() if key != "record_sha256"
                 }
                 record["record_sha256"] = hashlib.sha256(
                     json.dumps(

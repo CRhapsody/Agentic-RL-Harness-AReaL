@@ -435,6 +435,79 @@ def _sample_from_event(
     return sample
 
 
+def admit_pre_batch_bound_harness_action_samples(
+    *,
+    trace: EpisodeTrace,
+    active_joint_version: JointVersion,
+    source_training_record_sha256: str,
+    trace_sha256: str,
+    bound_model_call_ids: Sequence[str],
+) -> AdmittedHarnessActionBatch:
+    """Admit real Harness decisions from a route-neutral pre-batch record.
+
+    The caller must already have validated its route-specific source record and
+    supplies only that record's digest plus the exact trace/model-call binding.
+    This helper deliberately does not accept an Agent Service receipt and does
+    not infer identities from a merged tensor batch.
+    """
+
+    _require(type(trace) is EpisodeTrace, "admission requires a full EpisodeTrace")
+    _require(
+        type(active_joint_version) is JointVersion,
+        "admission requires an active JointVersion",
+    )
+    _require(
+        _is_sha256(source_training_record_sha256),
+        "source pre-batch training-record SHA-256 is invalid",
+    )
+    _require(_is_sha256(trace_sha256), "trace SHA-256 is invalid")
+    _require(
+        isinstance(bound_model_call_ids, Sequence)
+        and not isinstance(bound_model_call_ids, (str, bytes))
+        and bool(bound_model_call_ids)
+        and len(set(bound_model_call_ids)) == len(bound_model_call_ids)
+        and all(_is_non_empty_string(value) for value in bound_model_call_ids),
+        "bound model-call IDs must be unique non-empty strings",
+    )
+    try:
+        trace_payload = trace.to_dict()
+        _assert_no_secret_fields(trace_payload, "trace")
+        require_lag_zero_admission(trace, active_joint_version)
+    except (StaleJointVersionError, ValueError) as exc:
+        raise HarnessActionAdmissionError(str(exc)) from exc
+    _require(
+        trace.validity_class in {"valid", "policy_failure"},
+        "invalid infrastructure or trace-contract episode cannot enter training",
+    )
+    _require(
+        _is_finite_number(trace.reward),
+        "Harness admission requires a finite terminal reward",
+    )
+
+    actions = tuple(
+        _sample_from_event(
+            trace=trace,
+            event=event,
+            decision_ordinal=decision_ordinal,
+        )
+        for decision_ordinal, event in enumerate(
+            event for event in trace.events if event.kind == "harness_decision"
+        )
+    )
+    batch = AdmittedHarnessActionBatch(
+        joint_version=trace.joint_version,
+        episode_id=trace.episode_id,
+        trace_sha256=trace_sha256,
+        source_training_record_sha256=source_training_record_sha256,
+        terminal_reward=float(trace.reward),
+        validity_class=trace.validity_class,
+        bound_model_call_ids=tuple(str(value) for value in bound_model_call_ids),
+        actions=actions,
+    )
+    batch.validate()
+    return batch
+
+
 def admit_real_harness_action_samples(
     *,
     trace: EpisodeTrace,

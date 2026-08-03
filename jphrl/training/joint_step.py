@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from jphrl.paths import require_within_configured_root
+from jphrl.paths import require_outside_repository
 from jphrl.trajectory.schema import JointVersion
 
 from .areal_policy_candidate import validate_areal_policy_candidate
@@ -479,12 +479,8 @@ def seal_joint_candidate_bundle(
         "both parent restore callbacks must be supplied together",
     )
     try:
-        root = require_within_configured_root(seal_root)
-        project = Path(project_root).expanduser().resolve()
-        _require(
-            root != project and project not in root.parents,
-            "joint barrier journal must be outside the Git project",
-        )
+        del project_root  # the actual checkout boundary is not caller-controlled
+        root = require_outside_repository(seal_root)
         root.mkdir(parents=True, exist_ok=True)
         bundle = build_joint_candidate_bundle(
             policy_receipt=policy_receipt,

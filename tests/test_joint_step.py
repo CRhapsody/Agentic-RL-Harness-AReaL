@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from jphrl.paths import repository_root
 from jphrl.training.joint_step import (
     JointStepError,
     JointStepRollbackError,
@@ -117,6 +118,22 @@ class JointStepTests(unittest.TestCase):
             audit.parent_joint_version.parser,
         )
         self.assertFalse(bundle["evidence_scope"]["joint_publish"])
+
+    def test_caller_cannot_lie_about_git_root_for_barrier_journal(self) -> None:
+        policy_record, harness_record = _receipts()
+        with self.assertRaisesRegex(ValueError, "outside Git checkout"):
+            seal_joint_candidate_bundle(
+                seal_root=repository_root() / "must-not-be-created" / "macro-1",
+                project_root="/tmp/caller-supplied-fake-project",
+                policy_receipt=policy_record,
+                harness_receipt=harness_record,
+                active_joint_version=_version(),
+                parent_release_id="release-parent",
+                macro_step_id="macro-1",
+                actor_public_version=7,
+                harness_public_version="harness-parent",
+                require_receipt_files=False,
+            )
 
     def test_source_mismatch_and_early_activation_restore_both_parents(self) -> None:
         policy_record, harness_record = _receipts()
