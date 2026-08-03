@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import unittest
+from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import replace
+from types import SimpleNamespace
 
 from jphrl.envs.calculator import TASKS
-from jphrl.harness.spec import HarnessSpec
+from jphrl.harness.controller import HarnessDecision
+from jphrl.harness.spec import HarnessAction, HarnessSpec
+from jphrl.models.base import ModelResponse
 from jphrl.runner import run_calculator_smoke
 from jphrl.trajectory.areal_agent_service_adapter import (
     AgentServiceModelCallReceipt,
@@ -30,11 +35,172 @@ from jphrl.trajectory.joint_credit_alignment import (
     build_frozen_joint_credit_alignment,
     validate_frozen_joint_credit_alignment,
 )
-from tests.test_areal_policy_admission import _interactions
-from tests.test_harness_action_admission import (
-    LiveLearnableHarnessController,
-    TokenBackedCalculatorModel,
-)
+
+
+class TokenBackedCalculatorModel:
+    policy_version = "real-policy-v7"
+    tokenizer_version = "real-tokenizer-v1"
+
+    def __init__(self) -> None:
+        self.call_index = 0
+
+    def generate(self, messages, max_new_tokens):
+        del messages, max_new_tokens
+        if self.call_index == 0:
+            response = ModelResponse(
+                text='{"tool":"calculator","expression":"17 + 25"}',
+                input_token_ids=[10, 11],
+                output_token_ids=[20, 21],
+                output_token_logprobs=[-0.2, -0.3],
+                output_versions=[7, 7],
+                completion_loss_mask=[1, 1],
+                policy_version=self.policy_version,
+                tokenizer_version=self.tokenizer_version,
+                policy_kind="causal_lm",
+                token_metadata_status="available",
+            )
+        else:
+            response = ModelResponse(
+                text='{"answer":"42"}',
+                input_token_ids=[10, 11, 20, 21, 30],
+                output_token_ids=[40],
+                output_token_logprobs=[-0.4],
+                output_versions=[7],
+                completion_loss_mask=[1],
+                policy_version=self.policy_version,
+                tokenizer_version=self.tokenizer_version,
+                policy_kind="causal_lm",
+                token_metadata_status="available",
+            )
+        self.call_index += 1
+        return response
+
+
+class LiveLearnableHarnessController:
+    version = "live-categorical-harness-v1"
+
+    def __init__(self) -> None:
+        self.ordinal = 0
+
+    def choose(self, state):
+        action_ids = tuple(action.value for action in HarnessAction)
+        action = (
+            HarnessAction.DIRECT
+            if state.verifier_status == "not-run"
+            else HarnessAction.VERIFY
+        )
+        action_index = action_ids.index(action.value)
+        logits = tuple(
+            1.25 if index == action_index else -0.25 for index in range(len(action_ids))
+        )
+        maximum = max(logits)
+        normalizer = maximum + math.log(
+            sum(math.exp(value - maximum) for value in logits)
+        )
+        decision = HarnessDecision(
+            decision_id=f"live-decision-{self.ordinal}",
+            action=action,
+            old_harness_logprob=logits[action_index] - normalizer,
+            controller_version=self.version,
+            action_ids=action_ids,
+            action_mask=(True,) * len(action_ids),
+            pre_mask_logits=logits,
+            harness_loss_mask=1,
+        )
+        self.ordinal += 1
+        return decision
+
+
+def _tensor_dict(
+    *,
+    input_ids: list[int],
+    loss_mask: list[int],
+    logprobs: list[float],
+    versions: list[int],
+) -> dict[str, object]:
+    return {
+        "input_ids": [input_ids],
+        "loss_mask": [loss_mask],
+        "logprobs": [logprobs],
+        "versions": [versions],
+        "attention_mask": [[True] * len(input_ids)],
+        "rewards": [1.0],
+    }
+
+
+class FakeInteraction:
+    def __init__(
+        self,
+        *,
+        interaction_id: str,
+        parent: FakeInteraction | None,
+        chat_template_type: str,
+        input_tokens: list[int],
+        output_tokens: list[int],
+        output_logprobs: list[float],
+        output_versions: list[int],
+        tensors: dict[str, object],
+    ) -> None:
+        self.interaction_id = interaction_id
+        self.parent = parent
+        self.chat_template_type = chat_template_type
+        self.model_response = SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            output_logprobs=output_logprobs,
+            output_versions=output_versions,
+        )
+        self._tensors = tensors
+
+    def to_tensor_dict(self) -> dict[str, object]:
+        return self._tensors
+
+
+def _interactions(style: str) -> OrderedDict[str, FakeInteraction]:
+    template_type = "concat" if style == "concat" else "hf"
+    first = FakeInteraction(
+        interaction_id="interaction-1",
+        parent=None,
+        chat_template_type=template_type,
+        input_tokens=[10, 11],
+        output_tokens=[20, 21],
+        output_logprobs=[-0.2, -0.3],
+        output_versions=[7, 7],
+        tensors=_tensor_dict(
+            input_ids=[10, 11, 20, 21],
+            loss_mask=[0, 0, 1, 1],
+            logprobs=[0.0, 0.0, -0.2, -0.3],
+            versions=[-1, -1, 7, 7],
+        ),
+    )
+    if style == "concat":
+        second_mask = [0, 0, 1, 1, 0, 1]
+        second_logprobs = [0.0, 0.0, -0.2, -0.3, 0.0, -0.4]
+        second_versions = [-1, -1, 7, 7, -1, 7]
+    else:
+        second_mask = [0, 0, 0, 0, 0, 1]
+        second_logprobs = [0.0, 0.0, 0.0, 0.0, 0.0, -0.4]
+        second_versions = [-1, -1, -1, -1, -1, 7]
+    second = FakeInteraction(
+        interaction_id="interaction-2",
+        parent=first,
+        chat_template_type=template_type,
+        input_tokens=[10, 11, 20, 21, 30],
+        output_tokens=[40],
+        output_logprobs=[-0.4],
+        output_versions=[7],
+        tensors=_tensor_dict(
+            input_ids=[10, 11, 20, 21, 30, 40],
+            loss_mask=second_mask,
+            logprobs=second_logprobs,
+            versions=second_versions,
+        ),
+    )
+    if style == "concat":
+        return OrderedDict(((second.interaction_id, second),))
+    return OrderedDict(
+        (interaction.interaction_id, interaction) for interaction in (first, second)
+    )
 
 
 def _resign(record: dict[str, object]) -> None:
