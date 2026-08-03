@@ -468,12 +468,12 @@ def build_live_production_worker_factory(
 ) -> ProductionWorkerFactory:
     """Build Y's factory without serializing the in-memory admin credential."""
 
-    runtime_root = require_outside_repository(Path(artifact_root) / "production-runtime")
     _require(
         isinstance(admin_api_key, str) and len(admin_api_key) >= 32,
         "M0 production admin API key is missing or too short",
     )
     _require(physical_gpu_id >= 0, "physical GPU ID must be non-negative")
+    runtime_root = require_outside_repository(Path(artifact_root) / "production-runtime")
     original_server_args = _recorded_server_args(selection.training_source)
 
     def create(assets: M0ActivationAssets) -> Sequence[object]:
