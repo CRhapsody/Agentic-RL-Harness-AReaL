@@ -32,6 +32,7 @@ from jphrl.experiments.m0_eight_gpu_integrated import (
 from jphrl.experiments.m0_eight_gpu_topology import M0WorkerPlacement
 from jphrl.experiments.m0_eight_gpu_real_adapter import (
     M0EightGPURealAdapterError,
+    NvidiaSMIGPUStateProvider,
     RealEightGPUIntegratedAdapters,
     _commit_actor_with_y_compensation,
     _validate_y_actor_terminal_receipts,
@@ -870,6 +871,108 @@ class YTerminalCompensationTests(unittest.TestCase):
                 worker=worker,
                 parent_probe=probe,
             )
+
+
+class NvidiaSMIGPUStateProviderTests(unittest.TestCase):
+    @staticmethod
+    def _nvidia_smi_output(
+        arguments: object,
+        *,
+        process_rows: str = "GPU-0, 946362, python, 128",
+    ) -> str:
+        query = tuple(arguments)
+        if query[0] == "--query-gpu=index,memory.used,memory.free":
+            return "\n".join(f"{gpu_id}, 1024, 80000" for gpu_id in range(8))
+        if query[0] == "--query-compute-apps=gpu_uuid,pid,process_name,used_memory":
+            return process_rows
+        if query[0] == "--query-gpu=index,uuid":
+            return "\n".join(f"{gpu_id}, GPU-{gpu_id}" for gpu_id in range(8))
+        raise AssertionError(f"unexpected nvidia-smi query: {query!r}")
+
+    def test_process_that_exits_before_identity_lookup_is_skipped(self) -> None:
+        with (
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter._run_nvidia_smi",
+                side_effect=self._nvidia_smi_output,
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter."
+                "_linux_process_start_time",
+                return_value=None,
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter.subprocess.run"
+            ) as process_probe,
+        ):
+            observations = NvidiaSMIGPUStateProvider().snapshot()
+
+        self.assertEqual(len(observations), 8)
+        self.assertTrue(all(not item.processes for item in observations))
+        process_probe.assert_not_called()
+
+    def test_failed_identity_lookup_for_still_live_process_fails_closed(self) -> None:
+        with (
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter._run_nvidia_smi",
+                side_effect=self._nvidia_smi_output,
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter."
+                "_linux_process_start_time",
+                side_effect=(101, 101),
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter.subprocess.run",
+                side_effect=subprocess.CalledProcessError(1, ("ps",)),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                M0EightGPURealAdapterError,
+                "cannot bind GPU process",
+            ):
+                NvidiaSMIGPUStateProvider().snapshot()
+
+    def test_pid_reuse_during_identity_lookup_fails_closed(self) -> None:
+        with (
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter._run_nvidia_smi",
+                side_effect=self._nvidia_smi_output,
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter."
+                "_linux_process_start_time",
+                side_effect=(101, 202),
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter.subprocess.run",
+                return_value=SimpleNamespace(stdout="4321 1000 worker\n"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                M0EightGPURealAdapterError,
+                "PID was reused",
+            ):
+                NvidiaSMIGPUStateProvider().snapshot()
+
+    def test_process_that_exits_after_identity_lookup_is_skipped(self) -> None:
+        with (
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter._run_nvidia_smi",
+                side_effect=self._nvidia_smi_output,
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter."
+                "_linux_process_start_time",
+                side_effect=(101, None),
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter.subprocess.run",
+                return_value=SimpleNamespace(stdout="4321 1000 worker\n"),
+            ),
+        ):
+            observations = NvidiaSMIGPUStateProvider().snapshot()
+
+        self.assertTrue(all(not item.processes for item in observations))
 
 
 class EightGPUMemoryObservationTests(unittest.TestCase):

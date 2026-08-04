@@ -787,6 +787,70 @@ def _run_nvidia_smi(arguments: Sequence[str]) -> str:
         raise M0EightGPURealAdapterError("cannot observe NVIDIA GPU state") from exc
 
 
+def _linux_process_start_time(pid: int) -> int | None:
+    """Return Linux start-time ticks, or ``None`` after a confirmed exit.
+
+    ``nvidia-smi`` and the ownership lookup are necessarily separate snapshots.
+    Binding both sides to ``/proc/<pid>/stat`` field 22 prevents a recycled PID
+    from inheriting a stale GPU-process row while allowing short-lived helper
+    processes to disappear normally between the two observations.
+    """
+
+    try:
+        raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as exc:
+        raise M0EightGPURealAdapterError(
+            "cannot read GPU process start time"
+        ) from exc
+    command_end = raw.rfind(")")
+    fields_after_command = raw[command_end + 1 :].split()
+    _require(
+        command_end > 0
+        and len(fields_after_command) >= 20
+        and fields_after_command[19].isdigit(),
+        "GPU process start-time record is invalid",
+    )
+    return int(fields_after_command[19])
+
+
+def _bind_gpu_process_identity(pid: int) -> tuple[int, int, str] | None:
+    """Bind a live PID to SID/UID/user without mistaking an exit for failure."""
+
+    start_time_before = _linux_process_start_time(pid)
+    if start_time_before is None:
+        return None
+    try:
+        raw = subprocess.run(
+            ["ps", "-o", "sid=,uid=,user=", "-p", str(pid)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        if _linux_process_start_time(pid) is None:
+            return None
+        raise M0EightGPURealAdapterError(
+            "cannot bind GPU process to SID/UID/user"
+        ) from exc
+
+    start_time_after = _linux_process_start_time(pid)
+    if start_time_after is None:
+        return None
+    _require(
+        start_time_after == start_time_before,
+        "GPU process PID was reused during identity binding",
+    )
+    try:
+        sid, uid, user = raw.split(maxsplit=2)
+        return int(sid), int(uid), user
+    except ValueError as exc:
+        raise M0EightGPURealAdapterError(
+            "cannot bind GPU process to SID/UID/user"
+        ) from exc
+
+
 def _nvidia_driver_version() -> str:
     values = {
         line.strip()
@@ -860,23 +924,15 @@ class NvidiaSMIGPUStateProvider:
                 "GPU compute process row is invalid",
             )
             pid = int(fields[1])
-            try:
-                raw = subprocess.run(
-                    ["ps", "-o", "sid=,uid=,user=", "-p", str(pid)],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                ).stdout.strip()
-                sid, uid, user = raw.split(maxsplit=2)
-            except (OSError, subprocess.CalledProcessError, ValueError) as exc:
-                raise M0EightGPURealAdapterError(
-                    "cannot bind GPU process to SID/UID/user"
-                ) from exc
+            identity = _bind_gpu_process_identity(pid)
+            if identity is None:
+                continue
+            sid, uid, user = identity
             processes[uuid_to_id[fields[0]]].append(
                 GPUProcessObservation(
                     pid=pid,
-                    session_id=int(sid),
-                    uid=int(uid),
+                    session_id=sid,
+                    uid=uid,
                     user=user,
                     process_name=fields[2],
                     used_memory_mib=int(fields[3]),
