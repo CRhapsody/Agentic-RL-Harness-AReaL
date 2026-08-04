@@ -538,6 +538,43 @@ def _continuation_rank_receipts(
 
 
 class DistributedPolicyReceiptTests(unittest.TestCase):
+    def test_parent_dcp_baseline_allows_only_optional_lazy_adamw_init(self) -> None:
+        distributed._require_post_parent_optimizer_baseline(
+            pre_parent_dcp_step=0,
+            post_parent_dcp_step=1,
+        )
+        distributed._require_post_parent_optimizer_baseline(
+            pre_parent_dcp_step=7,
+            post_parent_dcp_step=7,
+        )
+        for observed in (-1, 2):
+            with self.subTest(observed=observed), self.assertRaisesRegex(
+                ArealDistributedPolicyError,
+                "optional one-step lazy initialization",
+            ):
+                distributed._require_post_parent_optimizer_baseline(
+                    pre_parent_dcp_step=0,
+                    post_parent_dcp_step=observed,
+                )
+
+    def test_worker_update_stats_fail_closed_before_receipt_use(self) -> None:
+        self.assertEqual(
+            distributed._normalized_update_stats(
+                {"update_successful": 1.0, "grad_norm": 0.25, "lr": 1e-6}
+            )["update_successful_count"],
+            1,
+        )
+        for value in (
+            {"update_successful": 0.0, "grad_norm": 0.25, "lr": 1e-6},
+            {"update_successful": 1.0, "grad_norm": float("nan"), "lr": 1e-6},
+            {"update_successful": 1.0, "grad_norm": 0.25, "lr": 0.0},
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ArealDistributedPolicyError,
+                "does not prove one successful update",
+            ):
+                distributed._normalized_update_stats(value)
+
     def test_plural_sources_are_revalidated_memberwise_then_flattened_in_order(self) -> None:
         version = JointVersion(
             policy="policy",

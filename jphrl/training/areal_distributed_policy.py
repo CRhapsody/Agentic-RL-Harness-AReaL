@@ -360,6 +360,21 @@ def _optimizer_step(actor: object) -> int:
     return steps[0]
 
 
+def _require_post_parent_optimizer_baseline(
+    *,
+    pre_parent_dcp_step: int,
+    post_parent_dcp_step: int,
+) -> None:
+    """Accept only an unchanged or one-step DCP lazy-state initialization."""
+
+    _require(
+        post_parent_dcp_step
+        in {pre_parent_dcp_step, pre_parent_dcp_step + 1},
+        "parent DCP changed the rank-local AdamW parameter-state step by "
+        "more than its optional one-step lazy initialization",
+    )
+
+
 def _lr_scheduler_state(actor: object) -> dict[str, object]:
     scheduler = getattr(actor, "lr_scheduler", None)
     state_dict = getattr(scheduler, "state_dict", None)
@@ -1836,9 +1851,12 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                 self,
                 pending["scheduler_state_before"],  # type: ignore[arg-type]
             )
+            restored_optimizer_step = _optimizer_step(self)
             _require(
-                _optimizer_step(self) == pending["optimizer_step_before"],
-                "parent DCP did not restore the rank-local optimizer step",
+                restored_optimizer_step == pending["optimizer_step_before"],
+                "parent DCP did not restore the rank-local optimizer step "
+                f"(parent baseline={pending['optimizer_step_before']}, "
+                f"observed={restored_optimizer_step})",
             )
 
         self._run_group_phase("parent rollback", _rollback)
@@ -2710,13 +2728,17 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                 self._jph_optimizer_step_count == 1,
                 "distributed W continuation did not execute exactly one optimizer step",
             )
-            self.step_lr_scheduler()
+            # Invocation alone is not success: AReaL deliberately skips the
+            # underlying AdamW step for a non-finite gradient norm.  Validate
+            # its worker-local result before advancing the scheduler.
+            _normalized_update_stats(self._jph_last_optimizer_result)
             optimizer_step_after = _optimizer_step(self)
-            scheduler_after = _lr_scheduler_state(self)
             _require(
                 optimizer_step_after == optimizer_step_before + 1,
                 "distributed W continuation optimizer step differs",
             )
+            self.step_lr_scheduler()
+            scheduler_after = _lr_scheduler_state(self)
             _require_one_scheduler_step(scheduler_before, scheduler_after)
             root = Path(str(pending["candidate_path"])).parent
             continuation_path = root / f"w-{branch}-continuation.dcp"
@@ -3058,7 +3080,11 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                 "distributed Policy transaction paths must be new",
             )
             scheduler_state_before = _lr_scheduler_state(self)
-            optimizer_step_before = _optimizer_step(self)
+            # This is diagnostic only.  On pinned PyTorch, the first DCP
+            # get_state_dict() may lazily initialize an empty AdamW state with
+            # a zero-LR step.  The formal update/rollback baseline therefore
+            # has to be sampled after the parent DCP has been materialized.
+            optimizer_step_pre_parent_dcp = _optimizer_step(self)
             selected = set(indices)
             update_batch: list[dict[str, Any]] = []
             for member_index, (admission_record, _admission) in enumerate(
@@ -3109,7 +3135,7 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                 "candidate_path": candidate_path,
                 "rank_receipt_path": rank_receipt_path,
                 "scheduler_state_before": scheduler_state_before,
-                "optimizer_step_before": optimizer_step_before,
+                "optimizer_step_pre_parent_dcp": optimizer_step_pre_parent_dcp,
                 "update_batch": update_batch,
                 "global_sample_count": len(flattened_samples),
                 "global_sample_sha256": _sha256(global_samples),
@@ -3122,7 +3148,9 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
             "source_admission_sha256": state["source_admission_sha256"],
             "optimizer_class": state["optimizer_class"],
             "inference_engine_version": state["inference_engine_version"],
-            "optimizer_step_before": state["optimizer_step_before"],
+            "optimizer_step_pre_parent_dcp": state[
+                "optimizer_step_pre_parent_dcp"
+            ],
             "scheduler_state_before_sha256": _sha256(
                 state["scheduler_state_before"]
             ),
@@ -3149,6 +3177,25 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
             lambda: (self.save(meta=parent_meta), checkpoint_manifest(state["parent_path"]))[1],
         )
         self._require_group_common("parent DCP manifest", parent_manifest)
+        optimizer_step_before = self._run_group_phase(
+            "post-parent optimizer baseline",
+            lambda: _optimizer_step(self),
+        )
+        post_parent_common = {
+            "optimizer_step_before": optimizer_step_before,
+            "scheduler_state_before_sha256": _sha256(
+                state["scheduler_state_before"]
+            ),
+            "parent_dcp_manifest_sha256": parent_manifest[
+                "manifest_sha256"
+            ],
+        }
+        self._require_group_common("post-parent baseline", post_parent_common)
+        _require_post_parent_optimizer_baseline(
+            pre_parent_dcp_step=state["optimizer_step_pre_parent_dcp"],
+            post_parent_dcp_step=optimizer_step_before,
+        )
+        state["optimizer_step_before"] = optimizer_step_before
         self._jph_pending_m0_transaction = {
             "transaction_id": transaction_id,
             "parent_path": str(state["parent_path"]),
@@ -3184,23 +3231,26 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                     self._jph_optimizer_step_count == 1,
                     "worker did not execute exactly one optimizer_step",
                 )
+                update_stats = _normalized_update_stats(
+                    self._jph_last_optimizer_result
+                )
+                optimizer_step_after = _optimizer_step(self)
+                _require(
+                    optimizer_step_after == state["optimizer_step_before"] + 1,
+                    "worker optimizer step did not advance exactly once "
+                    f"(parent baseline={state['optimizer_step_before']}, "
+                    f"observed={optimizer_step_after})",
+                )
                 self.step_lr_scheduler()
                 scheduler_state_after = _lr_scheduler_state(self)
                 _require_one_scheduler_step(
                     state["scheduler_state_before"],
                     scheduler_state_after,
                 )
-                optimizer_step_after = _optimizer_step(self)
-                _require(
-                    optimizer_step_after == state["optimizer_step_before"] + 1,
-                    "worker optimizer step did not advance exactly once",
-                )
                 return {
                     "optimizer_step_after": optimizer_step_after,
                     "scheduler_state_after": scheduler_state_after,
-                    "update_stats": _normalized_update_stats(
-                        self._jph_last_optimizer_result
-                    ),
+                    "update_stats": update_stats,
                 }
 
             update = self._run_group_phase("PPO optimizer update", _update)
