@@ -622,6 +622,15 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("JPH_B0_MAX_USED_MEMORY_MIB:-10240", text)
         self.assertIn("--query-gpu=memory.used,memory.free", text)
         self.assertIn("--query-compute-apps=pid,process_name,used_memory", text)
+        self.assertIn(
+            'JPH_B0_ALLOWED_EXISTING_COMPUTE_UIDS:-',
+            text,
+        )
+        self.assertIn("must be unique positive UIDs", text)
+        self.assertIn('ps -o uid= -p "${process_pid}"', text)
+        self.assertIn("has disallowed or unresolved UID", text)
+        self.assertIn('[[ -z "${ALLOWED_EXISTING_COMPUTE_UIDS}" ]]', text)
+        self.assertIn("allowed_existing_compute_uids=%s", text)
         self.assertIn("memory_free < MIN_FREE_MEMORY_MIB", text)
         self.assertIn("memory_used > MAX_USED_MEMORY_MIB", text)
         self.assertIn("MIN_FREE_MEMORY_MIB < 71680", text)

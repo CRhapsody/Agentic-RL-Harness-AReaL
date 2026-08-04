@@ -24,6 +24,7 @@ readonly DATASET_REPORT="${JPH_ROOT}/artifacts/bootstrap/gsm8k-snapshot.json"
 readonly CUDA_TOOLKIT_ROOT="${JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6}"
 readonly MIN_FREE_MEMORY_MIB="${JPH_B0_MIN_FREE_MEMORY_MIB:-71680}"
 readonly MAX_USED_MEMORY_MIB="${JPH_B0_MAX_USED_MEMORY_MIB:-10240}"
+readonly ALLOWED_EXISTING_COMPUTE_UIDS="${JPH_B0_ALLOWED_EXISTING_COMPUTE_UIDS:-}"
 readonly SOFT_MAX_NEW_GPU_MEMORY_MIB=26624
 readonly HARD_MAX_NEW_GPU_MEMORY_MIB=30720
 
@@ -42,6 +43,18 @@ fi
 if ((MAX_USED_MEMORY_MIB > 10240)); then
   echo "JPH_B0_MAX_USED_MEMORY_MIB cannot relax the 10240 MiB ceiling" >&2
   exit 2
+fi
+declare -A SEEN_ALLOWED_COMPUTE_UIDS=()
+if [[ -n "${ALLOWED_EXISTING_COMPUTE_UIDS}" ]]; then
+  IFS=, read -r -a allowed_compute_uids <<< "${ALLOWED_EXISTING_COMPUTE_UIDS}"
+  for allowed_compute_uid in "${allowed_compute_uids[@]}"; do
+    if [[ ! "${allowed_compute_uid}" =~ ^[1-9][0-9]*$ ]] \
+      || [[ -n "${SEEN_ALLOWED_COMPUTE_UIDS[${allowed_compute_uid}]:-}" ]]; then
+      echo "JPH_B0_ALLOWED_EXISTING_COMPUTE_UIDS must be unique positive UIDs" >&2
+      exit 2
+    fi
+    SEEN_ALLOWED_COMPUTE_UIDS[${allowed_compute_uid}]=1
+  done
 fi
 if ((SOFT_MAX_NEW_GPU_MEMORY_MIB > HARD_MAX_NEW_GPU_MEMORY_MIB)); then
   echo "B0 soft GPU-memory cap exceeds the immutable hard cap" >&2
@@ -335,17 +348,35 @@ read_gpu_state() {
     echo "Cannot read GPU ${gpu_id} compute processes at ${stage}" >&2
     return 1
   fi
-  printf 'stage=%s\ngpu_id=%s\nmemory_used_mib=%s\nmemory_free_mib=%s\ncompute_processes=%s\n' \
+  printf 'stage=%s\ngpu_id=%s\nmemory_used_mib=%s\nmemory_free_mib=%s\nallowed_existing_compute_uids=%s\ncompute_processes=%s\n' \
     "${stage}" "${gpu_id}" "${memory_used}" "${memory_free}" \
-    "${processes:-none}" > "${snapshot_path}"
+    "${ALLOWED_EXISTING_COMPUTE_UIDS:-none}" "${processes:-none}" \
+    > "${snapshot_path}"
   chmod 600 "${snapshot_path}"
   if ((memory_used > MAX_USED_MEMORY_MIB || memory_free < MIN_FREE_MEMORY_MIB)); then
     echo "GPU ${gpu_id} lacks B0 headroom at ${stage}: used=${memory_used}MiB free=${memory_free}MiB" >&2
     return 1
   fi
   if [[ -n "${processes}" ]]; then
-    echo "GPU ${gpu_id} has an existing compute process at ${stage}" >&2
-    return 1
+    local process_line process_pid process_uid
+    if [[ -z "${ALLOWED_EXISTING_COMPUTE_UIDS}" ]]; then
+      echo "GPU ${gpu_id} has an existing compute process at ${stage}" >&2
+      return 1
+    fi
+    while IFS= read -r process_line; do
+      process_pid="${process_line%%,*}"
+      process_pid="${process_pid// /}"
+      if [[ ! "${process_pid}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "GPU ${gpu_id} has an invalid compute PID at ${stage}" >&2
+        return 1
+      fi
+      process_uid="$(ps -o uid= -p "${process_pid}" 2>/dev/null | tr -d ' ' || true)"
+      if [[ ! "${process_uid}" =~ ^[1-9][0-9]*$ ]] \
+        || [[ -z "${SEEN_ALLOWED_COMPUTE_UIDS[${process_uid}]:-}" ]]; then
+        echo "GPU ${gpu_id} compute PID ${process_pid} has disallowed or unresolved UID ${process_uid:-unknown} at ${stage}" >&2
+        return 1
+      fi
+    done <<< "${processes}"
   fi
   if [[ "${stage}" == immediately-before-launch ]]; then
     GPU_BASELINE_USED[${gpu_id}]="${memory_used}"
@@ -774,6 +805,8 @@ AUDIT_READY=1
 printf 'project=%s AReaL=%s GPUs=0,1,2,3,4,5,6,7 run_root=%s\n' \
   "${PROJECT_COMMIT}" "${ACTUAL_AREAL_COMMIT}" "${RUN_ROOT}" \
   | tee -a "${LOG_PATH}"
+printf 'allowed_existing_compute_uids=%s\n' \
+  "${ALLOWED_EXISTING_COMPUTE_UIDS:-none}" | tee -a "${LOG_PATH}"
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 HF_HUB_OFFLINE=1 \
