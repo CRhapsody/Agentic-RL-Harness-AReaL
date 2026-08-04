@@ -370,6 +370,12 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn('export PATH="${AREAL_VENV}/bin:${CUDA_HOME}/bin:${PATH}"', text)
         self.assertIn("-std=c++20", text)
         self.assertIn("mktemp --suffix=.o", text)
+        self.assertIn('realpath -e "${AREAL_VENV}/bin/python"', text)
+        self.assertIn(
+            '"${JPH_ROOT}/runtime/python/"*/bin/python3.12',
+            text,
+        )
+        self.assertIn('stat -c %u "${AREAL_PYTHON_REALPATH}"', text)
 
     def test_areal_b0_rejects_non_tmux_invocation_before_remote_setup(self) -> None:
         env = os.environ.copy()

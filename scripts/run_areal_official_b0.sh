@@ -64,7 +64,6 @@ fi
 for path in \
   "${JPH_PROJECT_DIR}/.git" \
   "${AREAL_REPO}/.git" \
-  "${AREAL_VENV}/bin/python" \
   "${CUDA_TOOLKIT_ROOT}/bin/nvcc" \
   "${MODEL_REPORT}" \
   "${DATASET_REPORT}"; do
@@ -73,6 +72,28 @@ for path in \
     exit 2
   fi
 done
+if [[ ! -d "${AREAL_VENV}" ]] || [[ -L "${AREAL_VENV}" ]] \
+  || [[ ! -x "${AREAL_VENV}/bin/python" ]]; then
+  echo "Missing or unsafe official B0 virtual environment: ${AREAL_VENV}" >&2
+  exit 2
+fi
+if ! AREAL_PYTHON_REALPATH="$(realpath -e "${AREAL_VENV}/bin/python")"; then
+  echo "Cannot resolve official B0 virtual-environment Python" >&2
+  exit 2
+fi
+case "${AREAL_PYTHON_REALPATH}" in
+  "${JPH_ROOT}/runtime/python/"*/bin/python3.12) ;;
+  *)
+    echo "Official B0 virtual-environment Python escapes pinned runtime: ${AREAL_PYTHON_REALPATH}" >&2
+    exit 2
+    ;;
+esac
+if [[ ! -f "${AREAL_PYTHON_REALPATH}" ]] \
+  || [[ -L "${AREAL_PYTHON_REALPATH}" ]] \
+  || [[ "$(stat -c %u "${AREAL_PYTHON_REALPATH}")" != "$(id -u)" ]]; then
+  echo "Official B0 resolved Python is not a caller-owned regular file" >&2
+  exit 2
+fi
 
 PROJECT_COMMIT="$(git -C "${JPH_PROJECT_DIR}" rev-parse HEAD)"
 ACTUAL_AREAL_COMMIT="$(git -C "${AREAL_REPO}" rev-parse HEAD)"
