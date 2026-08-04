@@ -20,7 +20,6 @@ from jphrl.trajectory.rlvr_online_binding import (
 from jphrl.trajectory.rlvr_workflow_admission import (
     load_rlvr_workflow_runner_admission_file,
 )
-from jphrl.trajectory.schema import JointVersion
 from scripts.write_m0_rlvr_estimator_template import (
     write_m0_rlvr_estimator_template,
 )
@@ -141,10 +140,7 @@ class RlvrOnlineBindingTests(unittest.TestCase):
     def test_crossed_pre_batch_interaction_and_secret_runtime_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            bridge, interaction, _ = self._stage(root)
-            interaction_id = bridge["interaction_adapter_sidecar"]["bindings"][0][
-                "interaction_id"
-            ]
+            _, interaction, _ = self._stage(root)
             binder = PersistentRlvrV2AgentPreBatchBinder(root / "journal")
             crossed = self._event(interaction, "crossed-interaction")
             with self.assertRaisesRegex(ValueError, "interaction"):
