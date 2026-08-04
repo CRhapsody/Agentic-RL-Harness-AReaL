@@ -31,6 +31,10 @@ from jphrl.training.production_checkpoint import (
 from jphrl.training.production_checkpoint import (
     _execute_live_continuation as execute_live_continuation,
 )
+from jphrl.training.production_checkpoint import (
+    _to_json_optimizer_state as to_json_optimizer_state,
+)
+from jphrl.training.production_checkpoint import _to_json_state as to_json_state
 from jphrl.trajectory.schema import JointVersion
 
 
@@ -267,6 +271,39 @@ def _resign(record: dict[str, object]) -> None:
 
 
 class ProductionCheckpointTests(unittest.TestCase):
+    def test_optimizer_state_canonicalization_preserves_integer_key_identity(
+        self,
+    ) -> None:
+        integer_key = to_json_optimizer_state(
+            {"state": {0: {"step": 1.0}}}
+        )
+        string_key = to_json_optimizer_state(
+            {"state": {"0": {"step": 1.0}}}
+        )
+
+        self.assertNotEqual(integer_key, string_key)
+        self.assertIn("str:state", integer_key)
+        self.assertIn("int:0", integer_key["str:state"])
+        with self.assertRaisesRegex(
+            ProductionCheckpointError,
+            "strings or non-negative integers",
+        ):
+            to_json_optimizer_state({"state": {-1: {}}})
+        with self.assertRaisesRegex(
+            ProductionCheckpointError,
+            "strings or non-negative integers",
+        ):
+            to_json_optimizer_state({"state": {True: {}}})
+
+    def test_runtime_state_contract_still_rejects_optimizer_integer_keys(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            ProductionCheckpointError,
+            "runtime state mapping keys must be strings",
+        ):
+            to_json_state({0: {"step": 1}})
+
     def _saved(self, root: Path) -> tuple[Path, SimpleNamespace]:
         project = root / "src" / "repo"
         project.mkdir(parents=True)

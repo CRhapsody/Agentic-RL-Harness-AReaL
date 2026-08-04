@@ -554,6 +554,53 @@ def _to_json_state(value: object) -> object:
     )
 
 
+def _to_json_optimizer_state(value: object) -> object:
+    """Canonically encode a PyTorch optimizer state without erasing key types.
+
+    ``Optimizer.state_dict()`` uses non-negative integer parameter identifiers in
+    its nested ``state`` mapping while its structural mappings use string keys.
+    JSON object keys cannot preserve that distinction on their own, so every key
+    is tagged before hashing.  Keeping this separate from ``_to_json_state``
+    leaves the stricter runtime/scheduler contract unchanged.
+    """
+
+    if isinstance(value, tuple):
+        return [_to_json_optimizer_state(item) for item in value]
+    if isinstance(value, list):
+        return [_to_json_optimizer_state(item) for item in value]
+    if isinstance(value, Mapping):
+        encoded: dict[str, object] = {}
+        for key, item in value.items():
+            if type(key) is str:
+                encoded_key = f"str:{key}"
+            elif type(key) is int and key >= 0:
+                encoded_key = f"int:{key}"
+            else:
+                raise ProductionCheckpointError(
+                    "optimizer state mapping keys must be strings or "
+                    "non-negative integers"
+                )
+            _require(
+                encoded_key not in encoded,
+                "optimizer state mapping keys collide after canonicalization",
+            )
+            encoded[encoded_key] = _to_json_optimizer_state(item)
+        return encoded
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "tolist"):
+        tensor = value.detach().cpu()
+        return {
+            "__torch_tensor__": True,
+            "dtype": str(tensor.dtype),
+            "shape": list(tensor.shape),
+            "data": tensor.tolist(),
+        }
+    raise ProductionCheckpointError(
+        f"optimizer state contains unsupported value {type(value).__qualname__}"
+    )
+
+
 def _nested_tuple(value: object) -> object:
     if isinstance(value, list):
         return tuple(_nested_tuple(item) for item in value)
@@ -2589,7 +2636,7 @@ def _execute_live_continuation(
         "live Harness optimizer did not change the parameter digest",
     )
     harness_optimizer_state_sha256 = _sha256(
-        _to_json_state(restored.harness_optimizer.state_dict())
+        _to_json_optimizer_state(restored.harness_optimizer.state_dict())
     )
     runtime_rng = capture_rank_runtime_state(
         rank=rank,
@@ -2947,8 +2994,8 @@ def _assert_live_harness_matches_checkpoint(
         and policy.update_step == restored_policy.update_step
         and policy.sample_count == restored_policy.sample_count
         and policy.training == restored_policy.training
-        and _sha256(_to_json_state(optimizer.state_dict()))
-        == _sha256(_to_json_state(restored_optimizer.state_dict()))
+        and _sha256(_to_json_optimizer_state(optimizer.state_dict()))
+        == _sha256(_to_json_optimizer_state(restored_optimizer.state_dict()))
         and policy._generator.get_state().cpu().tolist()
         == restored_policy._generator.get_state().cpu().tolist(),
         "live Harness candidate differs from its W checkpoint",
@@ -2999,7 +3046,7 @@ def _execute_distributed_harness_continuation(
         "parameter_digest_before": parameter_digest_before,
         "parameter_digest_after": parameter_digest_after,
         "optimizer_state_sha256": _sha256(
-            _to_json_state(optimizer.state_dict())
+            _to_json_optimizer_state(optimizer.state_dict())
         ),
         "generator_state_before_sha256": generator_state_before_sha256,
         "generator_state_after_sha256": _sha256(
