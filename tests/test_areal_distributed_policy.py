@@ -538,6 +538,63 @@ def _continuation_rank_receipts(
 
 
 class DistributedPolicyReceiptTests(unittest.TestCase):
+    def test_pending_candidate_state_is_complete_and_rank_receipt_bound(
+        self,
+    ) -> None:
+        scheduler = {"last_epoch": 1, "_step_count": 2}
+        manifest_sha256 = "a" * 64
+        rank_receipt = {
+            "candidate_dcp_manifest_sha256": manifest_sha256,
+            "parent_dcp_manifest_sha256": "b" * 64,
+            "optimizer_step_after": 2,
+            "lr_scheduler_state_after_sha256": _digest(scheduler),
+            "inference_engine_version": 7,
+            "record_sha256": "c" * 64,
+        }
+        pending = {
+            "parent_path": "/run/policy-parent.dcp",
+            "candidate_path": "/run/policy-candidate.dcp",
+            "candidate_manifest_sha256": manifest_sha256,
+            "optimizer_step_after": 2,
+            "scheduler_state_after": scheduler,
+            "rank_runtime_state": {"rank": 0},
+            "rank_receipt": rank_receipt,
+        }
+        self.assertIs(
+            distributed._validated_pending_m0_candidate_state(pending),
+            rank_receipt,
+        )
+
+        for field in (
+            "parent_path",
+            "candidate_path",
+            "candidate_manifest_sha256",
+            "optimizer_step_after",
+            "scheduler_state_after",
+            "rank_runtime_state",
+            "rank_receipt",
+        ):
+            changed = deepcopy(pending)
+            changed.pop(field)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ArealDistributedPolicyError,
+                "incomplete",
+            ):
+                distributed._validated_pending_m0_candidate_state(changed)
+
+        for field, value in (
+            ("candidate_manifest_sha256", "d" * 64),
+            ("optimizer_step_after", 3),
+            ("scheduler_state_after", {"last_epoch": 2, "_step_count": 3}),
+        ):
+            changed = deepcopy(pending)
+            changed[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ArealDistributedPolicyError,
+                "differs from its rank receipt",
+            ):
+                distributed._validated_pending_m0_candidate_state(changed)
+
     def test_w_candidate_checkpoint_requires_exact_pending_path_and_manifest(
         self,
     ) -> None:

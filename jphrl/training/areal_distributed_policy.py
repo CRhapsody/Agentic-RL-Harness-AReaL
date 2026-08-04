@@ -229,6 +229,40 @@ def _is_sha256(value: object) -> bool:
     )
 
 
+def _validated_pending_m0_candidate_state(
+    pending: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Require the complete worker-private T state before later mutations."""
+
+    rank_receipt = pending.get("rank_receipt")
+    scheduler_state_after = pending.get("scheduler_state_after")
+    rank_runtime_state = pending.get("rank_runtime_state")
+    optimizer_step_after = pending.get("optimizer_step_after")
+    _require(
+        isinstance(pending.get("parent_path"), str)
+        and bool(pending["parent_path"])
+        and isinstance(pending.get("candidate_path"), str)
+        and bool(pending["candidate_path"])
+        and _is_sha256(pending.get("candidate_manifest_sha256"))
+        and isinstance(optimizer_step_after, int)
+        and not isinstance(optimizer_step_after, bool)
+        and optimizer_step_after >= 0
+        and isinstance(scheduler_state_after, Mapping)
+        and isinstance(rank_runtime_state, Mapping)
+        and isinstance(rank_receipt, Mapping),
+        "pending M0 candidate state is incomplete",
+    )
+    _require(
+        rank_receipt.get("candidate_dcp_manifest_sha256")
+        == pending["candidate_manifest_sha256"]
+        and rank_receipt.get("optimizer_step_after") == optimizer_step_after
+        and rank_receipt.get("lr_scheduler_state_after_sha256")
+        == _sha256(scheduler_state_after),
+        "pending M0 candidate state differs from its rank receipt",
+    )
+    return rank_receipt
+
+
 def _is_git_commit(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -1929,6 +1963,7 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                 pending.get("transaction_id") == transaction_id,
                 "aggregate transaction differs from the pending worker state",
             )
+            rank_receipt = _validated_pending_m0_candidate_state(pending)
             path = require_within_configured_root(aggregate_path)
             _require(path.is_file() and not path.is_symlink(), "aggregate is missing")
             try:
@@ -1972,6 +2007,16 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                 and candidate_record["optimizer"]["remote_optimizer_receipt"]
                 == raw,
                 "persisted Policy candidate differs from its worker aggregate",
+            )
+            checkpoints = candidate_record["checkpoints"]
+            _require(
+                checkpoints["parent_path"] == pending["parent_path"]
+                and checkpoints["parent_manifest"]["manifest_sha256"]
+                == rank_receipt["parent_dcp_manifest_sha256"]
+                and checkpoints["candidate_path"] == pending["candidate_path"]
+                and checkpoints["candidate_manifest"]["manifest_sha256"]
+                == pending["candidate_manifest_sha256"],
+                "persisted Policy candidate checkpoints differ from T",
             )
             before = {
                 "actor_version": self.get_version(),
@@ -2023,13 +2068,14 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
             and isinstance(pending.get("policy_candidate_sha256"), str),
             "worker has no aggregate-bound pending M0 candidate",
         )
+        rank_receipt = _validated_pending_m0_candidate_state(pending)
         record: dict[str, object] = {
             "schema_version": "jph.m0-live-policy-worker-state.v1",
             "transaction_id": transaction_id,
             "worker_rank": rank,
             "aggregate_sha256": pending["aggregate_sha256"],
             "policy_candidate_sha256": pending["policy_candidate_sha256"],
-            "rank_receipt_sha256": pending["rank_receipt"]["record_sha256"],
+            "rank_receipt_sha256": rank_receipt["record_sha256"],
             "rank_runtime_state": deepcopy(pending["rank_runtime_state"]),
             "rank0_lr_scheduler_class": (
                 f"{type(self.lr_scheduler).__module__}."
@@ -2074,6 +2120,7 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
             and pending.get("post_export_candidate_state") is None,
             "serving export has no matching pending Policy candidate",
         )
+        rank_receipt = _validated_pending_m0_candidate_state(pending)
         request = {
             "transaction_id": transaction_id,
             "policy_candidate_sha256": policy_candidate_sha256,
@@ -2087,15 +2134,23 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
         self._require_group_common("serving export request", request)
         _require(SaveLoadMeta is not None, "AReaL SaveLoadMeta is unavailable")
         parent_dcp = require_within_configured_root(parent_dcp_path)
-        candidate_dcp = require_within_configured_root(candidate_dcp_path)
+        candidate_dcp = _validated_pending_w_candidate_path(
+            pending=pending,
+            candidate_path=candidate_dcp_path,
+            candidate_dcp_manifest_sha256=candidate_dcp_manifest_sha256,
+        )
         parent_export = require_within_configured_root(parent_export_path)
         candidate_export = require_within_configured_root(candidate_export_path)
         _require(
+            str(parent_dcp) == pending["parent_path"]
+            and parent_dcp_manifest_sha256
+            == rank_receipt.get("parent_dcp_manifest_sha256"),
+            "serving export parent DCP binding differs from T",
+        )
+        _require(
             checkpoint_manifest(parent_dcp)["manifest_sha256"]
-            == parent_dcp_manifest_sha256
-            and checkpoint_manifest(candidate_dcp)["manifest_sha256"]
-            == candidate_dcp_manifest_sha256,
-            "serving export DCP differs from T",
+            == parent_dcp_manifest_sha256,
+            "serving export parent DCP contents differ from T",
         )
         tokenizer = getattr(self, "tokenizer", None)
         _require(
@@ -2180,7 +2235,7 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                     isinstance(candidate_result, Mapping)
                     and _optimizer_step(self) == pending["optimizer_step_after"]
                     and _sha256(_lr_scheduler_state(self))
-                    == pending["rank_receipt"][
+                    == rank_receipt[
                         "lr_scheduler_state_after_sha256"
                     ],
                     "serving export did not restore the complete candidate state",
@@ -2513,6 +2568,7 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                     candidate_dcp_manifest_sha256
                 ),
             )
+            rank_receipt = _validated_pending_m0_candidate_state(pending)
             from .production_checkpoint import (
                 RankRuntimeState,
                 _assert_rank_rng_restored,
@@ -2537,11 +2593,22 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                 "distributed W rank runtime state is invalid",
             )
             _require(
+                rank_runtime_state == pending["rank_runtime_state"],
+                "distributed W rank runtime state differs from T",
+            )
+            _require(
                 _sha256(scheduler_state)
-                == pending["rank_receipt"][
+                == rank_receipt[
                     "lr_scheduler_state_after_sha256"
                 ],
                 "distributed W scheduler state differs from T",
+            )
+            _require(
+                expected_optimizer_step
+                == rank_receipt["optimizer_step_after"]
+                and actor_public_version
+                == rank_receipt["inference_engine_version"],
+                "distributed W optimizer/version identity differs from T",
             )
             if load_candidate:
                 _require(
@@ -2566,9 +2633,9 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
             _assert_rank_rng_restored(rank_runtime_state, harness_policy=None)
             _require(
                 _optimizer_step(self) == expected_optimizer_step
-                == pending["rank_receipt"]["optimizer_step_after"]
+                == rank_receipt["optimizer_step_after"]
                 and _sha256(_lr_scheduler_state(self))
-                == pending["rank_receipt"][
+                == rank_receipt[
                     "lr_scheduler_state_after_sha256"
                 ]
                 and self.get_version() == actor_public_version,
@@ -3399,6 +3466,7 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                     "scheduler_state_after": deepcopy(
                         update["scheduler_state_after"]
                     ),
+                    "optimizer_step_after": update["optimizer_step_after"],
                     "candidate_manifest_sha256": candidate_manifest[
                         "manifest_sha256"
                     ],
