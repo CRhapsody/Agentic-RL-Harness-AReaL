@@ -66,7 +66,7 @@ env -u JPH_M0_GPU_LOCK_FD JPH_ROOT="${JPH_ROOT}" LOCK_HELPER="${LOCK_HELPER}" \
     if jph_acquire_m0_gpu_lock 5; then
       exit 92
     fi
-  '
+  ' 9>&-
 """,
                 root=Path(directory),
             )
