@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import tempfile
 import unittest
@@ -303,6 +304,29 @@ class ProductionCheckpointTests(unittest.TestCase):
             "runtime state mapping keys must be strings",
         ):
             to_json_state({0: {"step": 1}})
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is unavailable")
+    def test_real_adam_state_round_trip_has_stable_canonical_digest(self) -> None:
+        import torch
+
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.Adam([parameter], lr=0.01)
+        parameter.grad = torch.tensor([0.5])
+        optimizer.step()
+        state = optimizer.state_dict()
+
+        self.assertTrue(state["state"])
+        self.assertTrue(all(type(key) is int for key in state["state"]))
+        encoded = to_json_optimizer_state(state)
+        json.dumps(encoded, allow_nan=False, sort_keys=True)
+
+        restored_parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        restored_optimizer = torch.optim.Adam([restored_parameter], lr=0.01)
+        restored_optimizer.load_state_dict(state)
+        self.assertEqual(
+            encoded,
+            to_json_optimizer_state(restored_optimizer.state_dict()),
+        )
 
     def _saved(self, root: Path) -> tuple[Path, SimpleNamespace]:
         project = root / "src" / "repo"
