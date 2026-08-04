@@ -2290,7 +2290,12 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                 meta=SaveLoadMeta(
                     path=str(source),
                     weight_format="dcp",
-                    with_optim=True,
+                    # HF serving export consumes weights only.  Loading the
+                    # pre-update parent optimizer can erase the live AdamW
+                    # state layout and make the following candidate optimizer
+                    # load fail.  Restore the complete candidate exactly once
+                    # after both weight-only exports instead.
+                    with_optim=False,
                 )
             )
             self.save(
@@ -2325,40 +2330,43 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
             self._require_group_common("candidate HF export", candidate_result)
         except BaseException as exc:
             export_error = exc
-        finally:
 
-            def _restore_candidate() -> None:
-                from .production_checkpoint import (
-                    _assert_rank_rng_restored,
-                    _restore_rank_rng,
-                )
+        def _restore_candidate() -> None:
+            from .production_checkpoint import (
+                _assert_rank_rng_restored,
+                _restore_rank_rng,
+            )
 
-                self.load(
-                    meta=SaveLoadMeta(
-                        path=str(candidate_dcp),
-                        weight_format="dcp",
-                        with_optim=True,
-                    )
+            self.load(
+                meta=SaveLoadMeta(
+                    path=str(candidate_dcp),
+                    weight_format="dcp",
+                    with_optim=True,
                 )
-                _restore_lr_scheduler_state(
-                    self,
-                    pending["scheduler_state_after"],  # type: ignore[arg-type]
-                )
-                rank_runtime_state = pending["rank_runtime_state"]
+            )
+            _restore_lr_scheduler_state(
+                self,
+                pending["scheduler_state_after"],  # type: ignore[arg-type]
+            )
+            rank_runtime_state = pending["rank_runtime_state"]
+            _require(
+                isinstance(rank_runtime_state, Mapping),
+                "serving export candidate RNG source is missing",
+            )
+            _restore_rank_rng(rank_runtime_state, harness_policy=None)
+            _assert_rank_rng_restored(rank_runtime_state, harness_policy=None)
+            _require(
+                _optimizer_step(self) == pending["optimizer_step_after"]
+                and _sha256(_lr_scheduler_state(self))
+                == rank_receipt[
+                    "lr_scheduler_state_after_sha256"
+                ],
+                "serving export did not restore the complete candidate state",
+            )
+            if export_error is None:
                 _require(
-                    isinstance(rank_runtime_state, Mapping),
-                    "serving export candidate RNG source is missing",
-                )
-                _restore_rank_rng(rank_runtime_state, harness_policy=None)
-                _assert_rank_rng_restored(rank_runtime_state, harness_policy=None)
-                _require(
-                    isinstance(candidate_result, Mapping)
-                    and _optimizer_step(self) == pending["optimizer_step_after"]
-                    and _sha256(_lr_scheduler_state(self))
-                    == rank_receipt[
-                        "lr_scheduler_state_after_sha256"
-                    ],
-                    "serving export did not restore the complete candidate state",
+                    isinstance(candidate_result, Mapping),
+                    "successful serving export has no candidate result",
                 )
                 pending["post_export_candidate_state"] = {
                     "candidate_dcp_manifest_sha256": (
@@ -2375,10 +2383,24 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                     "collective_export_rank_receipt_sha256": None,
                 }
 
+        restore_error: BaseException | None = None
+        try:
             self._run_group_phase(
                 "candidate restore after serving export",
                 _restore_candidate,
             )
+        except BaseException as exc:
+            restore_error = exc
+        if restore_error is not None:
+            if export_error is not None:
+                raise ArealDistributedPolicyError(
+                    "collective serving export failed ("
+                    + _exception_summary(export_error)
+                    + ") and candidate restore also failed ("
+                    + _exception_summary(restore_error)
+                    + ")"
+                ) from restore_error
+            raise restore_error
         if export_error is not None:
             raise export_error
         _require(

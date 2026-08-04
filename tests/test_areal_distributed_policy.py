@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -59,6 +60,208 @@ def _digest(value: object) -> str:
 
 
 class ExactRecoveryCudaRuntimeTests(unittest.TestCase):
+    def test_serving_exports_load_weights_only_then_restore_full_candidate(self) -> None:
+        source = inspect.getsource(
+            distributed.JPHFSDPPPOActor.materialize_m0_serving_export_pair
+        )
+        export_one = source.split("def _export_one", 1)[1].split(
+            "export_error:", 1
+        )[0]
+        restore_candidate = source.split("def _restore_candidate", 1)[1]
+
+        self.assertIn("with_optim=False", export_one)
+        self.assertNotIn("with_optim=True", export_one)
+        self.assertIn("with_optim=True", restore_candidate)
+        self.assertIn("restore_error", restore_candidate)
+        self.assertIn("and candidate restore also failed", restore_candidate)
+
+    def test_serving_export_restore_error_matrix_is_fail_closed(self) -> None:
+        from jphrl.training import areal_production_worker
+        from jphrl.training import production_checkpoint
+
+        parent_manifest = "a" * 64
+        candidate_manifest = "b" * 64
+        scheduler_state = {"last_epoch": 1, "_step_count": 2}
+        rank_runtime_state = {"rank": 0, "python_random_state": "state"}
+        rank_receipt = {
+            "parent_dcp_manifest_sha256": parent_manifest,
+            "candidate_dcp_manifest_sha256": candidate_manifest,
+            "optimizer_step_after": 2,
+            "lr_scheduler_state_after_sha256": _digest(scheduler_state),
+        }
+
+        for failure_mode in (None, "export", "restore", "both"):
+            with self.subTest(failure_mode=failure_mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                parent = root / "parent.dcp"
+                candidate = root / "candidate.dcp"
+                parent_export = root / "parent-hf"
+                candidate_export = root / "candidate-hf"
+                actor = object.__new__(distributed.JPHFSDPPPOActor)
+                actor.tokenizer = SimpleNamespace(save_pretrained=Mock())
+                actor.processor = None
+                actor._require_group_common = Mock()
+                actor.load = Mock()
+                actor.save = Mock()
+                actor._jph_pending_m0_transaction = {
+                    "transaction_id": "tx",
+                    "policy_candidate_sha256": "c" * 64,
+                    "parent_path": str(parent),
+                    "scheduler_state_after": scheduler_state,
+                    "optimizer_step_after": 2,
+                    "rank_runtime_state": rank_runtime_state,
+                    "post_export_candidate_state": None,
+                }
+                phases: list[str] = []
+
+                def run_phase(name, operation):
+                    phases.append(name)
+                    if name.startswith("parent collective") and failure_mode in {
+                        "export",
+                        "both",
+                    }:
+                        raise ValueError("export boom")
+                    if name.startswith("candidate restore") and failure_mode in {
+                        "restore",
+                        "both",
+                    }:
+                        raise RuntimeError("restore boom")
+                    return operation()
+
+                actor._run_group_phase = Mock(side_effect=run_phase)
+
+                with (
+                    patch.object(
+                        distributed,
+                        "SaveLoadMeta",
+                        new=lambda **kwargs: SimpleNamespace(**kwargs),
+                    ),
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "torch": SimpleNamespace(
+                                distributed=SimpleNamespace(
+                                    get_rank=Mock(return_value=0)
+                                )
+                            ),
+                            "torch.distributed": SimpleNamespace(
+                                get_rank=Mock(return_value=0)
+                            ),
+                        },
+                    ),
+                    patch.object(
+                        distributed,
+                        "require_within_configured_root",
+                        side_effect=lambda value: Path(value),
+                    ),
+                    patch.object(
+                        distributed,
+                        "_validated_pending_m0_candidate_state",
+                        return_value=rank_receipt,
+                    ),
+                    patch.object(
+                        distributed,
+                        "_validated_pending_w_candidate_path",
+                        return_value=candidate,
+                    ),
+                    patch.object(
+                        distributed,
+                        "checkpoint_manifest",
+                        return_value={"manifest_sha256": parent_manifest},
+                    ),
+                    patch.object(distributed, "_optimizer_step", return_value=2),
+                    patch.object(
+                        distributed,
+                        "_lr_scheduler_state",
+                        return_value=scheduler_state,
+                    ),
+                    patch.object(distributed, "_restore_lr_scheduler_state"),
+                    patch.object(production_checkpoint, "_restore_rank_rng"),
+                    patch.object(
+                        production_checkpoint, "_assert_rank_rng_restored"
+                    ),
+                    patch.object(
+                        areal_production_worker,
+                        "_directory_manifest",
+                        return_value={"files": [], "manifest_sha256": "d" * 64},
+                    ),
+                    patch.object(
+                        areal_production_worker,
+                        "_load_safetensor_export",
+                        side_effect=lambda path: Path(path),
+                    ),
+                    patch.object(
+                        areal_production_worker,
+                        "_parameter_digest",
+                        side_effect=lambda path: (
+                            "e" * 64 if Path(path) == parent_export else "f" * 64
+                        ),
+                    ),
+                ):
+                    if failure_mode is None:
+                        receipt = actor.materialize_m0_serving_export_pair(
+                            transaction_id="tx",
+                            policy_candidate_sha256="c" * 64,
+                            parent_dcp_path=str(parent),
+                            parent_dcp_manifest_sha256=parent_manifest,
+                            candidate_dcp_path=str(candidate),
+                            candidate_dcp_manifest_sha256=candidate_manifest,
+                            parent_export_path=str(parent_export),
+                            candidate_export_path=str(candidate_export),
+                        )
+                        self.assertTrue(
+                            receipt["evidence_scope"]["candidate_dcp_restored"]
+                        )
+                        self.assertIsInstance(
+                            actor._jph_pending_m0_transaction[
+                                "post_export_candidate_state"
+                            ],
+                            dict,
+                        )
+                    else:
+                        expected = (
+                            "collective serving export failed.*candidate restore also failed"
+                            if failure_mode == "both"
+                            else (
+                                "export boom"
+                                if failure_mode == "export"
+                                else "restore boom"
+                            )
+                        )
+                        with self.assertRaisesRegex(Exception, expected):
+                            actor.materialize_m0_serving_export_pair(
+                                transaction_id="tx",
+                                policy_candidate_sha256="c" * 64,
+                                parent_dcp_path=str(parent),
+                                parent_dcp_manifest_sha256=parent_manifest,
+                                candidate_dcp_path=str(candidate),
+                                candidate_dcp_manifest_sha256=candidate_manifest,
+                                parent_export_path=str(parent_export),
+                                candidate_export_path=str(candidate_export),
+                            )
+                        self.assertIsNone(
+                            actor._jph_pending_m0_transaction[
+                                "post_export_candidate_state"
+                            ]
+                        )
+
+                load_modes = [
+                    call.kwargs["meta"].with_optim
+                    for call in actor.load.call_args_list
+                ]
+                if failure_mode is None:
+                    self.assertEqual(load_modes, [False, False, True])
+                elif failure_mode == "export":
+                    self.assertEqual(load_modes, [True])
+                elif failure_mode == "restore":
+                    self.assertEqual(load_modes, [False, False])
+                else:
+                    self.assertEqual(load_modes, [])
+                self.assertIn(
+                    "candidate restore after serving export",
+                    phases,
+                )
+
     def test_runtime_requires_launcher_environment_before_torch_setup(self) -> None:
         with (
             patch.dict(
