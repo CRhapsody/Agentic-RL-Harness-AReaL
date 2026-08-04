@@ -38,6 +38,7 @@ from jphrl.experiments.m0_eight_gpu_real_adapter import (
     _bind_pinned_areal_child_environment,
     _commit_actor_with_y_compensation,
     _validate_y_actor_terminal_receipts,
+    build_distributed_rollout_config,
 )
 from jphrl.training.joint_activation import (
     ProductionProbeSpec,
@@ -536,6 +537,44 @@ class IntegratedPreflightTests(unittest.TestCase):
 
 
 class RealAdapterCleanupTests(unittest.TestCase):
+    def test_rollout_capacity_admits_both_frozen_version_zero_batches(self) -> None:
+        class ConfigRecord:
+            def __init__(self, **kwargs: object) -> None:
+                self.__dict__.update(kwargs)
+
+        areal_module = ModuleType("areal")
+        areal_api_module = ModuleType("areal.api")
+        cli_args_module = ModuleType("areal.api.cli_args")
+        cli_args_module.InferenceEngineConfig = ConfigRecord
+        cli_args_module.SchedulingSpec = ConfigRecord
+        config = SimpleNamespace(
+            validate=Mock(),
+            experiment_name="m0",
+            trial_name="capacity-regression",
+            run_root=Path("/outside-repository/run"),
+            model_snapshot=Path("/outside-repository/model"),
+            admin_api_key="a" * 32,
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "areal": areal_module,
+                "areal.api": areal_api_module,
+                "areal.api.cli_args": cli_args_module,
+            },
+        ):
+            rollout = build_distributed_rollout_config(config)
+
+        config.validate.assert_called_once_with()
+        self.assertEqual(rollout.consumer_batch_size, 4)
+        self.assertEqual(rollout.max_concurrent_rollouts, 8)
+        self.assertEqual(rollout.max_head_offpolicyness, 1)
+        self.assertEqual(
+            (rollout.max_head_offpolicyness + 1)
+            * rollout.consumer_batch_size,
+            rollout.max_concurrent_rollouts,
+        )
+
     def test_actor_initialize_forwards_required_engine_addr_by_keyword(self) -> None:
         class FinetuneSpec:
             def __init__(self, **kwargs: object) -> None:

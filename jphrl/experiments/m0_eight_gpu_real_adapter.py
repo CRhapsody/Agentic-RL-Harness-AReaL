@@ -633,7 +633,13 @@ def build_distributed_rollout_config(config: RealEightGPUAdapterConfig) -> objec
         fileroot=str(config.run_root / "scheduler"),
         max_concurrent_rollouts=8,
         consumer_batch_size=4,
-        max_head_offpolicyness=0,
+        # The formal M0 transaction freezes eight version-0 rollouts before
+        # splitting them into four training and four held-out episodes.  A
+        # zero head allowance caps accepted+running at one consumer batch and
+        # permanently prevents the second half from being scheduled before
+        # the first optimizer update.  One extra head batch admits exactly
+        # the two frozen batches while preserving the eight-rollout ceiling.
+        max_head_offpolicyness=1,
         enable_rollout_tracing=False,
         check_trajectory_format=False,
         tokenizer_path=str(config.model_snapshot),
@@ -661,6 +667,9 @@ def build_distributed_rollout_config(config: RealEightGPUAdapterConfig) -> objec
         and value._version == "v2"
         and value.max_concurrent_rollouts == 8
         and value.consumer_batch_size == 4
+        and value.max_head_offpolicyness == 1
+        and (value.max_head_offpolicyness + 1) * value.consumer_batch_size
+        == value.max_concurrent_rollouts
         and len(value.scheduling_spec) == 1
         and value.scheduling_spec[0].gpu == 1,
         "distributed rollout config differs from sglang:d4 DataProxy",
