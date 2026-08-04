@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 from torch import Tensor, nn
 
-from jphrl.paths import require_within_configured_root
+from jphrl.paths import require_outside_repository
 from jphrl.trajectory.joint_credit_alignment import (
     JointCreditAlignmentError,
     validate_frozen_joint_credit_alignment,
@@ -48,6 +48,16 @@ _HARNESS_EVIDENCE_SCOPE = {
     "rng_state_persisted": True,
     "policy_optimizer_update": False,
     "harness_optimizer_update": True,
+}
+_CHECKPOINT_METRIC_FIELDS = {
+    "batch_size",
+    "effective_batch_size",
+    "loss",
+    "mean_ratio",
+    "clip_fraction",
+    "gradient_norm",
+    "parameter_digest_before",
+    "parameter_digest_after",
 }
 
 
@@ -340,6 +350,110 @@ class TorchHarnessPolicy(nn.Module):
         return candidate
 
 
+def _adam_step(value: object, *, label: str) -> int:
+    if isinstance(value, Tensor):
+        _require(
+            value.numel() == 1 and bool(torch.isfinite(value).all()),
+            f"{label} must be one finite scalar",
+        )
+        numeric = float(value.detach().cpu().item())
+    else:
+        _require(
+            isinstance(value, (int, float)) and not isinstance(value, bool),
+            f"{label} must be numeric",
+        )
+        numeric = float(value)
+    _require(
+        math.isfinite(numeric) and numeric >= 0.0 and numeric.is_integer(),
+        f"{label} must be a non-negative integer",
+    )
+    return int(numeric)
+
+
+def _validate_adam_optimizer_state(
+    policy: TorchHarnessPolicy,
+    optimizer: torch.optim.Adam,
+    *,
+    allow_uninitialized_step_zero: bool,
+) -> int:
+    """Bind one independent Adam state to every parameter and policy step."""
+
+    _require(
+        type(policy) is TorchHarnessPolicy,
+        "Harness Adam state requires TorchHarnessPolicy",
+    )
+    _require(
+        type(optimizer) is torch.optim.Adam and len(optimizer.param_groups) == 1,
+        "Harness optimizer must be one independent Adam parameter group",
+    )
+    _require(
+        type(policy.update_step) is int and policy.update_step >= 0,
+        "Harness policy update step is invalid",
+    )
+    parameters = tuple(policy.parameters())
+    group = optimizer.param_groups[0]
+    group_parameters = tuple(group.get("params", ()))
+    _require(
+        len(group_parameters) == len(parameters)
+        and all(
+            actual is expected for actual, expected in zip(group_parameters, parameters)
+        ),
+        "Harness Adam parameters differ from the policy",
+    )
+    learning_rate = group.get("lr")
+    _require(
+        isinstance(learning_rate, (int, float))
+        and not isinstance(learning_rate, bool)
+        and math.isfinite(float(learning_rate))
+        and float(learning_rate) > 0.0,
+        "Harness Adam learning rate must be finite and positive",
+    )
+    _require(
+        not bool(group.get("amsgrad", False)),
+        "Harness Adam checkpoint unexpectedly enables AMSGrad",
+    )
+
+    if not optimizer.state:
+        _require(
+            allow_uninitialized_step_zero and policy.update_step == 0,
+            "Harness policy after step zero requires persisted Adam state",
+        )
+        return 0
+
+    _require(
+        policy.update_step > 0,
+        "initialized Harness Adam state cannot belong to step zero",
+    )
+    _require(
+        {id(parameter) for parameter in optimizer.state}
+        == {id(parameter) for parameter in parameters},
+        "Harness Adam state does not cover every policy parameter exactly once",
+    )
+    observed_steps: set[int] = set()
+    for parameter in parameters:
+        state = optimizer.state.get(parameter)
+        _require(
+            isinstance(state, Mapping)
+            and set(state) == {"step", "exp_avg", "exp_avg_sq"},
+            "Harness Adam parameter state field set differs",
+        )
+        observed_steps.add(_adam_step(state["step"], label="Harness Adam step"))
+        for name in ("exp_avg", "exp_avg_sq"):
+            moment = state[name]
+            _require(
+                isinstance(moment, Tensor)
+                and moment.shape == parameter.shape
+                and moment.dtype == parameter.dtype
+                and bool(torch.isfinite(moment).all()),
+                f"Harness Adam {name} differs from its policy parameter",
+            )
+    _require(
+        observed_steps == {policy.update_step},
+        "Harness Adam step differs from the policy update step",
+    )
+    return policy.update_step
+
+
 def _json_tensor_record(value: Tensor) -> dict[str, object]:
     tensor = value.detach().cpu().contiguous()
     _require(
@@ -630,13 +744,18 @@ def validate_torch_harness_update_evidence(
         type(step_before) is int and step_before >= 0 and step_after == step_before + 1,
         "Harness candidate optimizer step did not advance exactly once",
     )
+    expected_behavior_version = (
+        f"{POLICY_SCHEMA_VERSION}-step{step_before:06d}-{before_digest[:16]}"
+    )
     expected_candidate_version = (
         f"{POLICY_SCHEMA_VERSION}-step{step_after:06d}-{after_digest[:16]}"
     )
     _require(
-        record.get("candidate_version") == expected_candidate_version
+        record.get("behavior_version") == expected_behavior_version
+        and record.get("behavior_version") == parent_joint_version.harness_controller
+        and record.get("candidate_version") == expected_candidate_version
         and record.get("candidate_version") != record.get("behavior_version"),
-        "Harness candidate version differs from its parameter digest",
+        "Harness behavior or candidate version differs from its parameter digest",
     )
     batch_size = record.get("batch_size")
     effective_batch_size = record.get("effective_batch_size")
@@ -669,7 +788,12 @@ def validate_torch_harness_update_evidence(
         "Harness candidate checkpoint identity is invalid",
     )
     if require_checkpoint:
-        path = require_within_configured_root(checkpoint_path)
+        unresolved_path = Path(checkpoint_path).expanduser()
+        _require(
+            not unresolved_path.is_symlink(),
+            "Harness candidate checkpoint is missing or unsafe",
+        )
+        path = require_outside_repository(checkpoint_path)
         _require(
             path.is_file() and not path.is_symlink(),
             "Harness candidate checkpoint is missing or unsafe",
@@ -677,6 +801,39 @@ def validate_torch_harness_update_evidence(
         _require(
             _checkpoint_sha256(path) == checkpoint_sha256,
             "Harness candidate checkpoint hash mismatch",
+        )
+        restored_policy, restored_optimizer, checkpoint = load_torch_harness_checkpoint(
+            path, map_location="cpu"
+        )
+        del restored_optimizer  # fully checked by the checkpoint loader
+        source = checkpoint["source"]
+        metrics = checkpoint["update_metrics"]
+        _require(
+            restored_policy.version == record.get("candidate_version")
+            and restored_policy.parameter_digest == after_digest
+            and restored_policy.update_step == step_after,
+            "Harness candidate checkpoint model differs from evidence",
+        )
+        _require(
+            source["joint_credit_record_sha256"]
+            == record.get("source_joint_credit_sha256")
+            and source["parent_joint_version_id"]
+            == record.get("parent_joint_version_id"),
+            "Harness candidate checkpoint source differs from evidence",
+        )
+        _require(
+            metrics
+            == {
+                "batch_size": batch_size,
+                "effective_batch_size": effective_batch_size,
+                "loss": record["loss"],
+                "mean_ratio": record["mean_ratio"],
+                "clip_fraction": record["clip_fraction"],
+                "gradient_norm": record["gradient_norm"],
+                "parameter_digest_before": before_digest,
+                "parameter_digest_after": after_digest,
+            },
+            "Harness candidate checkpoint metrics differ from evidence",
         )
     _require(
         record.get("evidence_scope") == _HARNESS_EVIDENCE_SCOPE,
@@ -696,8 +853,14 @@ def validate_torch_harness_update_evidence(
 def _safe_torch_load(path: Path, *, map_location: str | torch.device) -> object:
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
-    except TypeError:  # torch < 2.0 has no weights_only argument
-        return torch.load(path, map_location=map_location)
+    except TypeError as exc:
+        raise TorchHarnessLearningError(
+            "safe Harness checkpoint loading requires torch.load(weights_only=True)"
+        ) from exc
+    except Exception as exc:
+        raise TorchHarnessLearningError(
+            "cannot safely load Harness checkpoint"
+        ) from exc
 
 
 def _checkpoint_payload(
@@ -748,10 +911,19 @@ def load_torch_harness_checkpoint(
 ) -> tuple[TorchHarnessPolicy, torch.optim.Adam, dict[str, object]]:
     """Load and self-validate model, Adam state, and owned sampling RNG."""
 
-    path = Path(checkpoint_path)
-    _require(path.is_file(), "Harness checkpoint does not exist")
+    unresolved_path = Path(checkpoint_path).expanduser()
+    _require(
+        not unresolved_path.is_symlink(),
+        "Harness checkpoint does not exist or is unsafe",
+    )
+    path = require_outside_repository(checkpoint_path)
+    _require(
+        path.is_file() and not path.is_symlink(),
+        "Harness checkpoint does not exist or is unsafe",
+    )
     raw = _safe_torch_load(path, map_location=map_location)
     _require(isinstance(raw, Mapping), "Harness checkpoint must be an object")
+    _assert_no_secret_fields(raw, "checkpoint")
     required = {
         "schema_version",
         "policy_schema_version",
@@ -784,7 +956,12 @@ def load_torch_harness_checkpoint(
     metadata = raw["policy_metadata"]
     rng = raw["rng"]
     _require(
-        isinstance(config, Mapping) and set(config) == {"seed", "hidden_size"},
+        isinstance(config, Mapping)
+        and set(config) == {"seed", "hidden_size"}
+        and type(config.get("seed")) is int
+        and config["seed"] >= 0
+        and type(config.get("hidden_size")) is int
+        and config["hidden_size"] > 0,
         "Harness checkpoint policy config differs",
     )
     _require(
@@ -792,6 +969,15 @@ def load_torch_harness_checkpoint(
         and set(metadata)
         == {"update_step", "sample_count", "version", "parameter_digest"},
         "Harness checkpoint policy metadata differs",
+    )
+    _require(
+        type(metadata.get("update_step")) is int
+        and metadata["update_step"] > 0
+        and type(metadata.get("sample_count")) is int
+        and metadata["sample_count"] >= 0
+        and isinstance(metadata.get("version"), str)
+        and _is_sha256(metadata.get("parameter_digest")),
+        "Harness checkpoint policy metadata values are invalid",
     )
     _require(
         isinstance(rng, Mapping)
@@ -804,14 +990,49 @@ def load_torch_harness_checkpoint(
         "Harness checkpoint RNG state differs",
     )
     policy = TorchHarnessPolicy(
-        seed=int(config["seed"]),
-        hidden_size=int(config["hidden_size"]),
+        seed=config["seed"],
+        hidden_size=config["hidden_size"],
     )
-    policy.load_state_dict(raw["model_state_dict"], strict=True)
+    model_state = raw["model_state_dict"]
+    expected_state = policy.state_dict()
+    _require(
+        isinstance(model_state, Mapping) and set(model_state) == set(expected_state),
+        "Harness checkpoint model parameter names differ",
+    )
+    for name, expected in expected_state.items():
+        value = model_state[name]
+        _require(
+            isinstance(value, Tensor)
+            and value.shape == expected.shape
+            and value.dtype == expected.dtype
+            and bool(torch.isfinite(value).all()),
+            f"Harness checkpoint model parameter {name} is invalid",
+        )
+    policy.load_state_dict(model_state, strict=True)
     policy.to(map_location)
-    policy.update_step = int(metadata["update_step"])
-    policy.sample_count = int(metadata["sample_count"])
-    policy._generator.set_state(rng["policy_generator_state"].cpu())
+    policy.update_step = metadata["update_step"]
+    policy.sample_count = metadata["sample_count"]
+    policy_generator_state = rng["policy_generator_state"]
+    torch_cpu_rng_state = rng["torch_cpu_rng_state"]
+    _require(
+        isinstance(policy_generator_state, Tensor)
+        and policy_generator_state.dtype == torch.uint8
+        and policy_generator_state.ndim == 1
+        and policy_generator_state.numel() > 0
+        and isinstance(torch_cpu_rng_state, Tensor)
+        and torch_cpu_rng_state.dtype == torch.uint8
+        and torch_cpu_rng_state.ndim == 1
+        and torch_cpu_rng_state.numel() > 0
+        and isinstance(rng["torch_cuda_rng_states"], list)
+        and not rng["torch_cuda_rng_states"],
+        "Harness checkpoint RNG state is invalid",
+    )
+    try:
+        policy._generator.set_state(policy_generator_state.cpu())
+    except RuntimeError as exc:
+        raise TorchHarnessLearningError(
+            "Harness checkpoint policy RNG cannot be restored"
+        ) from exc
     _require(
         policy.parameter_digest == metadata["parameter_digest"],
         "Harness checkpoint parameter digest mismatch",
@@ -827,22 +1048,56 @@ def load_torch_harness_checkpoint(
         "Harness checkpoint optimizer state is missing",
     )
     optimizer = torch.optim.Adam(policy.parameters(), lr=1.0)
-    optimizer.load_state_dict(optimizer_state)
-    _require(bool(optimizer.state), "Harness checkpoint Adam state is empty")
-    _require(
-        isinstance(rng["torch_cpu_rng_state"], Tensor)
-        and isinstance(rng["torch_cuda_rng_states"], list)
-        and all(isinstance(state, Tensor) for state in rng["torch_cuda_rng_states"]),
-        "Harness checkpoint process RNG state is invalid",
+    try:
+        optimizer.load_state_dict(optimizer_state)
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+        raise TorchHarnessLearningError(
+            "Harness checkpoint Adam state cannot be restored"
+        ) from exc
+    _validate_adam_optimizer_state(
+        policy,
+        optimizer,
+        allow_uninitialized_step_zero=False,
     )
     source = raw["source"]
     metrics = raw["update_metrics"]
     _require(
         isinstance(source, Mapping)
-        and set(source) == {"joint_credit_record_sha256", "parent_joint_version_id"},
+        and set(source) == {"joint_credit_record_sha256", "parent_joint_version_id"}
+        and _is_sha256(source.get("joint_credit_record_sha256"))
+        and isinstance(source.get("parent_joint_version_id"), str)
+        and bool(source["parent_joint_version_id"]),
         "Harness checkpoint source identity differs",
     )
-    _require(isinstance(metrics, Mapping), "Harness checkpoint metrics are missing")
+    _require(
+        isinstance(metrics, Mapping) and set(metrics) == _CHECKPOINT_METRIC_FIELDS,
+        "Harness checkpoint metrics field set differs",
+    )
+    batch_size = metrics.get("batch_size")
+    effective_batch_size = metrics.get("effective_batch_size")
+    _require(
+        type(batch_size) is int
+        and type(effective_batch_size) is int
+        and 0 < effective_batch_size <= batch_size,
+        "Harness checkpoint batch sizes are invalid",
+    )
+    for name in ("loss", "mean_ratio", "clip_fraction", "gradient_norm"):
+        value = metrics.get(name)
+        _require(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value)),
+            f"Harness checkpoint metric {name} is invalid",
+        )
+    _require(
+        float(metrics["mean_ratio"]) > 0.0
+        and 0.0 <= float(metrics["clip_fraction"]) <= 1.0
+        and float(metrics["gradient_norm"]) > 0.0
+        and _is_sha256(metrics.get("parameter_digest_before"))
+        and metrics.get("parameter_digest_after") == policy.parameter_digest
+        and metrics["parameter_digest_before"] != metrics["parameter_digest_after"],
+        "Harness checkpoint optimizer metrics are inconsistent",
+    )
     return policy, optimizer, dict(raw)
 
 
@@ -885,12 +1140,27 @@ class TorchHarnessOptimizer:
             and len(self.optimizer.param_groups) == 1,
             "Harness optimizer must be one independent Adam parameter group",
         )
+        _validate_adam_optimizer_state(
+            self.policy,
+            self.optimizer,
+            allow_uninitialized_step_zero=True,
+        )
 
     def _candidate(self) -> tuple[TorchHarnessPolicy, torch.optim.Adam]:
+        _validate_adam_optimizer_state(
+            self.policy,
+            self.optimizer,
+            allow_uninitialized_step_zero=True,
+        )
         candidate = self.policy.clone()
         learning_rate = float(self.optimizer.param_groups[0]["lr"])
         optimizer = torch.optim.Adam(candidate.parameters(), lr=learning_rate)
         optimizer.load_state_dict(deepcopy(self.optimizer.state_dict()))
+        _validate_adam_optimizer_state(
+            candidate,
+            optimizer,
+            allow_uninitialized_step_zero=True,
+        )
         return candidate, optimizer
 
     def update_from_frozen_joint_credit(
@@ -926,7 +1196,7 @@ class TorchHarnessOptimizer:
             audit["joint_version_id"] == active_joint_version.version_id,
             "S audit differs from lag-zero JointVersion",
         )
-        target = require_within_configured_root(checkpoint_path)
+        target = require_outside_repository(checkpoint_path)
         _require(not target.exists(), "Harness checkpoint path already exists")
         target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1098,6 +1368,11 @@ class TorchHarnessOptimizer:
         torch.nn.utils.clip_grad_norm_(candidate.parameters(), self.max_grad_norm)
         optimizer.step()
         candidate.update_step = self.policy.update_step + 1
+        _validate_adam_optimizer_state(
+            candidate,
+            optimizer,
+            allow_uninitialized_step_zero=False,
+        )
         parameter_digest_after = candidate.parameter_digest
         _require(
             parameter_digest_after != parameter_digest_before,
@@ -1107,8 +1382,6 @@ class TorchHarnessOptimizer:
             candidate.version != self.policy.version,
             "Harness candidate version did not advance",
         )
-        _require(bool(optimizer.state), "Harness Adam state is empty after update")
-
         mean_ratio = float(ratio.detach().mean().item())
         clip_fraction = float(
             ((ratio.detach() - 1.0).abs() > self.clip_ratio).float().mean().item()

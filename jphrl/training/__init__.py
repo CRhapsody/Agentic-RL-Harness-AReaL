@@ -16,6 +16,7 @@ from .areal_policy_optimizer import (
     build_areal_external_advantage_batch,
     materialize_areal_ppo_update_tensors,
     validate_areal_external_advantage_batch,
+    validate_areal_policy_optimizer_source,
     validate_m0_areal_actor_config,
 )
 
@@ -33,5 +34,6 @@ __all__ = [
     "run_areal_policy_candidate_update",
     "validate_areal_external_advantage_batch",
     "validate_areal_policy_candidate",
+    "validate_areal_policy_optimizer_source",
     "validate_m0_areal_actor_config",
 ]

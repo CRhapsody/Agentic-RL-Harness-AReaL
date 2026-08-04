@@ -5,6 +5,7 @@ import json
 import math
 import os
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -15,11 +16,11 @@ from jphrl.trajectory.schema import JointVersion
 
 from .areal_policy_optimizer import (
     materialize_areal_ppo_update_tensors,
-    validate_areal_external_advantage_batch,
+    validate_areal_policy_optimizer_source,
     validate_m0_areal_actor_config,
 )
 
-AREAL_POLICY_CANDIDATE_SCHEMA = "jph.areal-policy-candidate.v1"
+AREAL_POLICY_CANDIDATE_SCHEMA = "jph.areal-policy-candidate.v2"
 PINNED_AREAL_COMMIT = "fee938eada49208a5aabdbc1095730a13076a349"
 _EVIDENCE_SCOPE = {
     "policy_optimizer_update": True,
@@ -240,16 +241,76 @@ def _validate_safe_config(value: object) -> Mapping[str, object]:
 
 
 def _real_areal_actor(actor: object) -> tuple[str, str]:
-    actor_type = type(actor)
-    module = actor_type.__module__
+    try:
+        from areal.engine.fsdp_engine import FSDPPPOActor
+    except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover
+        raise ArealPolicyCandidateError(
+            "pinned AReaL FSDPPPOActor is unavailable"
+        ) from exc
     _require(
-        module.startswith("areal."),
-        "optimizer evidence requires a real actor from the pinned AReaL package",
+        type(actor) is FSDPPPOActor,
+        "optimizer evidence requires the exact pinned AReaL FSDPPPOActor",
     )
     optimizer = getattr(actor, "optimizer", None)
     _require(optimizer is not None, "real AReaL actor optimizer is unavailable")
     optimizer_type = f"{type(optimizer).__module__}.{type(optimizer).__qualname__}"
-    return f"{module}.{actor_type.__qualname__}", optimizer_type
+    _require(
+        optimizer_type == "torch.optim.adamw.AdamW",
+        "M0 Policy optimizer must be the pinned torch AdamW implementation",
+    )
+    return "areal.engine.fsdp_engine.FSDPPPOActor", optimizer_type
+
+
+def _lr_scheduler_state(actor: object) -> dict[str, object]:
+    scheduler = getattr(actor, "lr_scheduler", None)
+    state_dict = getattr(scheduler, "state_dict", None)
+    _require(callable(state_dict), "AReaL actor lr scheduler state is unavailable")
+    raw_state = state_dict()
+    _require(isinstance(raw_state, Mapping), "AReaL lr scheduler state is invalid")
+    state = deepcopy(dict(raw_state))
+    _canonical_json(state)
+    return state
+
+
+def _restore_lr_scheduler_state(
+    actor: object,
+    state: Mapping[str, object],
+) -> None:
+    scheduler = getattr(actor, "lr_scheduler", None)
+    load_state_dict = getattr(scheduler, "load_state_dict", None)
+    _require(
+        callable(load_state_dict),
+        "AReaL actor lr scheduler rollback is unavailable",
+    )
+    load_state_dict(deepcopy(dict(state)))
+    _require(
+        _lr_scheduler_state(actor) == state,
+        "AReaL actor lr scheduler rollback is incomplete",
+    )
+
+
+def _require_one_lr_scheduler_step(
+    before: Mapping[str, object],
+    after: Mapping[str, object],
+) -> None:
+    _require(
+        set(before) == set(after)
+        and type(before.get("last_epoch")) is int
+        and after.get("last_epoch") == before["last_epoch"] + 1
+        and type(before.get("_step_count")) is int
+        and after.get("_step_count") == before["_step_count"] + 1,
+        "AReaL lr scheduler did not advance exactly once",
+    )
+    before_rest = dict(before)
+    after_rest = dict(after)
+    before_rest.pop("last_epoch")
+    before_rest.pop("_step_count")
+    after_rest.pop("last_epoch")
+    after_rest.pop("_step_count")
+    _require(
+        before_rest == after_rest,
+        "AReaL constant lr scheduler changed outside its step counters",
+    )
 
 
 def _actor_version(actor: object) -> int:
@@ -416,6 +477,7 @@ class ValidatedArealPolicyCandidate:
 def _run_areal_policy_candidate_update_unprotected(
     admission_record: Mapping[str, object],
     *,
+    source_joint_credit_record: Mapping[str, object],
     actor: object,
     active_joint_version: JointVersion,
     candidate_root: str | Path,
@@ -436,8 +498,9 @@ def _run_areal_policy_candidate_update_unprotected(
         "candidate transaction ID is missing",
     )
     _require(_is_git_commit(project_commit), "project commit must be a full Git SHA-1")
-    admission = validate_areal_external_advantage_batch(
+    admission = validate_areal_policy_optimizer_source(
         admission_record,
+        source_joint_credit_record=source_joint_credit_record,
         active_joint_version=active_joint_version,
     )
     root = _prepare_run_root(candidate_root, project_root)
@@ -497,6 +560,7 @@ def _run_areal_policy_candidate_update_unprotected(
         device=device,
     )
     optimizer_step_before = _optimizer_step(actor)
+    lr_scheduler_state_before = _lr_scheduler_state(actor)
     export_stats()
     update_batch = materialize_areal_ppo_update_tensors(
         admission_record,
@@ -506,6 +570,11 @@ def _run_areal_policy_candidate_update_unprotected(
     )
     ppo_update(update_batch)
     step_scheduler()
+    lr_scheduler_state_after = _lr_scheduler_state(actor)
+    _require_one_lr_scheduler_step(
+        lr_scheduler_state_before,
+        lr_scheduler_state_after,
+    )
     optimizer_stats = _optimizer_stats(export_stats())
     optimizer_step_after = _optimizer_step(actor)
     _require(
@@ -591,7 +660,11 @@ def _run_areal_policy_candidate_update_unprotected(
             "optimizer_type": optimizer_type,
             "config": safe_config,
             "stats": optimizer_stats,
-            "lr_scheduler_step_completed": True,
+            "lr_scheduler": {
+                "state_before_sha256": _sha256(lr_scheduler_state_before),
+                "state_after_sha256": _sha256(lr_scheduler_state_after),
+                "step_completed": True,
+            },
         },
         "checkpoints": {
             "parent_path": str(parent_path),
@@ -621,6 +694,7 @@ def _run_areal_policy_candidate_update_unprotected(
 def run_areal_policy_candidate_update(
     admission_record: Mapping[str, object],
     *,
+    source_joint_credit_record: Mapping[str, object],
     actor: object,
     active_joint_version: JointVersion,
     candidate_root: str | Path,
@@ -632,9 +706,11 @@ def run_areal_policy_candidate_update(
 ) -> dict[str, object]:
     """Create an unpublished candidate, restoring the parent on any failure."""
 
+    scheduler_state = _lr_scheduler_state(actor)
     try:
         return _run_areal_policy_candidate_update_unprotected(
             admission_record,
+            source_joint_credit_record=source_joint_credit_record,
             actor=actor,
             active_joint_version=active_joint_version,
             candidate_root=candidate_root,
@@ -648,8 +724,8 @@ def run_areal_policy_candidate_update(
         parent_path = (
             require_within_configured_root(candidate_root) / "policy-parent.dcp"
         )
-        if parent_path.is_dir():
-            try:
+        try:
+            if parent_path.is_dir():
                 from areal.api import SaveLoadMeta
 
                 load = getattr(actor, "load", None)
@@ -661,10 +737,11 @@ def run_areal_policy_candidate_update(
                         with_optim=True,
                     )
                 )
-            except BaseException as rollback_error:
-                raise ArealPolicyCandidateError(
-                    "Policy candidate failed and parent rollback also failed"
-                ) from rollback_error
+            _restore_lr_scheduler_state(actor, scheduler_state)
+        except BaseException as rollback_error:
+            raise ArealPolicyCandidateError(
+                "Policy candidate failed and parent rollback also failed"
+            ) from rollback_error
         raise
 
 
@@ -779,19 +856,29 @@ def validate_areal_policy_candidate(
             "optimizer_type",
             "config",
             "stats",
-            "lr_scheduler_step_completed",
+            "lr_scheduler",
         },
         "Policy candidate optimizer",
     )
     _require(
-        isinstance(optimizer.get("actor_type"), str)
-        and optimizer["actor_type"].startswith("areal.")
-        and isinstance(optimizer.get("optimizer_type"), str)
-        and optimizer.get("lr_scheduler_step_completed") is True,
+        optimizer.get("actor_type") == "areal.engine.fsdp_engine.FSDPPPOActor"
+        and optimizer.get("optimizer_type") == "torch.optim.adamw.AdamW",
         "Policy candidate optimizer identity is invalid",
     )
     _validate_safe_config(optimizer.get("config"))
     _validate_normalized_optimizer_stats(optimizer.get("stats"))
+    lr_scheduler = _exact_mapping(
+        optimizer.get("lr_scheduler"),
+        {"state_before_sha256", "state_after_sha256", "step_completed"},
+        "Policy candidate lr scheduler",
+    )
+    _require(
+        _is_sha256(lr_scheduler.get("state_before_sha256"))
+        and _is_sha256(lr_scheduler.get("state_after_sha256"))
+        and lr_scheduler["state_before_sha256"] != lr_scheduler["state_after_sha256"]
+        and lr_scheduler.get("step_completed") is True,
+        "Policy candidate lr scheduler evidence is invalid",
+    )
     checkpoints = _exact_mapping(
         record.get("checkpoints"),
         {

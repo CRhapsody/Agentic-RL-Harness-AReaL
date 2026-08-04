@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from jphrl.paths import repository_root
@@ -15,6 +16,7 @@ from jphrl.training.areal_policy_candidate import (
     ArealPolicyCandidateError,
     _prepare_run_root,
     checkpoint_manifest,
+    run_areal_policy_candidate_update,
     validate_areal_policy_candidate,
 )
 from jphrl.trajectory.schema import JointVersion
@@ -113,7 +115,11 @@ def _record() -> dict[str, object]:
                 "update_successful": 1.0,
                 "update_successful_count": 1,
             },
-            "lr_scheduler_step_completed": True,
+            "lr_scheduler": {
+                "state_before_sha256": "6" * 64,
+                "state_after_sha256": "7" * 64,
+                "step_completed": True,
+            },
         },
         "checkpoints": {
             "parent_path": "/tmp/run/policy-parent.dcp",
@@ -188,6 +194,72 @@ class ArealPolicyCandidateTests(unittest.TestCase):
         _resign(credential)
         with self.assertRaisesRegex(ArealPolicyCandidateError, "field set"):
             validate_areal_policy_candidate(credential)
+
+        spoofed_actor = _record()
+        spoofed_actor["optimizer"]["actor_type"] = "areal.fake.FSDPPPOActor"
+        _resign(spoofed_actor)
+        with self.assertRaisesRegex(ArealPolicyCandidateError, "identity"):
+            validate_areal_policy_candidate(spoofed_actor)
+
+        scheduler_claim = _record()
+        scheduler_claim["optimizer"]["lr_scheduler"]["state_after_sha256"] = (
+            scheduler_claim["optimizer"]["lr_scheduler"]["state_before_sha256"]
+        )
+        _resign(scheduler_claim)
+        with self.assertRaisesRegex(ArealPolicyCandidateError, "scheduler evidence"):
+            validate_areal_policy_candidate(scheduler_claim)
+
+    def test_failure_restores_scheduler_state_not_covered_by_areal_dcp(self) -> None:
+        class FakeScheduler:
+            def __init__(self) -> None:
+                self.state = {"last_epoch": 0, "_step_count": 1, "lr_lambdas": [None]}
+
+            def state_dict(self):
+                return dict(self.state)
+
+            def load_state_dict(self, state):
+                self.state = dict(state)
+
+            def step(self) -> None:
+                self.state["last_epoch"] += 1
+                self.state["_step_count"] += 1
+
+        scheduler = FakeScheduler()
+        actor = SimpleNamespace(lr_scheduler=scheduler)
+
+        def fail_after_scheduler_step(*args, **kwargs):
+            del args, kwargs
+            scheduler.step()
+            raise RuntimeError("post-update candidate probe failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with (
+                patch.dict("os.environ", {"JPH_ROOT": str(root)}),
+                patch(
+                    "jphrl.training.areal_policy_candidate."
+                    "_run_areal_policy_candidate_update_unprotected",
+                    side_effect=fail_after_scheduler_step,
+                ),
+                self.assertRaisesRegex(RuntimeError, "candidate probe failed"),
+            ):
+                run_areal_policy_candidate_update(
+                    {},
+                    source_joint_credit_record={},
+                    actor=actor,
+                    active_joint_version=_version(),
+                    candidate_root=root / "candidate",
+                    project_root=repository_root(),
+                    transaction_id="txn-rollback",
+                    project_commit="5" * 40,
+                    areal_commit=PINNED_AREAL_COMMIT,
+                    device="cpu",
+                )
+
+        self.assertEqual(
+            scheduler.state,
+            {"last_epoch": 0, "_step_count": 1, "lr_lambdas": [None]},
+        )
 
     def test_checkpoint_manifest_hashes_files_and_rejects_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

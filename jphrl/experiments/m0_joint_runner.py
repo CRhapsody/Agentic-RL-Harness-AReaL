@@ -1508,6 +1508,7 @@ class _M0JointUpdateRunner:
 
             policy_receipt = run_areal_policy_candidate_update(
                 admission,
+                source_joint_credit_record=self.source.s_joint_credit,
                 actor=actor,
                 active_joint_version=self.source.active_joint_version,
                 candidate_root=root / "policy-candidate",

@@ -32,6 +32,7 @@ from jphrl.envs.calculator import TASKS
 from jphrl.harness.controller import HarnessState
 from jphrl.harness.spec import HarnessAction, HarnessSpec
 from jphrl.models.base import ModelResponse
+from jphrl.paths import repository_root
 from jphrl.runner import run_calculator_smoke
 from jphrl.trajectory.areal_agent_service_adapter import (
     AgentServiceModelCallReceipt,
@@ -202,6 +203,10 @@ def _resign(record: dict[str, object]) -> None:
         sort_keys=True,
     ).encode("utf-8")
     record["record_sha256"] = hashlib.sha256(payload).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _real_s_record(policy, *, baseline: float = 0.2, loss_mask: int = 1):
@@ -417,6 +422,13 @@ class TorchHarnessLearningTests(unittest.TestCase):
                 result.candidate_policy.parameter_digest,
             )
             self.assertTrue(optimizer.state)
+            self.assertEqual(
+                {
+                    int(state["step"].detach().cpu().item())
+                    for state in optimizer.state.values()
+                },
+                {result.candidate_policy.update_step},
+            )
             self.assertTrue(math.isfinite(result.evidence.gradient_norm))
             self.assertGreater(result.evidence.gradient_norm, 0.0)
             self.assertEqual(result.evidence.effective_batch_size, 2)
@@ -452,6 +464,85 @@ class TorchHarnessLearningTests(unittest.TestCase):
             actual = restored.choose(probe)
             self.assertEqual(expected.action, actual.action)
             self.assertEqual(expected.old_harness_logprob, actual.old_harness_logprob)
+
+            with self.assertRaisesRegex(
+                TorchHarnessLearningError,
+                "requires persisted Adam state",
+            ):
+                TorchHarnessOptimizer(result.candidate_policy)
+
+    def test_checkpoint_rebinding_and_adam_step_tamper_fail_closed(self) -> None:
+        policy = TorchHarnessPolicy(seed=31, hidden_size=16)
+        record, version = _real_s_record(policy)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "harness-candidate.pt"
+            result = TorchHarnessOptimizer(
+                policy,
+                learning_rate=1e-2,
+            ).update_from_frozen_joint_credit(
+                record,
+                active_joint_version=version,
+                checkpoint_path=path,
+            )
+            evidence = result.evidence.to_record()
+            _, _, checkpoint = load_torch_harness_checkpoint(path)
+
+            rebound_checkpoint = deepcopy(checkpoint)
+            rebound_checkpoint["source"]["joint_credit_record_sha256"] = "f" * 64
+            rebound_path = root / "rebound.pt"
+            torch.save(rebound_checkpoint, rebound_path)
+            rebound_evidence = deepcopy(evidence)
+            rebound_evidence["checkpoint_path"] = str(rebound_path)
+            rebound_evidence["checkpoint_sha256"] = _file_sha256(rebound_path)
+            _resign(rebound_evidence)
+            with self.assertRaisesRegex(
+                TorchHarnessLearningError,
+                "source differs from evidence",
+            ):
+                validate_torch_harness_update_evidence(
+                    rebound_evidence,
+                    active_joint_version=version,
+                )
+
+            tampered_checkpoint = deepcopy(checkpoint)
+            for state in tampered_checkpoint["optimizer_state_dict"]["state"].values():
+                state["step"] = state["step"] + 1
+            tampered_path = root / "tampered-adam-step.pt"
+            torch.save(tampered_checkpoint, tampered_path)
+            tampered_evidence = deepcopy(evidence)
+            tampered_evidence["checkpoint_path"] = str(tampered_path)
+            tampered_evidence["checkpoint_sha256"] = _file_sha256(tampered_path)
+            _resign(tampered_evidence)
+            with self.assertRaisesRegex(
+                TorchHarnessLearningError,
+                "Adam step differs",
+            ):
+                validate_torch_harness_update_evidence(
+                    tampered_evidence,
+                    active_joint_version=version,
+                )
+
+            symlink_path = root / "candidate-symlink.pt"
+            symlink_path.symlink_to(path)
+            with self.assertRaisesRegex(
+                TorchHarnessLearningError,
+                "unsafe",
+            ):
+                load_torch_harness_checkpoint(symlink_path)
+
+        unsafe_path = repository_root() / ".must-not-create-harness-candidate.pt"
+        self.assertFalse(unsafe_path.exists())
+        with self.assertRaisesRegex(ValueError, "outside Git checkout"):
+            TorchHarnessOptimizer(
+                policy, learning_rate=1e-2
+            ).update_from_frozen_joint_credit(
+                record,
+                active_joint_version=version,
+                checkpoint_path=unsafe_path,
+            )
+        self.assertFalse(unsafe_path.exists())
 
     def test_invalid_stale_logprob_mask_zero_credit_and_credential_fail(self) -> None:
         policy = TorchHarnessPolicy(seed=41, hidden_size=16)

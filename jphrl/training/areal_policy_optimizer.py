@@ -572,6 +572,40 @@ def validate_areal_external_advantage_batch(
     )
 
 
+def validate_areal_policy_optimizer_source(
+    record: Mapping[str, object],
+    *,
+    source_joint_credit_record: Mapping[str, object],
+    active_joint_version: JointVersion,
+) -> ValidatedArealExternalAdvantageBatch:
+    """Prove that an optimizer batch was derived from the supplied S record.
+
+    A digest carried by a self-contained optimizer batch is only an identity
+    claim.  The production update boundary therefore revalidates the original
+    Q/R/S record, deterministically rebuilds the adapter output, and requires
+    exact equality before any actor state may change.
+    """
+
+    validated = validate_areal_external_advantage_batch(
+        record,
+        active_joint_version=active_joint_version,
+    )
+    expected = build_areal_external_advantage_batch(
+        source_joint_credit_record,
+        active_joint_version=active_joint_version,
+    )
+    _require(
+        validated.source_joint_credit_sha256
+        == source_joint_credit_record.get("record_sha256"),
+        "Policy PPO batch source differs from the supplied S record",
+    )
+    _require(
+        _canonical_json(record) == _canonical_json(expected),
+        "Policy PPO batch does not exactly derive from the supplied S record",
+    )
+    return validated
+
+
 def validate_m0_areal_actor_config(actor: object) -> None:
     """Fail closed unless the actor uses the audited external-advantage mode."""
 

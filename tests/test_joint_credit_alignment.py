@@ -15,8 +15,10 @@ from jphrl.harness.spec import HarnessAction, HarnessSpec
 from jphrl.models.base import ModelResponse
 from jphrl.runner import run_calculator_smoke
 from jphrl.training.areal_policy_optimizer import (
+    ArealExternalAdvantageBatchError,
     build_areal_external_advantage_batch,
     validate_areal_external_advantage_batch,
+    validate_areal_policy_optimizer_source,
 )
 from jphrl.trajectory.areal_agent_service_adapter import (
     AgentServiceModelCallReceipt,
@@ -316,6 +318,11 @@ class JointCreditAlignmentTests(unittest.TestCase):
                     json.loads(json.dumps(policy_batch)),
                     active_joint_version=trace.joint_version,
                 )
+                optimizer_source_audit = validate_areal_policy_optimizer_source(
+                    json.loads(json.dumps(policy_batch)),
+                    source_joint_credit_record=persisted,
+                    active_joint_version=trace.joint_version,
+                )
 
                 self.assertEqual(audit["policy_sample_count"], expected_sample_count)
                 self.assertEqual(
@@ -323,6 +330,10 @@ class JointCreditAlignmentTests(unittest.TestCase):
                     expected_sample_count,
                 )
                 self.assertEqual(policy_batch_audit.inference_engine_version, 7)
+                self.assertEqual(
+                    optimizer_source_audit.source_joint_credit_sha256,
+                    persisted["record_sha256"],
+                )
                 self.assertEqual(audit["policy_decision_span_count"], 2)
                 self.assertEqual(audit["harness_action_count"], 2)
                 self.assertEqual(
@@ -363,6 +374,39 @@ class JointCreditAlignmentTests(unittest.TestCase):
                         "harness_optimizer_update": False,
                     },
                 )
+
+    def test_self_rehashed_optimizer_batch_cannot_replace_real_s_source(self) -> None:
+        trace, policy, harness, estimator = self._components()
+        source = build_frozen_joint_credit_alignment(
+            policy_admission=policy,
+            harness_admission=harness,
+            active_joint_version=trace.joint_version,
+            estimator=estimator,
+        )
+        batch = build_areal_external_advantage_batch(
+            source,
+            active_joint_version=trace.joint_version,
+        )
+        forged = deepcopy(batch)
+        tensors = forged["samples"][0]["tensor_dict"]
+        trainable_position = tensors["loss_mask"][0].index(1)
+        tensors["advantages"][0][trainable_position] += 0.125
+        tensors["returns"][0][trainable_position] += 0.125
+        _resign(forged)
+
+        validate_areal_external_advantage_batch(
+            forged,
+            active_joint_version=trace.joint_version,
+        )
+        with self.assertRaisesRegex(
+            ArealExternalAdvantageBatchError,
+            "does not exactly derive",
+        ):
+            validate_areal_policy_optimizer_source(
+                forged,
+                source_joint_credit_record=source,
+                active_joint_version=trace.joint_version,
+            )
 
     def test_frozen_estimator_requires_real_distinct_complete_provenance(self) -> None:
         trace, policy, harness, estimator = self._components()
