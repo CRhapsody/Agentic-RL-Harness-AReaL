@@ -13,6 +13,7 @@ umask 077
 
 readonly AREAL_REPO="${JPH_ROOT}/src/AReaL-v2.0.0"
 readonly AREAL_VENV="${JPH_ROOT}/venvs/areal-v2.0.0"
+readonly CUDA_TOOLKIT="/usr/local/cuda-12.6"
 readonly MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/qwen2.5-1.5b-snapshot.json"
 readonly DATASET_REPORT="${JPH_ROOT}/artifacts/bootstrap/gsm8k-snapshot.json"
 readonly EXPECTED_AREAL_COMMIT="fee938eada49208a5aabdbc1095730a13076a349"
@@ -43,6 +44,7 @@ for required_path in \
   "${AREAL_REPO}/.git" \
   "${AREAL_VENV}/bin/python" \
   "${AREAL_VENV}/bin/python3" \
+  "${CUDA_TOOLKIT}/bin/nvcc" \
   "${MODEL_REPORT}" \
   "${DATASET_REPORT}"; do
   if [[ ! -e "${required_path}" ]]; then
@@ -55,9 +57,17 @@ done
 # LocalScheduler and its guards inherit PATH, so keep that literal command on
 # the same Python 3.12 virtual environment as the controller instead of the
 # host's Python 3.10 interpreter.
-export PATH="${AREAL_VENV}/bin:${PATH}"
+export CUDA_HOME="${CUDA_TOOLKIT}"
+export CUDA_PATH="${CUDA_TOOLKIT}"
+export PATH="${AREAL_VENV}/bin:${CUDA_TOOLKIT}/bin:${PATH}"
+export LD_LIBRARY_PATH="${CUDA_TOOLKIT}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 if [[ "$(command -v python3)" != "${AREAL_VENV}/bin/python3" ]]; then
   echo "formal integrated child python3 does not resolve to the AReaL venv" >&2
+  exit 2
+fi
+if [[ "$(command -v nvcc)" != "${CUDA_TOOLKIT}/bin/nvcc" ]] \
+  || ! nvcc --version | grep -Fq "release 12.6"; then
+  echo "formal integrated SGLang JIT requires the pinned CUDA 12.6 compiler" >&2
   exit 2
 fi
 

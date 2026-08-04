@@ -1112,7 +1112,9 @@ class FormalLauncherStaticSafetyTests(unittest.TestCase):
 
     def test_sglang_child_python3_is_pinned_to_the_areal_venv(self) -> None:
         text = self.launcher_text
-        path_export = 'export PATH="${AREAL_VENV}/bin:${PATH}"'
+        path_export = (
+            'export PATH="${AREAL_VENV}/bin:${CUDA_TOOLKIT}/bin:${PATH}"'
+        )
         resolution_check = (
             '"$(command -v python3)" != "${AREAL_VENV}/bin/python3"'
         )
@@ -1124,6 +1126,21 @@ class FormalLauncherStaticSafetyTests(unittest.TestCase):
         self.assertIn(resolution_check, text)
         self.assertLess(text.index(path_export), scheduler_snapshot)
         self.assertLess(text.index(resolution_check), scheduler_snapshot)
+
+    def test_sglang_jit_is_pinned_to_cuda_twelve_six_before_scheduler(self) -> None:
+        text = self.launcher_text
+        scheduler_snapshot = text.index(
+            'snapshot_all_eight_gpus "immediately-before-scheduler"'
+        )
+        for fragment in (
+            'readonly CUDA_TOOLKIT="/usr/local/cuda-12.6"',
+            'export CUDA_HOME="${CUDA_TOOLKIT}"',
+            'export CUDA_PATH="${CUDA_TOOLKIT}"',
+            '"$(command -v nvcc)" != "${CUDA_TOOLKIT}/bin/nvcc"',
+            'nvcc --version | grep -Fq "release 12.6"',
+        ):
+            self.assertIn(fragment, text)
+            self.assertLess(text.index(fragment), scheduler_snapshot)
 
     def test_execute_mode_constructs_and_runs_the_registered_real_adapter(self) -> None:
         spec = importlib.util.spec_from_file_location(
