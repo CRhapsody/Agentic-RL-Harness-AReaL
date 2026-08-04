@@ -14,6 +14,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/remote_env.sh"
+source "${SCRIPT_DIR}/m0_gpu_lock.sh"
 umask 077
 
 AREAL_VENV="${JPH_ROOT}/venvs/areal-v2.0.0"
@@ -21,6 +22,9 @@ PROJECT_COMMIT="$(git -C "${JPH_PROJECT_DIR}" rev-parse HEAD)"
 if [[ -n "$(git -C "${JPH_PROJECT_DIR}" status --porcelain=v1 --untracked-files=all)" ]]; then
   echo "Project worktree must be clean before the M0 pipeline" >&2
   exit 2
+fi
+if ! jph_acquire_m0_gpu_lock "${GPU_ID}"; then
+  exit 3
 fi
 
 PIPELINE_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"

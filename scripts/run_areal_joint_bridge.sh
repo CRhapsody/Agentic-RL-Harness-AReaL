@@ -14,6 +14,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/remote_env.sh"
+source "${SCRIPT_DIR}/m0_gpu_lock.sh"
 umask 077
 
 while IFS='=' read -r variable_name _; do
@@ -223,8 +224,15 @@ fi
 export CUDA_HOME="${CUDA_TOOLKIT_ROOT}"
 export CUDACXX="${CUDA_HOME}/bin/nvcc"
 export PATH="${AREAL_VENV}/bin:${CUDA_HOME}/bin:${PATH}"
-"${CUDACXX}" -std=c++20 -x cu -c /dev/null \
-  -o "${JPH_ROOT}/tmp/nvcc-joint-bridge-preflight.o"
+NVCC_PREFLIGHT_OBJECT="$(
+  mktemp "${JPH_ROOT}/tmp/nvcc-joint-bridge-preflight.XXXXXXXX.o"
+)"
+if ! "${CUDACXX}" -std=c++20 -x cu -c /dev/null \
+  -o "${NVCC_PREFLIGHT_OBJECT}"; then
+  rm -f -- "${NVCC_PREFLIGHT_OBJECT}"
+  exit 2
+fi
+rm -f -- "${NVCC_PREFLIGHT_OBJECT}"
 ACTUAL_AREAL_COMMIT="$(git -C "${AREAL_REPO}" rev-parse HEAD)"
 if [[ "${ACTUAL_AREAL_COMMIT}" != "${EXPECTED_AREAL_COMMIT}" ]]; then
   echo "AReaL commit mismatch: ${ACTUAL_AREAL_COMMIT}" >&2
@@ -280,10 +288,7 @@ if [[ -n "${RLVR_RUNNER_ADMISSION_MODE}" ]]; then
     "${RLVR_FROZEN_ESTIMATOR_TEMPLATE_PATH}" "${JPH_ROOT}"
 fi
 
-mkdir -p -m 700 "${JPH_ROOT}/runtime/locks"
-exec 9> "${JPH_ROOT}/runtime/locks/gpu-${GPU_ID}.lock"
-if ! flock -n 9; then
-  echo "GPU ${GPU_ID} is reserved by another JPH process" >&2
+if ! jph_acquire_m0_gpu_lock "${GPU_ID}"; then
   exit 3
 fi
 IFS=, read -r GPU_MEMORY_USED GPU_MEMORY_FREE < <(

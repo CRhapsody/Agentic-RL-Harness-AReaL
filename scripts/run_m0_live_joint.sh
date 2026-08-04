@@ -15,6 +15,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/remote_env.sh"
+source "${SCRIPT_DIR}/m0_gpu_lock.sh"
 umask 077
 
 AREAL_REPO="${JPH_ROOT}/src/AReaL-v2.0.0"
@@ -24,6 +25,12 @@ MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/qwen2.5-1.5b-snapshot.json"
 MAX_USED_MEMORY_MIB=10240
 MIN_FREE_MEMORY_MIB=65536
 MAX_NEW_GPU_MEMORY_MIB=26624
+EXPECTED_MASTER_PORT="$((61000 + GPU_ID))"
+M0_MASTER_PORT="${JPH_M0_MASTER_PORT:-${EXPECTED_MASTER_PORT}}"
+if [[ "${M0_MASTER_PORT}" != "${EXPECTED_MASTER_PORT}" ]]; then
+  echo "M0 MASTER_PORT must be ${EXPECTED_MASTER_PORT} for GPU ${GPU_ID}" >&2
+  exit 2
+fi
 
 for path in \
   "${AREAL_REPO}/.git" \
@@ -95,10 +102,7 @@ case "${MODEL_SNAPSHOT}" in
     ;;
 esac
 
-mkdir -p -m 700 "${JPH_ROOT}/runtime/locks"
-exec 9> "${JPH_ROOT}/runtime/locks/gpu-${GPU_ID}.lock"
-if ! flock -n 9; then
-  echo "GPU ${GPU_ID} is reserved by another JPH process" >&2
+if ! jph_acquire_m0_gpu_lock "${GPU_ID}"; then
   exit 3
 fi
 
@@ -296,6 +300,18 @@ echo "source_rollout=${ROLLOUT_RUN_ROOT} run_root=${RUN_ROOT}" | tee -a "${LOG_P
 require_idle_gpu "immediately-before-python"
 GPU_MEMORY_USED_AT_LAUNCH="${GPU_MEMORY_USED_SNAPSHOT}"
 GPU_MEMORY_FREE_AT_LAUNCH="${GPU_MEMORY_FREE_SNAPSHOT}"
+if ! "${AREAL_VENV}/bin/python" - "${M0_MASTER_PORT}" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", port))
+PY
+then
+  echo "M0 MASTER_PORT ${M0_MASTER_PORT} is unavailable" >&2
+  exit 3
+fi
 printf '%s,%s,%s\n' \
   "$(date +%s)" \
   "${GPU_MEMORY_USED_AT_LAUNCH}" \
@@ -303,6 +319,11 @@ printf '%s,%s,%s\n' \
 
 rm -f "${MEMORY_BREACH}" "${WATCHDOG_TARGET}"
 CUDA_VISIBLE_DEVICES="${GPU_ID}" \
+WORLD_SIZE=1 \
+RANK=0 \
+LOCAL_RANK=0 \
+MASTER_ADDR=127.0.0.1 \
+MASTER_PORT="${M0_MASTER_PORT}" \
 HF_HUB_OFFLINE=1 \
 TRANSFORMERS_OFFLINE=1 \
 JPH_PHYSICAL_GPU_ID="${GPU_ID}" \

@@ -335,6 +335,13 @@ class RemoteScriptContractTests(unittest.TestCase):
 
     def test_areal_b0_is_bounded_and_does_not_max_workers(self) -> None:
         text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
+        subprocess.run(
+            ["bash", "-n", str(SCRIPTS / "run_areal_official_b0.sh")],
+            check=True,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
         self.assertIn("+total_train_steps=1", text)
         self.assertIn("train_dataset.num_workers=2", text)
         self.assertIn("valid_dataset.num_workers=2", text)
@@ -348,7 +355,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("HF_HUB_OFFLINE=1", text)
         self.assertIn("HF_DATASETS_OFFLINE=1", text)
         self.assertIn("TRANSFORMERS_OFFLINE=1", text)
-        self.assertIn("secrets.token_urlsafe(32)", text)
+        self.assertIn("secrets.token_urlsafe(48)", text)
         self.assertIn('JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}"', text)
         self.assertIn(
             "'+rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}'",
@@ -362,6 +369,116 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn('export CUDACXX="${CUDA_HOME}/bin/nvcc"', text)
         self.assertIn('export PATH="${AREAL_VENV}/bin:${CUDA_HOME}/bin:${PATH}"', text)
         self.assertIn("-std=c++20", text)
+        self.assertIn("mktemp --suffix=.o", text)
+
+    def test_areal_b0_rejects_non_tmux_invocation_before_remote_setup(self) -> None:
+        env = os.environ.copy()
+        env.pop("TMUX", None)
+        result = subprocess.run(
+            ["bash", str(SCRIPTS / "run_areal_official_b0.sh")],
+            check=False,
+            cwd=PROJECT_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must run inside tmux", result.stderr)
+
+    def test_areal_b0_is_one_eight_gpu_areal_job(self) -> None:
+        text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
+        self.assertEqual(text.count('"${AREAL_VENV}/bin/python" examples/math/gsm8k_rl.py'), 1)
+        self.assertIn("os.setsid()", text)
+        self.assertIn("os.execv(sys.argv[1], sys.argv[1:])", text)
+        self.assertIn("cluster.n_nodes=1", text)
+        self.assertIn("cluster.n_gpus_per_node=8", text)
+        self.assertIn("actor.backend=fsdp:d4p1t1", text)
+        self.assertIn("rollout.backend=sglang:d4p1t1", text)
+        self.assertIn("ref.backend=fsdp:d4p1t1", text)
+        self.assertIn("ref.scheduling_strategy.type=colocation", text)
+        self.assertIn("ref.scheduling_strategy.target=actor", text)
+        self.assertIn("sglang.mem_fraction_static=0.29", text)
+        self.assertIn("sglang.context_length=1024", text)
+        self.assertIn("sglang.max_running_requests=2", text)
+        self.assertNotIn("run_m0_live_pipeline.sh", text)
+        self.assertNotIn("m0-live-parallel-8gpu", text)
+        self.assertNotIn("WORLD_SIZE=1", text)
+
+    def test_areal_b0_composes_and_persists_update_checkpoint_config(self) -> None:
+        text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
+        self.assertIn("GRPOConfig, load_expr_config", text)
+        self.assertIn('CUDA_VISIBLE_DEVICES=""', text)
+        self.assertIn("hydra-preflight.json", text)
+        self.assertIn("actor.optimizer.lr=1.70e-5", text)
+        self.assertIn("actor.optimizer.lr_scheduler_type=constant", text)
+        self.assertIn("actor.optimizer.warmup_steps_proportion=0.0", text)
+        self.assertIn("actor.kl_ctl=0.0", text)
+        self.assertIn("saver.freq_steps=1", text)
+        self.assertIn("saver.freq_epochs=null", text)
+        self.assertIn("saver.freq_secs=null", text)
+        self.assertIn("+saver.mode=sync", text)
+        self.assertIn("recover.mode=disabled", text)
+        self.assertIn('saver.fileroot="${RUN_ROOT}"', text)
+
+    def test_areal_b0_owns_all_locks_and_only_kills_its_session(self) -> None:
+        text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
+        self.assertIn('if [[ -z "${TMUX:-}" ]]', text)
+        self.assertIn("areal-official-b0-8gpu.lock", text)
+        self.assertIn("declare -A GPU_LOCK_FDS", text)
+        self.assertIn('flock -n "${gpu_lock_fd}"', text)
+        self.assertIn("process_start_time", text)
+        self.assertIn("bind_job_identity", text)
+        self.assertIn('[[ "${JOB_SESSION_ID}" == "${JOB_PID}" ]]', text)
+        self.assertIn('pkill -TERM -s "${JOB_SESSION_ID}"', text)
+        self.assertIn('pkill -KILL -s "${JOB_SESSION_ID}"', text)
+        self.assertIn("JOB_LEADER_REAPED", text)
+        self.assertIn("areal-session-straggler-after-coordinator-exit", text)
+        self.assertNotIn("nvidia-smi --gpu-reset", text)
+        self.assertNotIn("killall", text)
+        self.assertIn("trap 'exit 129' HUP", text)
+        self.assertIn("trap 'exit 130' INT", text)
+        self.assertIn("trap 'exit 143' TERM", text)
+
+    def test_areal_b0_persists_fail_closed_eight_gpu_memory_audit(self) -> None:
+        text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
+        self.assertIn("SOFT_MAX_NEW_GPU_MEMORY_MIB=26624", text)
+        self.assertIn("HARD_MAX_NEW_GPU_MEMORY_MIB=30720", text)
+        self.assertIn('AUDIT_PATH="${RUN_ROOT}/gpu-memory-audit.json"', text)
+        self.assertIn("jph.areal-official-b0-gpu-memory-audit.v1", text)
+        self.assertIn('"run_kind": "areal-official-b0-v1"', text)
+        self.assertIn('"baseline_used_mib": baseline', text)
+        self.assertIn('"peak_used_mib": peak_used', text)
+        self.assertIn('"peak_delta_mib": delta', text)
+        self.assertIn('"soft_cap_mib": soft_cap', text)
+        self.assertIn('"hard_cap_mib": hard_cap', text)
+        self.assertIn('"sample_count": len(samples)', text)
+        self.assertIn('record["record_sha256"] = hashlib.sha256(canonical)', text)
+        self.assertIn('delta > SOFT_MAX_NEW_GPU_MEMORY_MIB', text)
+        self.assertIn('kill -TERM "${B0_ORCHESTRATOR_PID}"', text)
+        self.assertIn("append_final_samples", text)
+        self.assertIn("write_gpu_memory_audit", text)
+        self.assertNotIn('"peak_timestamp_unix":', text)
+        self.assertNotIn('"watchdog_breach":', text)
+        self.assertNotIn('"failure_reason": failure_reason', text)
+
+    def test_areal_b0_pins_clean_sources_and_verifies_secret_absence(self) -> None:
+        text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
+        self.assertIn("fee938eada49208a5aabdbc1095730a13076a349", text)
+        self.assertGreaterEqual(text.count("status --porcelain=v1"), 2)
+        self.assertIn("Project worktree must be clean before official B0", text)
+        self.assertIn("Pinned AReaL worktree must be clean before official B0", text)
+        self.assertIn('--verify-absent "${RUN_ROOT}" "${LOG_PATH}"', text)
+        self.assertIn('RUN_ROOT="${JPH_ROOT}/artifacts/areal-b0/', text)
+        self.assertIn('LOG_PATH="${JPH_ROOT}/logs/areal-b0-', text)
+        self.assertIn(
+            "project=%s AReaL=%s GPUs=0,1,2,3,4,5,6,7 run_root=%s",
+            text,
+        )
+        self.assertIn('exec tee -a "${LOG_PATH}" >/dev/null', text)
+        self.assertIn('NAME_RESOLVE_ROOT="${RUN_ROOT}/name-resolve"', text)
+        self.assertIn('"${SCRIPT_DIR}/verify_areal_official_b0.py"', text)
+        self.assertIn('--output "${RUN_ROOT}/verification.json"', text)
+        self.assertNotIn("harness_optimizer_update", text)
 
     def test_areal_trace_is_real_bounded_and_recomputed(self) -> None:
         launcher = (SCRIPTS / "run_areal_trace_b0.sh").read_text(encoding="utf-8")
@@ -504,8 +621,22 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("JPH_B0_MIN_FREE_MEMORY_MIB:-71680", text)
         self.assertIn("JPH_B0_MAX_USED_MEMORY_MIB:-10240", text)
         self.assertIn("--query-gpu=memory.used,memory.free", text)
-        self.assertIn("GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB", text)
-        self.assertIn("GPU_MEMORY_USED > MAX_USED_MEMORY_MIB", text)
+        self.assertIn("--query-compute-apps=pid,process_name,used_memory", text)
+        self.assertIn("memory_free < MIN_FREE_MEMORY_MIB", text)
+        self.assertIn("memory_used > MAX_USED_MEMORY_MIB", text)
+        self.assertIn("MIN_FREE_MEMORY_MIB < 71680", text)
+        self.assertIn("MAX_USED_MEMORY_MIB > 10240", text)
+        self.assertIn("run_all_gpu_gate preflight", text)
+        self.assertIn("run_all_gpu_gate immediately-before-launch", text)
+        preflight = text.index("run_all_gpu_gate preflight")
+        compose = text.index("GRPOConfig, load_expr_config")
+        final_gate = text.index("run_all_gpu_gate immediately-before-launch")
+        launch = text.index(
+            '"${AREAL_VENV}/bin/python" examples/math/gsm8k_rl.py'
+        )
+        self.assertLess(preflight, compose)
+        self.assertLess(compose, final_gate)
+        self.assertLess(final_gate, launch)
 
     def test_real_trace_audit_rejects_scripted_and_accepts_valid_hf_metadata(
         self,
