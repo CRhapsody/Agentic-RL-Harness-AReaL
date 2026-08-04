@@ -538,6 +538,41 @@ def _continuation_rank_receipts(
 
 
 class DistributedPolicyReceiptTests(unittest.TestCase):
+    def test_collective_checkpoint_path_preflight_barriers_before_save(
+        self,
+    ) -> None:
+        actor = object.__new__(distributed.JPHFSDPPPOActor)
+        actor._require_group_common = Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "continuation.dcp"
+            self.assertEqual(
+                actor._collectively_require_new_checkpoint_path(
+                    name="test continuation",
+                    path=checkpoint,
+                ),
+                checkpoint,
+            )
+            actor._require_group_common.assert_called_once_with(
+                "test continuation path preflight",
+                {
+                    "path": str(checkpoint),
+                    "exists": False,
+                    "is_symlink": False,
+                },
+            )
+
+            checkpoint.mkdir()
+            actor._require_group_common.reset_mock()
+            with self.assertRaisesRegex(
+                ArealDistributedPolicyError,
+                "collectively new",
+            ):
+                actor._collectively_require_new_checkpoint_path(
+                    name="test continuation",
+                    path=checkpoint,
+                )
+            actor._require_group_common.assert_called_once()
+
     def test_pending_candidate_state_is_complete_and_rank_receipt_bound(
         self,
     ) -> None:

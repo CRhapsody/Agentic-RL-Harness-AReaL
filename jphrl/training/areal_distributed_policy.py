@@ -1881,6 +1881,33 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
             f"actor ranks disagree on {name}",
         )
 
+    def _collectively_require_new_checkpoint_path(
+        self,
+        *,
+        name: str,
+        path: Path,
+    ) -> Path:
+        """Barrier all ranks after observing a shared DCP path as new."""
+
+        observation = {
+            "path": str(path),
+            "exists": path.exists(),
+            "is_symlink": path.is_symlink(),
+        }
+        # No rank may create the shared directory until every rank has made
+        # and exchanged its pre-save observation.  Rechecking after this
+        # barrier would itself race with a faster rank entering DCP save.
+        self._require_group_common(f"{name} path preflight", observation)
+        _require(
+            observation == {
+                "path": str(path),
+                "exists": False,
+                "is_symlink": False,
+            },
+            f"{name} path must be collectively new",
+        )
+        return path
+
     def _rollback_pending_group(self, transaction_id: str) -> bool:
         pending = self._jph_pending_m0_transaction
         descriptor = None
@@ -2836,10 +2863,9 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
             scheduler_after = _lr_scheduler_state(self)
             _require_one_scheduler_step(scheduler_before, scheduler_after)
             root = Path(str(pending["candidate_path"])).parent
-            continuation_path = root / f"w-{branch}-continuation.dcp"
-            _require(
-                not continuation_path.exists(),
-                "distributed W continuation DCP path must be new",
+            continuation_path = self._collectively_require_new_checkpoint_path(
+                name=f"distributed W {branch} continuation DCP",
+                path=root / f"w-{branch}-continuation.dcp",
             )
             _require(SaveLoadMeta is not None, "AReaL SaveLoadMeta is unavailable")
             self.save(
