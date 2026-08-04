@@ -342,7 +342,8 @@ class RemoteScriptContractTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        self.assertIn("+total_train_steps=1", text)
+        self.assertIn("TOTAL_TRAIN_STEPS=1", text)
+        self.assertIn('+total_train_steps="${TOTAL_TRAIN_STEPS}"', text)
         self.assertIn("train_dataset.num_workers=2", text)
         self.assertIn("valid_dataset.num_workers=2", text)
         self.assertIn("rollout.max_concurrent_rollouts=8", text)
@@ -419,12 +420,50 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("actor.optimizer.lr_scheduler_type=constant", text)
         self.assertIn("actor.optimizer.warmup_steps_proportion=0.0", text)
         self.assertIn("actor.kl_ctl=0.0", text)
-        self.assertIn("saver.freq_steps=1", text)
+        self.assertIn("SAVER_FREQ_STEPS=1", text)
+        self.assertIn('saver.freq_steps="${SAVER_FREQ_STEPS}"', text)
         self.assertIn("saver.freq_epochs=null", text)
         self.assertIn("saver.freq_secs=null", text)
         self.assertIn("+saver.mode=sync", text)
         self.assertIn("recover.mode=disabled", text)
         self.assertIn('saver.fileroot="${RUN_ROOT}"', text)
+
+    def test_areal_gpu_holder_reuses_b0_safety_and_bounds_disk(self) -> None:
+        holder = (SCRIPTS / "run_areal_gpu_holder.sh").read_text(encoding="utf-8")
+        launcher = (SCRIPTS / "run_areal_official_b0.sh").read_text(
+            encoding="utf-8"
+        )
+        stopper = (SCRIPTS / "stop_areal_gpu_holder.py").read_text(
+            encoding="utf-8"
+        )
+        subprocess.run(
+            ["bash", "-n", str(SCRIPTS / "run_areal_gpu_holder.sh")],
+            check=True,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("JPH_B0_RUN_MODE=holder", holder)
+        self.assertIn('run_areal_official_b0.sh"', holder)
+        self.assertNotIn("nvidia-smi", holder)
+        self.assertIn("JPH_HOLDER_TOTAL_TRAIN_STEPS:-10000", launcher)
+        self.assertIn("JPH_HOLDER_MAX_RUNTIME_SECONDS:-21600", launcher)
+        self.assertIn("ROLLOUT_DUMP_TO_FILE=false", launcher)
+        self.assertIn("SAVER_FREQ_STEPS=null", launcher)
+        self.assertIn("recover.freq_steps=null", launcher)
+        self.assertIn("recover.freq_epochs=null", launcher)
+        self.assertIn("recover.freq_secs=null", launcher)
+        self.assertIn("evaluator.freq_steps=null", launcher)
+        self.assertIn("evaluator.freq_epochs=null", launcher)
+        self.assertIn("evaluator.freq_secs=null", launcher)
+        self.assertIn("final_state=stopped", launcher)
+        self.assertIn('[[ "${RUN_MODE}" == official ]]', launcher)
+        self.assertIn("holder-control.json", launcher)
+        self.assertIn("stop.requested.json", launcher)
+        self.assertIn("PID {pid} start time no longer matches", stopper)
+        self.assertIn("os.kill(launcher_pid, signal.SIGTERM)", stopper)
+        self.assertNotIn("pkill", stopper)
+        self.assertNotIn("killall", holder + stopper)
 
     def test_areal_b0_owns_all_locks_and_only_kills_its_session(self) -> None:
         text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
@@ -451,7 +490,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("HARD_MAX_NEW_GPU_MEMORY_MIB=30720", text)
         self.assertIn('AUDIT_PATH="${RUN_ROOT}/gpu-memory-audit.json"', text)
         self.assertIn("jph.areal-official-b0-gpu-memory-audit.v1", text)
-        self.assertIn('"run_kind": "areal-official-b0-v1"', text)
+        self.assertIn('MEMORY_RUN_KIND="areal-official-b0-v1"', text)
         self.assertIn('"baseline_used_mib": baseline', text)
         self.assertIn('"peak_used_mib": peak_used', text)
         self.assertIn('"peak_delta_mib": delta', text)

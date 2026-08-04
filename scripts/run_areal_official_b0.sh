@@ -27,6 +27,30 @@ readonly MAX_USED_MEMORY_MIB="${JPH_B0_MAX_USED_MEMORY_MIB:-10240}"
 readonly ALLOWED_EXISTING_COMPUTE_UIDS="${JPH_B0_ALLOWED_EXISTING_COMPUTE_UIDS:-}"
 readonly SOFT_MAX_NEW_GPU_MEMORY_MIB=26624
 readonly HARD_MAX_NEW_GPU_MEMORY_MIB=30720
+readonly RUN_MODE="${JPH_B0_RUN_MODE:-official}"
+readonly HOLDER_TOTAL_TRAIN_STEPS="${JPH_HOLDER_TOTAL_TRAIN_STEPS:-10000}"
+readonly HOLDER_MAX_RUNTIME_SECONDS="${JPH_HOLDER_MAX_RUNTIME_SECONDS:-21600}"
+
+if [[ "${RUN_MODE}" != official && "${RUN_MODE}" != holder ]]; then
+  echo "JPH_B0_RUN_MODE must be official or holder" >&2
+  exit 2
+fi
+if [[ "${RUN_MODE}" == holder ]]; then
+  if [[ ! "${JPH_HOLDER_RUN_ID:-}" =~ ^[0-9]{8}T[0-9]{6}Z-gpu-holder-[0-9a-f]{16}$ ]]; then
+    echo "Holder mode requires a canonical JPH_HOLDER_RUN_ID" >&2
+    exit 2
+  fi
+  if [[ ! "${HOLDER_TOTAL_TRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]] \
+    || ((HOLDER_TOTAL_TRAIN_STEPS < 10 || HOLDER_TOTAL_TRAIN_STEPS > 100000)); then
+    echo "JPH_HOLDER_TOTAL_TRAIN_STEPS must be in [10, 100000]" >&2
+    exit 2
+  fi
+  if [[ ! "${HOLDER_MAX_RUNTIME_SECONDS}" =~ ^[1-9][0-9]*$ ]] \
+    || ((HOLDER_MAX_RUNTIME_SECONDS < 300 || HOLDER_MAX_RUNTIME_SECONDS > 86400)); then
+    echo "JPH_HOLDER_MAX_RUNTIME_SECONDS must be in [300, 86400]" >&2
+    exit 2
+  fi
+fi
 
 if [[ ! "${MIN_FREE_MEMORY_MIB}" =~ ^[1-9][0-9]*$ ]]; then
   echo "JPH_B0_MIN_FREE_MEMORY_MIB must be a positive integer" >&2
@@ -181,14 +205,34 @@ done
 
 RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_NONCE="$("${AREAL_VENV}/bin/python" -c 'import secrets; print(secrets.token_hex(16))')"
-RUN_ID="${RUN_STAMP}-official-b0-${RUN_NONCE}"
-RUN_ROOT="${JPH_ROOT}/artifacts/areal-b0/${RUN_ID}"
-LOG_PATH="${JPH_ROOT}/logs/areal-b0-${RUN_ID}.log"
+if [[ "${RUN_MODE}" == holder ]]; then
+  RUN_ID="${JPH_HOLDER_RUN_ID}"
+  RUN_ROOT="${JPH_ROOT}/artifacts/areal-gpu-holder/${RUN_ID}"
+  LOG_PATH="${JPH_ROOT}/logs/areal-gpu-holder-${RUN_ID}.log"
+  MEMORY_AUDIT_SCHEMA="jph.areal-gpu-holder-gpu-memory-audit.v1"
+  MEMORY_RUN_KIND="areal-gpu-holder-v1"
+  EXPERIMENT_NAME="jph-gpu-holder"
+  TOTAL_TRAIN_STEPS="${HOLDER_TOTAL_TRAIN_STEPS}"
+  ROLLOUT_DUMP_TO_FILE=false
+  SAVER_FREQ_STEPS=null
+else
+  RUN_ID="${RUN_STAMP}-official-b0-${RUN_NONCE}"
+  RUN_ROOT="${JPH_ROOT}/artifacts/areal-b0/${RUN_ID}"
+  LOG_PATH="${JPH_ROOT}/logs/areal-b0-${RUN_ID}.log"
+  MEMORY_AUDIT_SCHEMA="jph.areal-official-b0-gpu-memory-audit.v1"
+  MEMORY_RUN_KIND="areal-official-b0-v1"
+  EXPERIMENT_NAME="jph-b0"
+  TOTAL_TRAIN_STEPS=1
+  ROLLOUT_DUMP_TO_FILE=true
+  SAVER_FREQ_STEPS=1
+fi
 NAME_RESOLVE_ROOT="${RUN_ROOT}/name-resolve"
 AUDIT_PATH="${RUN_ROOT}/gpu-memory-audit.json"
 MEMORY_BREACH="${RUN_ROOT}/gpu-memory-breach.txt"
 RUN_STATUS_PATH="${RUN_ROOT}/run.status"
 LOG_FIFO="${RUN_ROOT}/coordinator-output.fifo"
+HOLDER_CONTROL_PATH="${RUN_ROOT}/holder-control.json"
+HOLDER_STOP_REQUEST_PATH="${RUN_ROOT}/stop.requested.json"
 RUN_ADMIN_API_KEY="$(
   "${AREAL_VENV}/bin/python" -c \
     'import secrets; print("jph-b0-" + secrets.token_urlsafe(48))'
@@ -204,6 +248,7 @@ JOB_START_TIME=""
 JOB_SESSION_ID=""
 JOB_LEADER_REAPED=0
 MEMORY_MONITOR_PID=""
+RUNTIME_MONITOR_PID=""
 GPU_DMON_PID=""
 SECRET_REDACTOR_PID=""
 LOG_TEE_PID=""
@@ -211,6 +256,7 @@ AUDIT_READY=0
 AUDIT_WRITTEN=0
 RUN_FAILURE_REASON=""
 B0_ORCHESTRATOR_PID="$$"
+B0_ORCHESTRATOR_START_TIME=""
 
 process_start_time() {
   local pid="$1"
@@ -226,6 +272,8 @@ process_start_time() {
   fi
   printf '%s\n' "${20}"
 }
+
+B0_ORCHESTRATOR_START_TIME="$(process_start_time "${B0_ORCHESTRATOR_PID}")"
 
 bind_job_identity() {
   local attempt actual_start actual_sid
@@ -471,7 +519,8 @@ write_gpu_memory_audit() {
     "${AREAL_VENV}/bin/python" - \
       "${RUN_ROOT}" "${AUDIT_PATH}" "${PROJECT_COMMIT}" \
       "${ACTUAL_AREAL_COMMIT}" "${SOFT_MAX_NEW_GPU_MEMORY_MIB}" \
-      "${HARD_MAX_NEW_GPU_MEMORY_MIB}" \
+      "${HARD_MAX_NEW_GPU_MEMORY_MIB}" "${MEMORY_AUDIT_SCHEMA}" \
+      "${MEMORY_RUN_KIND}" \
       "${GPU_BASELINE_USED[0]}" "${GPU_BASELINE_USED[1]}" \
       "${GPU_BASELINE_USED[2]}" "${GPU_BASELINE_USED[3]}" \
       "${GPU_BASELINE_USED[4]}" "${GPU_BASELINE_USED[5]}" \
@@ -490,6 +539,8 @@ from pathlib import Path
     areal_commit,
     soft_raw,
     hard_raw,
+    memory_audit_schema,
+    memory_run_kind,
     *baseline_raw,
 ) = sys.argv[1:]
 run_root = Path(run_root_raw).resolve(strict=True)
@@ -538,8 +589,8 @@ passed = (
     and all(gpu["passed"] for gpu in gpus)
 )
 record = {
-    "schema_version": "jph.areal-official-b0-gpu-memory-audit.v1",
-    "run_kind": "areal-official-b0-v1",
+    "schema_version": memory_audit_schema,
+    "run_kind": memory_run_kind,
     "project_commit": project_commit,
     "areal_commit": areal_commit,
     "soft_cap_mib": soft_cap,
@@ -598,9 +649,51 @@ redact_and_verify_secret() {
       --verify-absent "${RUN_ROOT}" "${LOG_PATH}" >/dev/null
 }
 
+holder_stop_was_requested() {
+  [[ "${RUN_MODE}" == holder ]] \
+    && [[ -f "${HOLDER_STOP_REQUEST_PATH}" ]] \
+    && [[ ! -L "${HOLDER_STOP_REQUEST_PATH}" ]] \
+    && [[ "$(stat -c %u "${HOLDER_STOP_REQUEST_PATH}")" == "$(id -u)" ]] \
+    && "${AREAL_VENV}/bin/python" - "${HOLDER_STOP_REQUEST_PATH}" \
+      "${RUN_ID}" "${B0_ORCHESTRATOR_PID}" \
+      "${B0_ORCHESTRATOR_START_TIME}" "$(id -u)" <<'PY'
+import json
+import sys
+
+path, run_id, launcher_pid, launcher_start, launcher_uid = sys.argv[1:]
+record = json.load(open(path, encoding="utf-8"))
+expected_fields = {
+    "schema_version", "run_id", "launcher_pid", "launcher_start_time",
+    "reason", "requested_by_uid", "requested_unix",
+}
+if set(record) != expected_fields:
+    raise SystemExit("holder stop-request fields differ from schema")
+if record["schema_version"] != "jph.areal-gpu-holder-stop-request.v1":
+    raise SystemExit("holder stop-request schema differs")
+if record["run_id"] != run_id:
+    raise SystemExit("holder stop-request run ID differs")
+if type(record["launcher_pid"]) is not int or record["launcher_pid"] != int(launcher_pid):
+    raise SystemExit("holder stop-request launcher PID differs")
+if type(record["launcher_start_time"]) is not int or record["launcher_start_time"] != int(launcher_start):
+    raise SystemExit("holder stop-request launcher start time differs")
+if type(record["requested_by_uid"]) is not int or record["requested_by_uid"] != int(launcher_uid):
+    raise SystemExit("holder stop-request UID differs")
+if record["reason"] not in ("manual", "runtime-limit"):
+    raise SystemExit("holder stop-request reason is invalid")
+if type(record["requested_unix"]) is not int or record["requested_unix"] <= 0:
+    raise SystemExit("holder stop-request timestamp is invalid")
+PY
+}
+
 cleanup() {
   local status=$?
+  local controlled_holder_stop=0
   trap - EXIT HUP INT TERM
+  if ((status == 129 || status == 130 || status == 143)) \
+    && holder_stop_was_requested; then
+    controlled_holder_stop=1
+    status=0
+  fi
   if ((status == 0)) && [[ -n "${RUN_FAILURE_REASON}" ]]; then
     status=4
   fi
@@ -609,6 +702,7 @@ cleanup() {
   fi
   stop_owned_job_session
   stop_background_process MEMORY_MONITOR_PID
+  stop_background_process RUNTIME_MONITOR_PID
   stop_background_process GPU_DMON_PID
   stop_background_process SECRET_REDACTOR_PID
   finish_log_tee
@@ -624,7 +718,7 @@ cleanup() {
   if ! write_gpu_memory_audit; then
     status=4
   fi
-  if ((status == 0)); then
+  if ((status == 0)) && [[ "${RUN_MODE}" == official ]]; then
     if ! "${AREAL_VENV}/bin/python" \
       "${SCRIPT_DIR}/verify_areal_official_b0.py" \
         --run-root "${RUN_ROOT}" \
@@ -637,12 +731,21 @@ cleanup() {
     fi
   fi
   if ((status == 0)); then
-    printf 'state=passed\nexit_code=0\nproject_commit=%s\nareal_commit=%s\nrun_root=%s\naudit_path=%s\n' \
-      "${PROJECT_COMMIT}" "${ACTUAL_AREAL_COMMIT}" "${RUN_ROOT}" "${AUDIT_PATH}" \
-      > "${RUN_STATUS_PATH}" || status=4
+    if [[ "${RUN_MODE}" == holder ]]; then
+      if ((controlled_holder_stop != 0)); then
+        final_state=stopped
+      else
+        final_state=completed
+      fi
+    else
+      final_state=passed
+    fi
+    printf 'state=%s\nexit_code=0\nrun_mode=%s\nproject_commit=%s\nareal_commit=%s\nrun_root=%s\naudit_path=%s\n' \
+      "${final_state}" "${RUN_MODE}" "${PROJECT_COMMIT}" "${ACTUAL_AREAL_COMMIT}" \
+      "${RUN_ROOT}" "${AUDIT_PATH}" > "${RUN_STATUS_PATH}" || status=4
   else
-    printf 'state=failed\nexit_code=%s\nreason=%s\nproject_commit=%s\nareal_commit=%s\nrun_root=%s\naudit_path=%s\n' \
-      "${status}" "${RUN_FAILURE_REASON}" "${PROJECT_COMMIT}" \
+    printf 'state=failed\nexit_code=%s\nreason=%s\nrun_mode=%s\nproject_commit=%s\nareal_commit=%s\nrun_root=%s\naudit_path=%s\n' \
+      "${status}" "${RUN_FAILURE_REASON}" "${RUN_MODE}" "${PROJECT_COMMIT}" \
       "${ACTUAL_AREAL_COMMIT}" "${RUN_ROOT}" "${AUDIT_PATH}" \
       > "${RUN_STATUS_PATH}" || true
   fi
@@ -659,13 +762,13 @@ run_all_gpu_gate preflight
 AREAL_ARGS=(
   --config "${AREAL_REPO}/examples/math/gsm8k_grpo.yaml"
   scheduler.type=local
-  experiment_name=jph-b0
+  experiment_name="${EXPERIMENT_NAME}"
   trial_name="${RUN_ID}"
   cluster.n_nodes=1
   cluster.n_gpus_per_node=8
   cluster.fileroot="${RUN_ROOT}"
   cluster.name_resolve.nfs_record_root="${NAME_RESOLVE_ROOT}"
-  +total_train_steps=1
+  +total_train_steps="${TOTAL_TRAIN_STEPS}"
   actor.backend=fsdp:d4p1t1
   actor.path="${MODEL_SNAPSHOT}"
   actor.optimizer.lr=1.70e-5
@@ -680,7 +783,7 @@ AREAL_ARGS=(
   rollout.backend=sglang:d4p1t1
   rollout.max_concurrent_rollouts=8
   rollout.max_head_offpolicyness=0
-  rollout.dump_to_file=true
+  rollout.dump_to_file="${ROLLOUT_DUMP_TO_FILE}"
   '+rollout.agent.admin_api_key=${oc.env:JPH_AREAL_ADMIN_API_KEY}'
   sglang.mem_fraction_static=0.29
   sglang.context_length=1024
@@ -695,12 +798,22 @@ AREAL_ARGS=(
   gconfig.max_new_tokens=256
   gconfig.max_tokens=512
   saver.fileroot="${RUN_ROOT}"
-  saver.freq_steps=1
+  saver.freq_steps="${SAVER_FREQ_STEPS}"
   saver.freq_epochs=null
   saver.freq_secs=null
   +saver.mode=sync
   recover.mode=disabled
 )
+if [[ "${RUN_MODE}" == holder ]]; then
+  AREAL_ARGS+=(
+    recover.freq_steps=null
+    recover.freq_epochs=null
+    recover.freq_secs=null
+    evaluator.freq_steps=null
+    evaluator.freq_epochs=null
+    evaluator.freq_secs=null
+  )
+fi
 
 (
   close_inherited_b0_locks
@@ -717,6 +830,8 @@ cd "${AREAL_REPO}"
 if ! CUDA_VISIBLE_DEVICES="" \
   JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
   JPH_B0_PREFLIGHT_PATH="${RUN_ROOT}/hydra-preflight.json" \
+  JPH_B0_RUN_MODE="${RUN_MODE}" \
+  JPH_B0_EXPECTED_TOTAL_TRAIN_STEPS="${TOTAL_TRAIN_STEPS}" \
   "${AREAL_VENV}/bin/python" - "${AREAL_ARGS[@]}" \
     > "${RUN_ROOT}/hydra-preflight.log" 2>&1 <<'PY'
 import json
@@ -755,6 +870,13 @@ checks = {
     "max_tokens": config.gconfig.max_tokens,
     "rollout_max_concurrent": config.rollout.max_concurrent_rollouts,
     "rollout_max_head_offpolicyness": config.rollout.max_head_offpolicyness,
+    "rollout_dump_to_file": config.rollout.dump_to_file,
+    "recover_freq_steps": config.recover.freq_steps,
+    "recover_freq_epochs": config.recover.freq_epochs,
+    "recover_freq_secs": config.recover.freq_secs,
+    "evaluator_freq_steps": config.evaluator.freq_steps,
+    "evaluator_freq_epochs": config.evaluator.freq_epochs,
+    "evaluator_freq_secs": config.evaluator.freq_secs,
 }
 assert checks["cluster_n_gpus_per_node"] == 8
 assert checks["actor_backend"] == "fsdp:d4p1t1"
@@ -765,7 +887,9 @@ assert checks["ref_scheduling_target"] == "actor"
 assert math.isclose(checks["sglang_mem_fraction_static"], 0.29)
 assert checks["sglang_context_length"] == 1024
 assert checks["sglang_max_running_requests"] == 2
-assert checks["saver_freq_steps"] == 1
+run_mode = os.environ["JPH_B0_RUN_MODE"]
+expected_total_train_steps = int(os.environ["JPH_B0_EXPECTED_TOTAL_TRAIN_STEPS"])
+assert checks["saver_freq_steps"] == (1 if run_mode == "official" else None)
 assert checks["saver_freq_epochs"] is None
 assert checks["saver_freq_secs"] is None
 assert checks["saver_mode"] == "sync"
@@ -774,7 +898,7 @@ assert math.isclose(checks["actor_lr"], 1.70e-5)
 assert checks["actor_lr_scheduler_type"] == "constant"
 assert math.isclose(checks["warmup_steps_proportion"], 0.0)
 assert checks["recover_mode"] == "disabled"
-assert checks["total_train_steps"] == 1
+assert checks["total_train_steps"] == expected_total_train_steps
 assert checks["train_batch_size"] == 8
 assert checks["valid_batch_size"] == 8
 assert checks["n_samples"] == 2
@@ -782,6 +906,14 @@ assert checks["max_new_tokens"] == 256
 assert checks["max_tokens"] == 512
 assert checks["rollout_max_concurrent"] == 8
 assert checks["rollout_max_head_offpolicyness"] == 0
+assert checks["rollout_dump_to_file"] is (run_mode == "official")
+if run_mode == "holder":
+    assert checks["recover_freq_steps"] is None
+    assert checks["recover_freq_epochs"] is None
+    assert checks["recover_freq_secs"] is None
+    assert checks["evaluator_freq_steps"] is None
+    assert checks["evaluator_freq_epochs"] is None
+    assert checks["evaluator_freq_secs"] is None
 path = Path(os.environ["JPH_B0_PREFLIGHT_PATH"])
 descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -850,6 +982,29 @@ if ! bind_job_identity; then
   RUN_FAILURE_REASON="coordinator-setsid-identity-unbound"
   stop_unbound_direct_child
   exit 4
+fi
+if [[ "${RUN_MODE}" == holder ]]; then
+  if ! "${AREAL_VENV}/bin/python" "${SCRIPT_DIR}/stop_areal_gpu_holder.py" \
+    write-control \
+    --run-id "${RUN_ID}" \
+    --run-root "${RUN_ROOT}" \
+    --launcher-pid "${B0_ORCHESTRATOR_PID}" \
+    --launcher-start-time "${B0_ORCHESTRATOR_START_TIME}" \
+    --coordinator-pid "${JOB_PID}" \
+    --coordinator-start-time "${JOB_START_TIME}" \
+    --coordinator-session-id "${JOB_SESSION_ID}" \
+    --project-commit "${PROJECT_COMMIT}" \
+    --areal-commit "${ACTUAL_AREAL_COMMIT}"; then
+    RUN_FAILURE_REASON="holder-control-write-failed"
+    exit 4
+  fi
+  (
+    close_inherited_b0_locks
+    exec "${AREAL_VENV}/bin/python" "${SCRIPT_DIR}/stop_areal_gpu_holder.py" \
+      watch --run-id "${RUN_ID}" \
+      --runtime-seconds "${HOLDER_MAX_RUNTIME_SECONDS}"
+  ) >/dev/null 2>&1 &
+  RUNTIME_MONITOR_PID="$!"
 fi
 
 (
