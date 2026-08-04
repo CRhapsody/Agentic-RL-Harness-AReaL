@@ -16,7 +16,10 @@ from jphrl.trajectory.schema import JointVersion
 
 from .joint_step import ValidatedJointCandidateBundle, validate_joint_candidate_bundle
 from .production_checkpoint import (
+    DISTRIBUTED_RECOVERY_EVIDENCE_SCHEMA_VERSION,
+    RECOVERY_EVIDENCE_SCHEMA_VERSION,
     ValidatedProductionCheckpoint,
+    validate_exact_distributed_joint_recovery_evidence,
     validate_exact_joint_recovery_evidence,
     validate_production_joint_checkpoint,
 )
@@ -826,6 +829,48 @@ def _live_recovery_record(live_recovery: object) -> Mapping[str, object]:
     return record
 
 
+def _validate_persisted_exact_recovery(
+    record: Mapping[str, object],
+    *,
+    checkpoint_manifest: str | Path,
+    checkpoint: ValidatedProductionCheckpoint,
+) -> Mapping[str, object]:
+    distributed_checkpoint = (
+        checkpoint.topology.world_size == 4
+        and checkpoint.topology.data_parallel_size == 4
+        and checkpoint.policy_rank_state_count == 4
+    )
+    single_checkpoint = (
+        checkpoint.topology.world_size == 1
+        and checkpoint.topology.data_parallel_size == 1
+        and checkpoint.policy_rank_state_count == 1
+    )
+    _require(
+        distributed_checkpoint or single_checkpoint,
+        "unsupported exact recovery checkpoint topology",
+    )
+    expected_schema = (
+        DISTRIBUTED_RECOVERY_EVIDENCE_SCHEMA_VERSION
+        if distributed_checkpoint
+        else RECOVERY_EVIDENCE_SCHEMA_VERSION
+    )
+    _require(
+        record.get("schema_version") == expected_schema,
+        "exact recovery schema differs from checkpoint topology",
+    )
+    if distributed_checkpoint:
+        return validate_exact_distributed_joint_recovery_evidence(
+            record,
+            manifest=checkpoint_manifest,
+            current_topology=checkpoint.topology,
+        )
+    return validate_exact_joint_recovery_evidence(
+        record,
+        manifest=checkpoint_manifest,
+        current_topology=checkpoint.topology,
+    )
+
+
 def _require_live_recovery(
     live_recovery: object,
     *,
@@ -1157,10 +1202,10 @@ def validate_candidate_acceptance_report(
             checkpoint_manifest,
             require_component_files=require_component_files,
         )
-        recovery = validate_exact_joint_recovery_evidence(
+        recovery = _validate_persisted_exact_recovery(
             exact_recovery_evidence,
-            manifest=checkpoint_manifest,
-            current_topology=checkpoint.topology,
+            checkpoint_manifest=checkpoint_manifest,
+            checkpoint=checkpoint,
         )
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise CandidateAcceptanceError(str(exc)) from exc

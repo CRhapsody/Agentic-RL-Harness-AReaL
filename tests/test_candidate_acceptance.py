@@ -24,6 +24,10 @@ from jphrl.training.candidate_acceptance import (
     run_joint_candidate_acceptance,
     validate_candidate_acceptance_report,
 )
+from jphrl.training.production_checkpoint import (
+    DISTRIBUTED_RECOVERY_EVIDENCE_SCHEMA_VERSION,
+    RECOVERY_EVIDENCE_SCHEMA_VERSION,
+)
 from jphrl.trajectory.schema import JointVersion
 
 
@@ -146,7 +150,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
             harness_receipt_sha256="6" * 64,
             record_sha256="a" * 64,
         )
-        topology = SimpleNamespace(world_size=1)
+        topology = SimpleNamespace(world_size=1, data_parallel_size=1)
         checkpoint = SimpleNamespace(
             bundle_sha256="a" * 64,
             parent_joint_version=self.parent,
@@ -155,6 +159,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
             source_joint_credit_sha256="b" * 64,
             record_sha256="c" * 64,
             topology=topology,
+            policy_rank_state_count=1,
         )
         if valid_candidate_artifacts:
             policy = CandidateArtifact(
@@ -200,7 +205,10 @@ class CandidateAcceptanceTests(unittest.TestCase):
             harness=harness,
             expected_active_release_id=parent_manifest.release_id,
         )
-        recovery_record = {"record_sha256": "d" * 64}
+        recovery_record = {
+            "schema_version": RECOVERY_EVIDENCE_SCHEMA_VERSION,
+            "record_sha256": "d" * 64,
+        }
         live_recovery = SimpleNamespace(
             record=recovery_record,
             record_sha256="d" * 64,
@@ -331,6 +339,113 @@ class CandidateAcceptanceTests(unittest.TestCase):
                     "persisted_report_regrants_live_acceptance"
                 ]
             )
+
+    def test_distributed_recovery_uses_distributed_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with patch.dict("os.environ", {"JPH_ROOT": str(root)}):
+                scenario = self._scenario(root)
+                scenario.recovery_record["schema_version"] = (
+                    DISTRIBUTED_RECOVERY_EVIDENCE_SCHEMA_VERSION
+                )
+                scenario.checkpoint.topology = SimpleNamespace(
+                    world_size=4,
+                    data_parallel_size=4,
+                )
+                scenario.checkpoint.policy_rank_state_count = 4
+                patches = self._patches(scenario)
+                distributed_audit = {
+                    "integrity_valid": True,
+                    "exact_joint_recovery": False,
+                    "record_sha256": "d" * 64,
+                }
+                with (
+                    patches[0],
+                    patches[1],
+                    patches[3],
+                    patch(
+                        "jphrl.training.candidate_acceptance."
+                        "validate_exact_joint_recovery_evidence"
+                    ) as single_validator,
+                    patch(
+                        "jphrl.training.candidate_acceptance."
+                        "validate_exact_distributed_joint_recovery_evidence",
+                        return_value=distributed_audit,
+                    ) as distributed_validator,
+                ):
+                    live = self._run(root, scenario)
+
+            self.assertTrue(live.report["decision"]["accepted"])
+            single_validator.assert_not_called()
+            distributed_validator.assert_called_once_with(
+                scenario.recovery_record,
+                manifest=root / "manifest.json",
+                current_topology=scenario.checkpoint.topology,
+            )
+
+    def test_recovery_schema_must_match_checkpoint_topology(self) -> None:
+        from jphrl.training.candidate_acceptance import (
+            _validate_persisted_exact_recovery,
+        )
+
+        cases = (
+            (
+                SimpleNamespace(
+                    topology=SimpleNamespace(
+                        world_size=1,
+                        data_parallel_size=1,
+                    ),
+                    policy_rank_state_count=1,
+                ),
+                DISTRIBUTED_RECOVERY_EVIDENCE_SCHEMA_VERSION,
+                "schema differs from checkpoint topology",
+            ),
+            (
+                SimpleNamespace(
+                    topology=SimpleNamespace(
+                        world_size=4,
+                        data_parallel_size=4,
+                    ),
+                    policy_rank_state_count=4,
+                ),
+                RECOVERY_EVIDENCE_SCHEMA_VERSION,
+                "schema differs from checkpoint topology",
+            ),
+            (
+                SimpleNamespace(
+                    topology=SimpleNamespace(
+                        world_size=2,
+                        data_parallel_size=2,
+                    ),
+                    policy_rank_state_count=2,
+                ),
+                RECOVERY_EVIDENCE_SCHEMA_VERSION,
+                "unsupported exact recovery checkpoint topology",
+            ),
+        )
+        for checkpoint, recovery_schema, message in cases:
+            with (
+                self.subTest(
+                    world_size=checkpoint.topology.world_size,
+                    recovery_schema=recovery_schema,
+                ),
+                patch(
+                    "jphrl.training.candidate_acceptance."
+                    "validate_exact_joint_recovery_evidence"
+                ) as single_validator,
+                patch(
+                    "jphrl.training.candidate_acceptance."
+                    "validate_exact_distributed_joint_recovery_evidence"
+                ) as distributed_validator,
+                self.assertRaisesRegex(CandidateAcceptanceError, message),
+            ):
+                _validate_persisted_exact_recovery(
+                    {"schema_version": recovery_schema},
+                    checkpoint_manifest="/unused/manifest.json",
+                    checkpoint=checkpoint,
+                )
+            single_validator.assert_not_called()
+            distributed_validator.assert_not_called()
 
     def test_probe_callback_cannot_report_pass_score_or_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
