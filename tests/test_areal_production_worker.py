@@ -17,6 +17,8 @@ from jphrl.training.areal_production_worker import (
     PinnedArealSGLangActivationWorker,
     _freeze_data_parallel_routes,
     _load_safetensor_export,
+    _parameter_digest,
+    _runtime_parameter_digest,
     _tensor_bytes,
     build_production_probe_output,
     materialize_areal_serving_export_pair,
@@ -230,7 +232,7 @@ def _fake_worker(
     worker._closed = False
     worker._http_json = mesh.request
 
-    def dump(route: object) -> str:
+    def dump(route: object, **_contract: object) -> str:
         mesh.parameter_dumps.append(route.routed_worker_id)
         model_path = mesh.model_paths[route.inference_url]
         return {
@@ -239,6 +241,10 @@ def _fake_worker(
         }[model_path]
 
     worker._dump_live_parameters = dump
+    worker._live_parameter_contract = lambda _expected: (
+        frozenset({"fake.weight"}),
+        False,
+    )
     return worker, controller, mesh, targets
 
 
@@ -265,6 +271,58 @@ class ArealProductionWorkerTests(unittest.TestCase):
                 self.assertEqual(
                     hashlib.sha256(buffer).hexdigest(),
                     hashlib.sha256(legacy).hexdigest(),
+                )
+
+    def test_runtime_digest_restores_only_declared_tied_output_alias(self) -> None:
+        try:
+            import torch
+        except ModuleNotFoundError:
+            self.skipTest("torch is not installed in the local unit-test runtime")
+
+        embedding = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+        layer = torch.arange(4, dtype=torch.bfloat16)
+        runtime = {
+            "model.embed_tokens.weight": embedding,
+            "model.norm.weight": layer,
+        }
+        export_names = frozenset((*runtime, "lm_head.weight"))
+        expected = {
+            **runtime,
+            "lm_head.weight": embedding,
+        }
+        self.assertEqual(
+            _runtime_parameter_digest(
+                runtime,
+                export_parameter_names=export_names,
+                tie_word_embeddings=True,
+            ),
+            _parameter_digest(expected),
+        )
+
+        cases = (
+            (
+                {"model.embed_tokens.weight": embedding},
+                export_names,
+                True,
+                "names differ",
+            ),
+            (runtime, export_names, False, "unapproved output weight"),
+            (
+                {**runtime, "unexpected.weight": layer},
+                export_names,
+                True,
+                "absent from the serving export",
+            ),
+        )
+        for tensors, names, tied, message in cases:
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(ArealProductionWorkerError, message),
+            ):
+                _runtime_parameter_digest(
+                    tensors,
+                    export_parameter_names=names,
+                    tie_word_embeddings=tied,
                 )
 
     def test_safetensor_export_uses_context_handle_keys_api(self) -> None:
@@ -419,6 +477,32 @@ class ArealProductionWorkerTests(unittest.TestCase):
                 "coverage|roster",
             ):
                 worker.read_state()
+
+    def test_live_policy_rejects_one_divergent_or_all_wrong_replicas(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for case in ("one-divergent", "all-wrong"):
+                worker, _controller, _mesh, _targets = _fake_worker(
+                    Path(directory)
+                )
+
+                def dump(route: object, **_contract: object) -> str:
+                    if case == "all-wrong" or route.index == 3:
+                        return "9" * 64
+                    return "1" * 64
+
+                worker._dump_live_parameters = dump
+                with (
+                    self.subTest(case=case),
+                    self.assertRaisesRegex(
+                        ArealProductionWorkerError,
+                        (
+                            "differ across workers"
+                            if case == "one-divergent"
+                            else "differ from the AReaL serving export"
+                        ),
+                    ),
+                ):
+                    worker._verify_live_policy("parent")
 
     def test_four_replica_install_syncs_each_inference_and_data_proxy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

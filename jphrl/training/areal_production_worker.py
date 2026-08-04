@@ -217,6 +217,116 @@ def _load_safetensor_export(root: Path) -> dict[str, object]:
     return tensors
 
 
+def _safetensor_export_parameter_names(root: Path) -> frozenset[str]:
+    try:
+        from safetensors import safe_open
+    except ModuleNotFoundError as exc:  # pragma: no cover - production dependency
+        raise ArealProductionWorkerError(
+            "safetensors is required to verify live AReaL parameters"
+        ) from exc
+    index = root / "model.safetensors.index.json"
+    expected_names: set[str] | None = None
+    if index.is_file():
+        try:
+            record = json.loads(index.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ArealProductionWorkerError(
+                "serving export index is invalid"
+            ) from exc
+        weight_map = record.get("weight_map")
+        _require(
+            isinstance(weight_map, Mapping)
+            and all(
+                isinstance(name, str)
+                and bool(name)
+                and isinstance(shard, str)
+                and bool(shard)
+                for name, shard in weight_map.items()
+            ),
+            "serving export weight map is invalid",
+        )
+        expected_names = set(weight_map)
+        paths = [root / name for name in sorted(set(weight_map.values()))]
+    else:
+        paths = sorted(root.glob("*.safetensors"))
+    _require(bool(paths), "AReaL HF export has no safetensors weights")
+    names: set[str] = set()
+    for path in paths:
+        _require(
+            path.is_file() and not path.is_symlink() and path.parent == root,
+            "serving export weight shard is unsafe",
+        )
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            shard_names = set(handle.keys())
+        _require(
+            bool(shard_names)
+            and all(isinstance(name, str) and bool(name) for name in shard_names)
+            and names.isdisjoint(shard_names),
+            "serving export parameter names are invalid or duplicated",
+        )
+        names.update(shard_names)
+    if expected_names is not None:
+        _require(names == expected_names, "serving export index differs from weights")
+    return frozenset(names)
+
+
+def _runtime_parameter_contract(root: Path) -> tuple[frozenset[str], bool]:
+    config_path = root / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ArealProductionWorkerError(
+            "serving export model config is invalid"
+        ) from exc
+    _require(isinstance(config, Mapping), "serving export model config is invalid")
+    tied = config.get("tie_word_embeddings")
+    _require(
+        type(tied) is bool,
+        "serving export tie_word_embeddings contract is missing",
+    )
+    return _safetensor_export_parameter_names(root), tied
+
+
+def _runtime_parameter_digest(
+    tensors: Mapping[str, object],
+    *,
+    export_parameter_names: frozenset[str],
+    tie_word_embeddings: bool,
+) -> str:
+    _require(
+        type(export_parameter_names) is frozenset
+        and bool(export_parameter_names)
+        and all(isinstance(name, str) and bool(name) for name in export_parameter_names)
+        and type(tie_word_embeddings) is bool,
+        "live parameter digest contract is invalid",
+    )
+    normalized = dict(tensors)
+    _require(
+        set(normalized).issubset(export_parameter_names),
+        "live SGLang parameter names contain values absent from the serving export",
+    )
+    missing = export_parameter_names.difference(normalized)
+    output_name = "lm_head.weight"
+    embedding_name = "model.embed_tokens.weight"
+    if missing == {output_name}:
+        _require(
+            tie_word_embeddings and embedding_name in normalized,
+            "live SGLang parameters omit an unapproved output weight",
+        )
+        # PyTorch named_parameters() removes duplicate Parameter objects.  A
+        # tied Qwen output head is therefore absent from AReaL's SGLang debug
+        # dump even when the HF export serializes both aliases.  Reintroduce
+        # only that declared alias from the observed live embedding tensor;
+        # the full export digest below still proves the two serialized values
+        # are byte-identical.
+        normalized[output_name] = normalized[embedding_name]
+    _require(
+        set(normalized) == export_parameter_names,
+        "live SGLang parameter names differ from the serving export",
+    )
+    return _parameter_digest(normalized)
+
+
 def _write_new_json(path: Path, record: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
@@ -887,7 +997,13 @@ class PinnedArealSGLangActivationWorker(ProductionActivationWorker):
             "live AReaL Policy version differs across DataProxy workers",
         )
 
-    def _dump_live_parameters(self, route: _ArealDataParallelRoute) -> str:
+    def _dump_live_parameters(
+        self,
+        route: _ArealDataParallelRoute,
+        *,
+        export_parameter_names: frozenset[str],
+        tie_word_embeddings: bool,
+    ) -> str:
         path = self._root / (f"live-parameters-dp-{route.index:05d}-{uuid4().hex}.pt")
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(descriptor)
@@ -918,16 +1034,38 @@ class PinnedArealSGLangActivationWorker(ProductionActivationWorker):
         finally:
             path.unlink(missing_ok=True)
         _require(isinstance(tensors, Mapping), "SGLang parameter dump is invalid")
-        return _parameter_digest(tensors)
+        return _runtime_parameter_digest(
+            tensors,
+            export_parameter_names=export_parameter_names,
+            tie_word_embeddings=tie_word_embeddings,
+        )
+
+    def _live_parameter_contract(
+        self, expected: ArealServingExportAudit
+    ) -> tuple[frozenset[str], bool]:
+        return _runtime_parameter_contract(Path(expected.serving_export_path))
 
     def _verify_live_policy(self, release_id: str) -> None:
         expected = self._targets[release_id]
         routes = self._require_frozen_routes()
-        digests = tuple(self._dump_live_parameters(route) for route in routes)
+        export_parameter_names, tie_word_embeddings = (
+            self._live_parameter_contract(expected)
+        )
+        digests = tuple(
+            self._dump_live_parameters(
+                route,
+                export_parameter_names=export_parameter_names,
+                tie_word_embeddings=tie_word_embeddings,
+            )
+            for route in routes
+        )
         _require(
-            len(digests) == len(routes)
-            and all(digest == expected.serving_parameter_sha256 for digest in digests),
-            "live SGLang parameters differ across workers or from the AReaL serving export",
+            len(digests) == len(routes) and len(set(digests)) == 1,
+            "live SGLang parameters differ across workers",
+        )
+        _require(
+            digests[0] == expected.serving_parameter_sha256,
+            "live SGLang parameters differ from the AReaL serving export",
         )
 
     def _post_every_data_proxy(
