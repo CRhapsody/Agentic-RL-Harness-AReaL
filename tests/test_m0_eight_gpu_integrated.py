@@ -38,6 +38,7 @@ from jphrl.experiments.m0_eight_gpu_real_adapter import (
     _bind_pinned_areal_child_environment,
     _commit_actor_with_y_compensation,
     _validate_y_actor_terminal_receipts,
+    build_distributed_inference_runtime_contract,
     build_distributed_rollout_config,
 )
 from jphrl.training.joint_activation import (
@@ -537,6 +538,51 @@ class IntegratedPreflightTests(unittest.TestCase):
 
 
 class RealAdapterCleanupTests(unittest.TestCase):
+    def test_runtime_contract_binds_rollout_prefetch_capacity(self) -> None:
+        torch_module = ModuleType("torch")
+        torch_module.version = SimpleNamespace(cuda="12.8")
+        config = SimpleNamespace(
+            validate=Mock(),
+            max_new_tokens=512,
+            behavior_revision="b" * 40,
+            dataset_revision="c" * 40,
+            dataset_selection="sequential-offset0-count8-v1",
+            project_commit="d" * 40,
+            harness_seed=1,
+            jph_root=Path("/outside-repository"),
+            transaction_id="capacity-contract",
+        )
+        with (
+            patch.dict(sys.modules, {"torch": torch_module}),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter."
+                "distribution_version",
+                return_value="test-version",
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter."
+                "_nvidia_driver_version",
+                return_value="test-driver",
+            ),
+        ):
+            contract = build_distributed_inference_runtime_contract(
+                config,
+                server_args={"disable_cuda_graph": False},
+                gpu_uuids=[f"GPU-{rank}" for rank in range(4)],
+                gpu_names=["test-gpu"] * 4,
+            )
+
+        rollout = contract["fixed"]["rollout"]
+        self.assertEqual(
+            rollout,
+            {
+                "backend": "sglang:d4",
+                "consumer_batch_size": 4,
+                "max_concurrent_rollouts": 8,
+                "max_head_offpolicyness": 1,
+            },
+        )
+
     def test_rollout_capacity_admits_both_frozen_version_zero_batches(self) -> None:
         class ConfigRecord:
             def __init__(self, **kwargs: object) -> None:

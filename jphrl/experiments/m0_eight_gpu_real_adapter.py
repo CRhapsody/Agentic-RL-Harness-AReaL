@@ -761,7 +761,9 @@ def build_distributed_inference_runtime_contract(
         "project_commit": config.project_commit,
         "rollout": {
             "backend": "sglang:d4",
+            "consumer_batch_size": 4,
             "max_concurrent_rollouts": 8,
+            "max_head_offpolicyness": 1,
         },
         "seed": config.harness_seed,
         "server_args": deepcopy(dict(server_args)),
