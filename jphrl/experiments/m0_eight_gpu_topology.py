@@ -85,6 +85,7 @@ class M0EightGPUTopology:
     rollout_backend: str = "sglang:d4"
     rollout_max_concurrent: int = 8
     rollout_consumer_batch_size: int = 4
+    rollout_max_head_offpolicyness: int = 1
     export_style: str = "individual"
     minimum_training_sample_count: int = 4
     memory_policy: str = "observation-only"
@@ -108,7 +109,11 @@ class M0EightGPUTopology:
             self.actor_backend == "fsdp:d4"
             and self.rollout_backend == "sglang:d4"
             and self.rollout_max_concurrent == 8
-            and self.rollout_consumer_batch_size == 4,
+            and self.rollout_consumer_batch_size == 4
+            and self.rollout_max_head_offpolicyness == 1
+            and (self.rollout_max_head_offpolicyness + 1)
+            * self.rollout_consumer_batch_size
+            == self.rollout_max_concurrent,
             "M0 distributed backends must remain fsdp:d4 and sglang:d4",
         )
         _require(
@@ -140,6 +145,7 @@ class M0EightGPUTopology:
                 "worker_count": len(self.rollout_gpu_ids),
                 "max_concurrent_rollouts": self.rollout_max_concurrent,
                 "consumer_batch_size": self.rollout_consumer_batch_size,
+                "max_head_offpolicyness": self.rollout_max_head_offpolicyness,
             },
             "training_batch": {
                 "export_style": self.export_style,
@@ -185,6 +191,7 @@ class M0EightGPUTopology:
             "worker_gpu_per_replica": 1,
             "max_concurrent_rollouts": self.rollout_max_concurrent,
             "consumer_batch_size": self.rollout_consumer_batch_size,
+            "max_head_offpolicyness": self.rollout_max_head_offpolicyness,
             "dump_to_file": False,
         }
 
