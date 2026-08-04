@@ -17,6 +17,7 @@ from jphrl.training.areal_production_worker import (
     PinnedArealSGLangActivationWorker,
     _freeze_data_parallel_routes,
     _load_safetensor_export,
+    _tensor_bytes,
     build_production_probe_output,
     materialize_areal_serving_export_pair,
     require_live_areal_serving_export_pair,
@@ -242,6 +243,30 @@ def _fake_worker(
 
 
 class ArealProductionWorkerTests(unittest.TestCase):
+    def test_tensor_buffer_matches_legacy_storage_bytes(self) -> None:
+        try:
+            import torch
+        except ModuleNotFoundError:
+            self.skipTest("torch is not installed in the local unit-test runtime")
+
+        for dtype in (torch.float32, torch.bfloat16, torch.int64):
+            with self.subTest(dtype=str(dtype)):
+                tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4).to(dtype)
+                legacy = bytes(
+                    tensor.detach()
+                    .cpu()
+                    .contiguous()
+                    .view(torch.uint8)
+                    .untyped_storage()
+                )
+                buffer = _tensor_bytes(tensor)
+                self.assertIsInstance(buffer, memoryview)
+                self.assertEqual(buffer.tobytes(), legacy)
+                self.assertEqual(
+                    hashlib.sha256(buffer).hexdigest(),
+                    hashlib.sha256(legacy).hexdigest(),
+                )
+
     def test_safetensor_export_uses_context_handle_keys_api(self) -> None:
         first = object()
         second = object()

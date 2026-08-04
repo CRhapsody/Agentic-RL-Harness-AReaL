@@ -132,7 +132,7 @@ def _directory_manifest(root: Path) -> dict[str, object]:
     return result
 
 
-def _tensor_bytes(value: object) -> bytes:
+def _tensor_bytes(value: object) -> memoryview:
     try:
         import torch
     except ModuleNotFoundError as exc:  # pragma: no cover - production dependency
@@ -143,7 +143,11 @@ def _tensor_bytes(value: object) -> bytes:
         not tensor.is_floating_point() or bool(torch.isfinite(tensor).all()),
         "serving parameter is non-finite",
     )
-    return bytes(tensor.view(torch.uint8).untyped_storage())
+    # ``bytes(UntypedStorage)`` iterates storage one byte at a time and takes
+    # minutes for a multi-GiB export.  A contiguous uint8 NumPy view exposes
+    # the identical bytes through the buffer protocol, so hashlib consumes
+    # them directly without a Python-level copy or changing the canonical SHA.
+    return memoryview(tensor.view(torch.uint8).numpy()).cast("B")
 
 
 def _parameter_digest(tensors: Mapping[str, object]) -> str:
