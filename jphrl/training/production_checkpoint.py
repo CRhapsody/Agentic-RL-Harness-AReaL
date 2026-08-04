@@ -3608,6 +3608,8 @@ def validate_exact_distributed_joint_recovery_evidence(
                 and item.get("engine_name") == f"actor/{rank}"
                 and item.get("candidate_dcp_manifest_sha256")
                 == candidate_dcp_manifest_sha256
+                and _is_sha256(item.get("continuation_dcp_manifest_sha256"))
+                and _is_sha256(item.get("continuation_dcp_payload_sha256"))
                 and item.get("record_sha256") == _record_sha256(item)
                 and item.get("optimizer_step_before") == saved_policy_step
                 and item.get("optimizer_step_after") == saved_policy_step + 1
@@ -3625,6 +3627,7 @@ def validate_exact_distributed_joint_recovery_evidence(
                     "schema_version",
                     "branch_id",
                     "restore_receipt_sha256",
+                    "continuation_dcp_manifest_sha256",
                     "record_sha256",
                 }
             }

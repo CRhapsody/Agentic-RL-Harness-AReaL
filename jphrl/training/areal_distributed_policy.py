@@ -263,6 +263,42 @@ def _validated_pending_m0_candidate_state(
     return rank_receipt
 
 
+def _checkpoint_dcp_payload_sha256(manifest: Mapping[str, object]) -> str:
+    """Digest DCP tensor/optimizer shards without save-instance metadata."""
+
+    files = manifest.get("files")
+    _require(
+        isinstance(files, list)
+        and len(files) >= 2
+        and sum(
+            isinstance(item, Mapping) and item.get("path") == ".metadata"
+            for item in files
+        )
+        == 1,
+        "distributed DCP manifest has no unique metadata boundary",
+    )
+    payload_files = []
+    for item in files:
+        _require(
+            isinstance(item, Mapping)
+            and set(item) == {"path", "size_bytes", "sha256"}
+            and isinstance(item.get("path"), str)
+            and isinstance(item.get("size_bytes"), int)
+            and not isinstance(item.get("size_bytes"), bool)
+            and item["size_bytes"] >= 0
+            and _is_sha256(item.get("sha256")),
+            "distributed DCP manifest file entry is invalid",
+        )
+        if item["path"] != ".metadata":
+            _require(
+                str(item["path"]).endswith(".distcp"),
+                "distributed DCP payload contains an unexpected file",
+            )
+            payload_files.append(deepcopy(dict(item)))
+    _require(payload_files, "distributed DCP payload is empty")
+    return _sha256({"files": payload_files})
+
+
 def _is_git_commit(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -1174,6 +1210,10 @@ def _continuation_rank_state_payload(
             "schema_version",
             "branch_id",
             "restore_receipt_sha256",
+            # PyTorch DCP metadata contains save-instance details that need
+            # not be byte-identical across an uninterrupted and a restored
+            # save.  Exact state is instead bound by the payload digest.
+            "continuation_dcp_manifest_sha256",
             "record_sha256",
         }
     }
@@ -1352,6 +1392,7 @@ def build_distributed_policy_continuation_receipt(
         "source_binding_sha256",
         "candidate_dcp_manifest_sha256",
         "continuation_dcp_manifest_sha256",
+        "continuation_dcp_payload_sha256",
         "local_sample_indices",
         "optimizer_step_before",
         "optimizer_step_after",
@@ -1373,8 +1414,10 @@ def build_distributed_policy_continuation_receipt(
     ]["manifest_sha256"]
     normalized: list[dict[str, object]] = []
     common_continuation_manifest: str | None = None
+    common_continuation_payload: str | None = None
     for rank, (record, rank_receipt) in enumerate(zip(records, rank_receipts)):
         continuation_manifest = record.get("continuation_dcp_manifest_sha256")
+        continuation_payload = record.get("continuation_dcp_payload_sha256")
         _require(
             set(record) == expected_fields
             and record.get("schema_version")
@@ -1396,6 +1439,7 @@ def build_distributed_policy_continuation_receipt(
             == candidate_manifest_sha256
             and _is_sha256(continuation_manifest)
             and continuation_manifest != candidate_manifest_sha256
+            and _is_sha256(continuation_payload)
             and record.get("local_sample_indices")
             == rank_receipt["local_sample_indices"]
             and record.get("optimizer_step_before")
@@ -1417,6 +1461,12 @@ def build_distributed_policy_continuation_receipt(
         _require(
             continuation_manifest == common_continuation_manifest,
             "distributed W continuation ranks disagree on DCP manifest",
+        )
+        if common_continuation_payload is None:
+            common_continuation_payload = str(continuation_payload)
+        _require(
+            continuation_payload == common_continuation_payload,
+            "distributed W continuation ranks disagree on DCP payload",
         )
         normalized.append(_continuation_rank_state_payload(record))
     continuation_state_sha256 = _sha256(normalized)
@@ -2876,6 +2926,9 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                 )
             )
             continuation_manifest = checkpoint_manifest(continuation_path)
+            continuation_payload_sha256 = _checkpoint_dcp_payload_sha256(
+                continuation_manifest
+            )
             from .production_checkpoint import capture_rank_runtime_state
 
             runtime_after = capture_rank_runtime_state(
@@ -2894,6 +2947,9 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                 "continuation_dcp_manifest_sha256": continuation_manifest[
                     "manifest_sha256"
                 ],
+                "continuation_dcp_payload_sha256": (
+                    continuation_payload_sha256
+                ),
                 "local_sample_indices": list(indices),
                 "optimizer_step_before": optimizer_step_before,
                 "optimizer_step_after": optimizer_step_after,

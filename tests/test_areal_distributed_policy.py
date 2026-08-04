@@ -496,6 +496,9 @@ def _continuation_rank_receipts(
         "manifest_sha256"
     ]
     records = []
+    continuation_manifest_sha256 = (
+        "d" * 64 if branch_id == "uninterrupted" else "e" * 64
+    )
     for rank, rank_receipt in enumerate(remote["rank_receipts"]):
         records.append(
             _seal(
@@ -515,7 +518,10 @@ def _continuation_rank_receipts(
                         "record_sha256"
                     ],
                     "candidate_dcp_manifest_sha256": candidate_manifest,
-                    "continuation_dcp_manifest_sha256": "d" * 64,
+                    "continuation_dcp_manifest_sha256": (
+                        continuation_manifest_sha256
+                    ),
+                    "continuation_dcp_payload_sha256": "6" * 64,
                     "local_sample_indices": [rank],
                     "optimizer_step_before": 3,
                     "optimizer_step_after": 4,
@@ -538,6 +544,40 @@ def _continuation_rank_receipts(
 
 
 class DistributedPolicyReceiptTests(unittest.TestCase):
+    def test_dcp_payload_digest_ignores_only_metadata(self) -> None:
+        def manifest(metadata_sha256: str, shard_sha256: str):
+            return {
+                "files": [
+                    {
+                        "path": ".metadata",
+                        "size_bytes": 10,
+                        "sha256": metadata_sha256,
+                    },
+                    {
+                        "path": "__0_0.distcp",
+                        "size_bytes": 20,
+                        "sha256": shard_sha256,
+                    },
+                ],
+                "manifest_sha256": "f" * 64,
+            }
+
+        first = distributed._checkpoint_dcp_payload_sha256(
+            manifest("a" * 64, "b" * 64)
+        )
+        self.assertEqual(
+            first,
+            distributed._checkpoint_dcp_payload_sha256(
+                manifest("c" * 64, "b" * 64)
+            ),
+        )
+        self.assertNotEqual(
+            first,
+            distributed._checkpoint_dcp_payload_sha256(
+                manifest("a" * 64, "d" * 64)
+            ),
+        )
+
     def test_collective_checkpoint_path_preflight_barriers_before_save(
         self,
     ) -> None:
@@ -1263,6 +1303,14 @@ class DistributedPolicyControllerTests(unittest.TestCase):
         self.assertEqual(
             continuations[0]["continuation_state_sha256"],
             continuations[1]["continuation_state_sha256"],
+        )
+        self.assertNotEqual(
+            continuations[0]["rank_receipts"][0][
+                "continuation_dcp_manifest_sha256"
+            ],
+            continuations[1]["rank_receipts"][0][
+                "continuation_dcp_manifest_sha256"
+            ],
         )
 
         tampered = deepcopy(continuations[1]["rank_receipts"])
