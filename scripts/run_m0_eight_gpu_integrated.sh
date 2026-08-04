@@ -42,6 +42,7 @@ for required_path in \
   "${JPH_PROJECT_DIR}/.git" \
   "${AREAL_REPO}/.git" \
   "${AREAL_VENV}/bin/python" \
+  "${AREAL_VENV}/bin/python3" \
   "${MODEL_REPORT}" \
   "${DATASET_REPORT}"; do
   if [[ ! -e "${required_path}" ]]; then
@@ -49,6 +50,16 @@ for required_path in \
     exit 2
   fi
 done
+
+# Pinned AReaL's SGLang command builder deliberately emits ``python3``.
+# LocalScheduler and its guards inherit PATH, so keep that literal command on
+# the same Python 3.12 virtual environment as the controller instead of the
+# host's Python 3.10 interpreter.
+export PATH="${AREAL_VENV}/bin:${PATH}"
+if [[ "$(command -v python3)" != "${AREAL_VENV}/bin/python3" ]]; then
+  echo "formal integrated child python3 does not resolve to the AReaL venv" >&2
+  exit 2
+fi
 
 PROJECT_COMMIT="$(git -C "${JPH_PROJECT_DIR}" rev-parse HEAD)"
 AREAL_COMMIT="$(git -C "${AREAL_REPO}" rev-parse HEAD)"

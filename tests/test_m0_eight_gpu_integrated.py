@@ -1110,6 +1110,21 @@ class FormalLauncherStaticSafetyTests(unittest.TestCase):
         self.assertIn('--model-report "${MODEL_REPORT}"', text)
         self.assertIn('--dataset-report "${DATASET_REPORT}"', text)
 
+    def test_sglang_child_python3_is_pinned_to_the_areal_venv(self) -> None:
+        text = self.launcher_text
+        path_export = 'export PATH="${AREAL_VENV}/bin:${PATH}"'
+        resolution_check = (
+            '"$(command -v python3)" != "${AREAL_VENV}/bin/python3"'
+        )
+        scheduler_snapshot = text.index(
+            'snapshot_all_eight_gpus "immediately-before-scheduler"'
+        )
+        self.assertIn('"${AREAL_VENV}/bin/python3"', text)
+        self.assertIn(path_export, text)
+        self.assertIn(resolution_check, text)
+        self.assertLess(text.index(path_export), scheduler_snapshot)
+        self.assertLess(text.index(resolution_check), scheduler_snapshot)
+
     def test_execute_mode_constructs_and_runs_the_registered_real_adapter(self) -> None:
         spec = importlib.util.spec_from_file_location(
             "jph_test_run_m0_eight_gpu_integrated",
