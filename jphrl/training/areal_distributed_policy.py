@@ -1849,6 +1849,48 @@ def validate_distributed_policy_current_state_receipt(
     return record
 
 
+def _configure_exact_recovery_cuda_runtime() -> None:
+    """Fail closed unless the actor can execute W deterministically.
+
+    W compares an uninterrupted optimizer continuation with one executed after
+    loading the candidate DCP.  A numerically-close CUDA result is insufficient
+    because it would conceal a different live optimizer/model state.  The
+    launcher establishes the cuBLAS workspace contract before any Python child
+    starts; each actor then enables PyTorch's strict deterministic mode before
+    AReaL constructs the model or optimizer.
+    """
+
+    _require(
+        os.environ.get("CUBLAS_WORKSPACE_CONFIG") == ":4096:8",
+        "exact recovery requires CUBLAS_WORKSPACE_CONFIG=:4096:8",
+    )
+    _require(
+        os.environ.get("PYTHONHASHSEED") == "0",
+        "exact recovery requires PYTHONHASHSEED=0",
+    )
+    try:
+        import torch
+    except ModuleNotFoundError as exc:  # pragma: no cover - remote gate
+        raise ArealDistributedPolicyError(
+            "PyTorch is unavailable for deterministic exact recovery"
+        ) from exc
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    # The formal actor is configured for eager attention.  Disable alternate
+    # scaled-dot-product kernels as a second fail-safe against an implicit
+    # FlashAttention/memory-efficient dispatch with atomic backward reductions.
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+    _require(
+        torch.are_deterministic_algorithms_enabled(),
+        "PyTorch deterministic algorithms did not remain enabled",
+    )
+
+
 class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
     """Pinned AReaL actor with a worker-local atomic M0 update RPC."""
 
@@ -1857,6 +1899,7 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
             raise ArealDistributedPolicyError(
                 "pinned AReaL FSDPPPOActor is unavailable"
             ) from _AREAL_IMPORT_ERROR
+        _configure_exact_recovery_cuda_runtime()
         super().__init__(config)  # type: ignore[misc]
         self._jph_capture_optimizer_step = False
         self._jph_optimizer_step_count = 0

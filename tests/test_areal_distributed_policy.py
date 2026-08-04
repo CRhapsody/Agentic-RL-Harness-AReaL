@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import sys
 import tempfile
 import unittest
 from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import jphrl.training.areal_distributed_policy as distributed
@@ -54,6 +56,66 @@ def _digest(value: object) -> str:
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()
+
+
+class ExactRecoveryCudaRuntimeTests(unittest.TestCase):
+    def test_runtime_requires_launcher_environment_before_torch_setup(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {"CUBLAS_WORKSPACE_CONFIG": ":16:8", "PYTHONHASHSEED": "0"},
+            ),
+            self.assertRaisesRegex(
+                ArealDistributedPolicyError,
+                "CUBLAS_WORKSPACE_CONFIG=:4096:8",
+            ),
+        ):
+            distributed._configure_exact_recovery_cuda_runtime()
+
+    def test_runtime_enables_strict_deterministic_backends(self) -> None:
+        torch = ModuleType("torch")
+        torch.use_deterministic_algorithms = Mock()  # type: ignore[attr-defined]
+        torch.are_deterministic_algorithms_enabled = Mock(  # type: ignore[attr-defined]
+            return_value=True
+        )
+        cudnn = SimpleNamespace(
+            benchmark=True,
+            deterministic=False,
+            allow_tf32=True,
+        )
+        cuda = SimpleNamespace(
+            matmul=SimpleNamespace(allow_tf32=True),
+            enable_flash_sdp=Mock(),
+            enable_mem_efficient_sdp=Mock(),
+            enable_math_sdp=Mock(),
+        )
+        torch.backends = SimpleNamespace(  # type: ignore[attr-defined]
+            cudnn=cudnn,
+            cuda=cuda,
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+                    "PYTHONHASHSEED": "0",
+                },
+            ),
+            patch.dict(sys.modules, {"torch": torch}),
+        ):
+            distributed._configure_exact_recovery_cuda_runtime()
+
+        torch.use_deterministic_algorithms.assert_called_once_with(  # type: ignore[attr-defined]
+            True,
+            warn_only=False,
+        )
+        self.assertFalse(cudnn.benchmark)
+        self.assertTrue(cudnn.deterministic)
+        self.assertFalse(cudnn.allow_tf32)
+        self.assertFalse(cuda.matmul.allow_tf32)
+        cuda.enable_flash_sdp.assert_called_once_with(False)
+        cuda.enable_mem_efficient_sdp.assert_called_once_with(False)
+        cuda.enable_math_sdp.assert_called_once_with(True)
 
 
 def _seal(record: dict[str, object]) -> dict[str, object]:

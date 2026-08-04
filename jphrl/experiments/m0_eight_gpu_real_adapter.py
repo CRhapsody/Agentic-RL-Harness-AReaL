@@ -589,7 +589,11 @@ def build_distributed_actor_config(config: RealEightGPUAdapterConfig) -> object:
         learning_rate=config.learning_rate,
         dtype="bfloat16",
         optimizer_dtype="float32",
-        attention_implementation="flash_attention_2",
+        # FlashAttention backward may use atomic reductions whose low bits
+        # vary across the uninterrupted and checkpoint-restored W branches.
+        # Formal exact-recovery evidence therefore uses the deterministic
+        # eager attention path.  The rollout backend remains real SGLang.
+        attention_implementation="eager",
         gradient_checkpointing=True,
         max_new_tokens=config.max_new_tokens,
     )

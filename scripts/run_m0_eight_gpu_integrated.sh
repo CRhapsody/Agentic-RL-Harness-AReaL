@@ -63,6 +63,13 @@ export CUDA_HOME="${CUDA_TOOLKIT}"
 export CUDA_PATH="${CUDA_TOOLKIT}"
 export PATH="${AREAL_VENV}/bin:${CUDA_TOOLKIT}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_TOOLKIT}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+# W proves checkpoint recovery by repeating the same optimizer continuation
+# and comparing the DCP tensor/optimizer payload byte for byte.  Make CUDA
+# reductions and Python container traversal reproducible in every controller,
+# RPC worker, and scheduler child rather than accepting numerically-close
+# states as exact recovery.
+export CUBLAS_WORKSPACE_CONFIG=":4096:8"
+export PYTHONHASHSEED="0"
 if [[ "$(command -v python3)" != "${AREAL_VENV}/bin/python3" ]]; then
   echo "formal integrated child python3 does not resolve to the AReaL venv" >&2
   exit 2

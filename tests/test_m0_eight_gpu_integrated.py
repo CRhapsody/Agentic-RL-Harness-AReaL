@@ -1303,8 +1303,15 @@ class FormalLauncherStaticSafetyTests(unittest.TestCase):
         cls.repository = Path(__file__).resolve().parents[1]
         cls.launcher = cls.repository / "scripts" / "run_m0_eight_gpu_integrated.sh"
         cls.entry = cls.repository / "scripts" / "run_m0_eight_gpu_integrated.py"
+        cls.real_adapter = (
+            cls.repository
+            / "jphrl"
+            / "experiments"
+            / "m0_eight_gpu_real_adapter.py"
+        )
         cls.launcher_text = cls.launcher.read_text(encoding="utf-8")
         cls.entry_text = cls.entry.read_text(encoding="utf-8")
+        cls.real_adapter_text = cls.real_adapter.read_text(encoding="utf-8")
 
     def test_shell_parses_and_non_tmux_exits_before_remote_setup(self) -> None:
         parsed = subprocess.run(
@@ -1380,6 +1387,26 @@ class FormalLauncherStaticSafetyTests(unittest.TestCase):
         self.assertNotIn("no LocalScheduler or GPU worker", self.entry_text)
         self.assertNotIn('"policy_optimizer_update": True', self.entry_text)
         self.assertNotIn('"harness_optimizer_update": True', self.entry_text)
+
+    def test_exact_recovery_runtime_is_deterministic_before_scheduler(self) -> None:
+        text = self.launcher_text
+        scheduler_snapshot = text.index(
+            'snapshot_all_eight_gpus "immediately-before-scheduler"'
+        )
+        for fragment in (
+            'export CUBLAS_WORKSPACE_CONFIG=":4096:8"',
+            'export PYTHONHASHSEED="0"',
+        ):
+            self.assertIn(fragment, text)
+            self.assertLess(text.index(fragment), scheduler_snapshot)
+        self.assertIn(
+            'attention_implementation="eager"',
+            self.real_adapter_text,
+        )
+        self.assertNotIn(
+            'attention_implementation="flash_attention_2"',
+            self.real_adapter_text,
+        )
 
     def test_nofile_and_snapshot_reports_are_checked_before_scheduler(self) -> None:
         text = self.launcher_text
