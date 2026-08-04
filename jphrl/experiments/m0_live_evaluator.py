@@ -114,6 +114,108 @@ def _finite_summary(value: object) -> dict[str, object]:
     return summary
 
 
+def _summarize_policy_outputs(
+    actor: object,
+    inputs: list[dict[str, Any]],
+    outputs: list[object],
+    *,
+    distributed: bool,
+) -> tuple[dict[str, object], ...]:
+    """Localize the exact AReaL RPC transport before scoring X outputs."""
+
+    if not distributed:
+        return tuple(_finite_summary(output) for output in outputs)
+
+    try:
+        import torch
+        from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
+    except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover
+        raise M0LiveEvaluatorError(
+            "AReaL RTensor transport is required for distributed M0 held-out X"
+        ) from exc
+    _require(
+        bool(outputs) and all(type(output) is RTensor for output in outputs),
+        "distributed held-out result is not an exact AReaL RTensor list",
+    )
+    raw_shard_ids: list[str] = []
+    for index, (input_item, output) in enumerate(
+        zip(inputs, outputs, strict=True)
+    ):
+        expected = input_item.get("input_ids")
+        _require(
+            type(expected) is torch.Tensor
+            and type(output.shard) is TensorShardInfo
+            and isinstance(output.shard.shard_id, str)
+            and bool(output.shard.shard_id)
+            and type(output.data) is torch.Tensor
+            and output.data.is_meta
+            and output.data.dtype is torch.float32
+            and tuple(output.data.shape) == tuple(expected.shape),
+            f"distributed held-out RTensor metadata differs at index {index}",
+        )
+        raw_shard_ids.append(output.shard.shard_id)
+    _require(
+        len(set(raw_shard_ids)) == len(raw_shard_ids),
+        "distributed held-out RTensor shard IDs are not unique",
+    )
+    clear_batches = getattr(actor, "clear_batches", None)
+    _require(
+        callable(clear_batches),
+        "distributed AReaL actor cannot clear held-out RTensor shards",
+    )
+
+    def clear_remote_outputs() -> None:
+        try:
+            clear_batches(
+                *(
+                    {"m0_x_candidate_logprobs": output}
+                    for output in outputs
+                )
+            )
+        except Exception as exc:
+            raise M0LiveEvaluatorError(
+                "distributed held-out RTensor shard cleanup failed"
+            ) from exc
+
+    try:
+        localized = RTensor.localize(outputs)
+        _require(
+            type(localized) is list
+            and len(localized) == len(outputs),
+            "distributed held-out RTensor localization changed result count",
+        )
+        summaries_list: list[dict[str, object]] = []
+        for index, (input_item, output) in enumerate(
+            zip(inputs, localized, strict=True)
+        ):
+            expected = input_item["input_ids"]
+            _require(
+                type(output) is torch.Tensor
+                and output.dtype is torch.float32
+                and tuple(output.shape) == tuple(expected.shape),
+                f"distributed held-out localized tensor differs at index {index}",
+            )
+            summary = _finite_summary(output)
+            _require(
+                summary["finite_fraction"] == 1.0
+                and isinstance(summary["maximum"], float)
+                and summary["maximum"] <= 1.0e-5,
+                f"distributed held-out log-probability is invalid at index {index}",
+            )
+            summaries_list.append(summary)
+        summaries = tuple(summaries_list)
+    except Exception:
+        try:
+            clear_remote_outputs()
+        except M0LiveEvaluatorError as cleanup_error:
+            raise M0LiveEvaluatorError(
+                "distributed held-out measurement and RTensor cleanup both failed"
+            ) from cleanup_error
+        raise
+    clear_remote_outputs()
+    return summaries
+
+
 def _fixture_record(
     *,
     kind: str,
@@ -502,16 +604,27 @@ class RealRlvrM0CandidateEvaluator(M0CandidateEvaluator):
             isinstance(outputs, list) and len(outputs) == len(inputs),
             "AReaL actor returned the wrong held-out log-probability count",
         )
+        distributed = actor_identity == (
+            "jphrl.training.areal_distributed_policy.JPHPPOActorController"
+        )
+        summaries = _summarize_policy_outputs(
+            actor,
+            inputs,
+            outputs,
+            distributed=distributed,
+        )
         measured: list[dict[str, object]] = []
-        for identity, output in zip(identities, outputs):
-            summary = _finite_summary(output)
-            measured.append(
-                {
-                    "runner_admission_sha256": identity[0],
-                    "sample_id": identity[1],
-                    "candidate_logprobs": summary,
-                }
-            )
+        for identity, summary in zip(identities, summaries, strict=True):
+            record: dict[str, object] = {
+                "runner_admission_sha256": identity[0],
+                "sample_id": identity[1],
+                "candidate_logprobs": summary,
+            }
+            if distributed:
+                record["transport_localization"] = (
+                    "AReaL-RTensor.localize-before-score-and-clear-v1"
+                )
+            measured.append(record)
         return tuple(measured)
 
     def _measure_harness(

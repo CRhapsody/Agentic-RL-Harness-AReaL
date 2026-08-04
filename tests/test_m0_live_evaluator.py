@@ -4,12 +4,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from jphrl.experiments.m0_joint_runner import load_m0_rlvr_source_records
 from jphrl.experiments.m0_live_evaluator import (
     M0LiveEvaluatorError,
     RealRlvrM0CandidateEvaluator,
+    _summarize_policy_outputs,
 )
 from jphrl.training.areal_distributed_policy import JPHPPOActorController
 from jphrl.trajectory.rlvr_workflow_admission import (
@@ -183,6 +184,194 @@ class RealRlvrM0CandidateEvaluatorTests(unittest.TestCase):
                 ),
             )
         actor.compute_logp.assert_not_called()
+
+    def test_distributed_rtensor_outputs_are_localized_scored_and_cleared(self) -> None:
+        from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
+
+        actor = Mock()
+        inputs = [
+            {"input_ids": torch.zeros((1, length), dtype=torch.long)}
+            for length in (2, 3)
+        ]
+        outputs = [
+            RTensor(
+                shard=TensorShardInfo(
+                    shard_id=f"heldout-{index}",
+                    node_addr="unused-for-local-test",
+                ),
+                data=torch.empty(
+                    tuple(item["input_ids"].shape),
+                    dtype=torch.float32,
+                    device="meta",
+                ),
+            )
+            for index, item in enumerate(inputs)
+        ]
+        localized = [
+            torch.full(
+                tuple(item["input_ids"].shape),
+                -0.25,
+                dtype=torch.float32,
+            )
+            for item in inputs
+        ]
+
+        with patch.object(RTensor, "localize", return_value=localized) as localize:
+            summaries = _summarize_policy_outputs(
+                actor,
+                inputs,
+                outputs,
+                distributed=True,
+            )
+
+        self.assertEqual(len(summaries), 2)
+        self.assertTrue(all(item["finite_fraction"] == 1.0 for item in summaries))
+        localize.assert_called_once_with(outputs)
+        actor.clear_batches.assert_called_once()
+        cleared = actor.clear_batches.call_args.args
+        self.assertEqual(len(cleared), 2)
+        self.assertTrue(
+            all(
+                item["m0_x_candidate_logprobs"] is output
+                for item, output in zip(cleared, outputs, strict=True)
+            )
+        )
+
+    def test_distributed_tensor_or_mixed_transport_fails_closed(self) -> None:
+        from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
+
+        actor = Mock()
+        inputs = [{"input_ids": torch.zeros((1, 1), dtype=torch.long)}]
+        remote = RTensor(
+            shard=TensorShardInfo(
+                shard_id="heldout-remote",
+                node_addr="unused-for-local-test",
+            ),
+            data=torch.empty((1, 1), dtype=torch.float32, device="meta"),
+        )
+        for outputs in (
+            [torch.tensor([[-0.25]], dtype=torch.float32)],
+            [remote, torch.tensor([[-0.25]], dtype=torch.float32)],
+        ):
+            with self.subTest(output_types=tuple(type(item) for item in outputs)):
+                with self.assertRaisesRegex(
+                    M0LiveEvaluatorError,
+                    "not an exact AReaL RTensor list",
+                ):
+                    _summarize_policy_outputs(
+                        actor,
+                        inputs * len(outputs),
+                        outputs,
+                        distributed=True,
+                    )
+        actor.clear_batches.assert_not_called()
+
+    def test_distributed_rtensor_metadata_and_localized_tensor_are_strict(self) -> None:
+        from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
+
+        actor = Mock()
+        inputs = [
+            {"input_ids": torch.zeros((1, length), dtype=torch.long)}
+            for length in (2, 3)
+        ]
+
+        def remote(shard_id, shape=(1, 2), dtype=torch.float32):
+            return RTensor(
+                shard=TensorShardInfo(
+                    shard_id=shard_id,
+                    node_addr="unused-for-local-test",
+                ),
+                data=torch.empty(shape, dtype=dtype, device="meta"),
+            )
+
+        invalid_raw_cases = (
+            ("duplicate", [remote("same"), remote("same", (1, 3))], "not unique"),
+            (
+                "wrong-shape",
+                [remote("a", (1, 3)), remote("b", (1, 3))],
+                "metadata differs",
+            ),
+            (
+                "wrong-dtype",
+                [remote("a", dtype=torch.float64), remote("b", (1, 3))],
+                "metadata differs",
+            ),
+        )
+        for label, outputs, message in invalid_raw_cases:
+            with self.subTest(raw=label):
+                with self.assertRaisesRegex(M0LiveEvaluatorError, message):
+                    _summarize_policy_outputs(
+                        actor,
+                        inputs,
+                        outputs,
+                        distributed=True,
+                    )
+
+        valid_raw = [remote("a"), remote("b", (1, 3))]
+        invalid_localized_cases = (
+            (
+                "crossed-shape",
+                [torch.zeros((1, 3)), torch.zeros((1, 2))],
+                "localized tensor differs",
+            ),
+            (
+                "wrong-dtype",
+                [torch.zeros((1, 2), dtype=torch.float64), torch.zeros((1, 3))],
+                "localized tensor differs",
+            ),
+            (
+                "non-finite",
+                [torch.tensor([[float("nan"), -0.5]]), torch.zeros((1, 3))],
+                "log-probability is invalid",
+            ),
+            (
+                "positive-logprob",
+                [torch.tensor([[0.1, -0.5]]), torch.zeros((1, 3))],
+                "log-probability is invalid",
+            ),
+        )
+        for label, localized, message in invalid_localized_cases:
+            actor.reset_mock()
+            with self.subTest(localized=label):
+                with patch.object(RTensor, "localize", return_value=localized):
+                    with self.assertRaisesRegex(M0LiveEvaluatorError, message):
+                        _summarize_policy_outputs(
+                            actor,
+                            inputs,
+                            valid_raw,
+                            distributed=True,
+                        )
+                actor.clear_batches.assert_called_once()
+
+    def test_distributed_rtensor_cleanup_failure_fails_closed(self) -> None:
+        from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
+
+        actor = Mock()
+        actor.clear_batches.side_effect = RuntimeError("cleanup failed")
+        inputs = [{"input_ids": torch.zeros((1, 1), dtype=torch.long)}]
+        output = RTensor(
+            shard=TensorShardInfo(
+                shard_id="heldout-cleanup",
+                node_addr="unused-for-local-test",
+            ),
+            data=torch.empty((1, 1), dtype=torch.float32, device="meta"),
+        )
+
+        with patch.object(
+            RTensor,
+            "localize",
+            return_value=[torch.tensor([[-0.25]], dtype=torch.float32)],
+        ):
+            with self.assertRaisesRegex(
+                M0LiveEvaluatorError,
+                "RTensor shard cleanup failed",
+            ):
+                _summarize_policy_outputs(
+                    actor,
+                    inputs,
+                    [output],
+                    distributed=True,
+                )
 
 
 if __name__ == "__main__":
