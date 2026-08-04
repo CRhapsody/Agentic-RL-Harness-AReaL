@@ -791,6 +791,25 @@ def build_distributed_inference_runtime_contract(
     return contract
 
 
+def _order_training_sources_for_multi_s(
+    training_sources: Sequence[RLVRM0SourceRecords],
+    multi_s_batch: ValidatedMultiSFrozenTrainingBatch,
+) -> tuple[RLVRM0SourceRecords, ...]:
+    """Return the selected sources in the batch's canonical member order."""
+
+    claims = required_v_member_claims(multi_s_batch)
+    sources_by_claim = {
+        source.s_record_sha256: source for source in training_sources
+    }
+    _require(
+        len(training_sources) == 4
+        and len(sources_by_claim) == 4
+        and set(sources_by_claim) == set(claims),
+        "TUVW sources differ from the ordered four-member multi-S batch",
+    )
+    return tuple(sources_by_claim[claim] for claim in claims)
+
+
 def _activate_pinned_areal_child_overlay(config: RealEightGPUAdapterConfig) -> None:
     """Route only new AReaL service children through the audited hook overlay.
 
@@ -1496,11 +1515,9 @@ class RealEightGPUIntegratedAdapters:
     ) -> IntegratedStageReference:
         del scheduler
         _require(self.actor is not None, "TUVW requires the live actor")
-        _require(
-            len(training_sources) == 4
-            and tuple(source.s_record_sha256 for source in training_sources)
-            == required_v_member_claims(multi_s_batch),
-            "TUVW sources differ from the ordered four-member multi-S batch",
+        ordered_training_sources = _order_training_sources_for_multi_s(
+            training_sources,
+            multi_s_batch,
         )
         # Imported here so CPU contract tests cannot accidentally claim an update.
         from jphrl.harness.torch_learning import (
@@ -1520,10 +1537,10 @@ class RealEightGPUIntegratedAdapters:
                 source.s_joint_credit,
                 active_joint_version=active,
             )
-            for source in training_sources
+            for source in ordered_training_sources
         ]
         checkpoints: list[Mapping[str, object]] = []
-        for source in training_sources:
+        for source in ordered_training_sources:
             checkpoint = source.runner_admission["bridge_record"]["harness"][
                 "controller_checkpoint_before_decision"
             ]
@@ -1580,7 +1597,7 @@ class RealEightGPUIntegratedAdapters:
             harness_receipt,
         )
         self.harness_result = harness_result
-        self.training_sources = tuple(training_sources)
+        self.training_sources = ordered_training_sources
         self.multi_s_batch = multi_s_batch
         self.behavior_checkpoint_path = behavior_path
         self.behavior_checkpoint_sha256 = str(checkpoints[0]["record_sha256"])

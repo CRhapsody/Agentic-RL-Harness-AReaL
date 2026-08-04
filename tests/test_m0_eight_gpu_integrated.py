@@ -37,6 +37,7 @@ from jphrl.experiments.m0_eight_gpu_real_adapter import (
     _activate_pinned_areal_child_overlay,
     _bind_pinned_areal_child_environment,
     _commit_actor_with_y_compensation,
+    _order_training_sources_for_multi_s,
     _validate_y_actor_terminal_receipts,
     build_distributed_inference_runtime_contract,
     build_distributed_rollout_config,
@@ -50,6 +51,7 @@ from jphrl.trajectory.schema import JointVersion
 from jphrl.trajectory.rlvr_workflow_admission import (
     prepare_rlvr_workflow_joint_admission,
 )
+from jphrl.trajectory.multi_s_frozen_training_batch import required_v_member_claims
 from tests.test_rlvr_workflow_admission import _fake_areal_type_import, _source
 
 def _canonical_json(value: object) -> bytes:
@@ -400,6 +402,24 @@ class EightGPUAdmissionSelectionTests(unittest.TestCase):
             )
             self.assertFalse(record["evidence_scope"]["holdouts_used_for_training"])
             self.assertFalse(record["evidence_scope"]["policy_optimizer_update"])
+
+            canonical = _order_training_sources_for_multi_s(
+                tuple(reversed(selection.training_sources)),
+                selection.multi_s_batch,
+            )
+            self.assertEqual(
+                tuple(source.s_record_sha256 for source in canonical),
+                required_v_member_claims(selection.multi_s_batch),
+            )
+            with self.assertRaisesRegex(
+                M0EightGPURealAdapterError,
+                "TUVW sources differ",
+            ):
+                _order_training_sources_for_multi_s(
+                    selection.training_sources[:3]
+                    + (selection.training_sources[0],),
+                    selection.multi_s_batch,
+                )
 
     def test_count_extra_duplicate_and_reuse_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
