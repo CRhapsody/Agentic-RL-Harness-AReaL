@@ -165,6 +165,37 @@ def _require(condition: bool, message: str) -> None:
         raise ArealDistributedPolicyError(message)
 
 
+def _validated_pending_w_candidate_path(
+    *,
+    pending: Mapping[str, object],
+    candidate_path: str,
+    candidate_dcp_manifest_sha256: str,
+) -> Path:
+    """Bind W to the exact candidate path and bytes persisted by T."""
+
+    path = require_within_configured_root(candidate_path)
+    _require(
+        path.is_dir() and not path.is_symlink(),
+        "distributed W candidate DCP is missing or unsafe",
+    )
+    _require(
+        isinstance(pending.get("candidate_path"), str)
+        and str(path) == pending["candidate_path"],
+        "distributed W candidate DCP path differs from T",
+    )
+    observed_manifest_sha256 = checkpoint_manifest(path)["manifest_sha256"]
+    _require(
+        observed_manifest_sha256 == candidate_dcp_manifest_sha256,
+        "distributed W candidate DCP contents differ from T",
+    )
+    _require(
+        candidate_dcp_manifest_sha256
+        == pending.get("candidate_manifest_sha256"),
+        "distributed W candidate DCP manifest binding differs from T",
+    )
+    return path
+
+
 def _canonical_json(value: object) -> bytes:
     try:
         return json.dumps(
@@ -2475,15 +2506,12 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
                 and isinstance(pending.get("w_source"), Mapping),
                 "distributed W restore differs from the live T transaction",
             )
-            path = require_within_configured_root(candidate_path)
-            _require(
-                path.is_dir()
-                and not path.is_symlink()
-                and str(path) == str(pending.get("candidate_path"))
-                and checkpoint_manifest(path)["manifest_sha256"]
-                == candidate_dcp_manifest_sha256
-                == pending.get("candidate_manifest_sha256"),
-                "distributed W candidate DCP differs from T",
+            path = _validated_pending_w_candidate_path(
+                pending=pending,
+                candidate_path=candidate_path,
+                candidate_dcp_manifest_sha256=(
+                    candidate_dcp_manifest_sha256
+                ),
             )
             from .production_checkpoint import (
                 RankRuntimeState,
@@ -3199,6 +3227,7 @@ class JPHFSDPPPOActor(_ArealFSDPPPOActor):  # type: ignore[misc,valid-type]
         self._jph_pending_m0_transaction = {
             "transaction_id": transaction_id,
             "parent_path": str(state["parent_path"]),
+            "candidate_path": str(state["candidate_path"]),
             "optimizer_step_before": state["optimizer_step_before"],
             "scheduler_state_before": deepcopy(state["scheduler_state_before"]),
             # W re-materializes only the individual, pre-batch sources that T

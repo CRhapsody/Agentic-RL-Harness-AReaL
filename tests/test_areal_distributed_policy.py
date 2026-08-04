@@ -538,6 +538,59 @@ def _continuation_rank_receipts(
 
 
 class DistributedPolicyReceiptTests(unittest.TestCase):
+    def test_w_candidate_checkpoint_requires_exact_pending_path_and_manifest(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            candidate = root / "policy-candidate.dcp"
+            candidate.mkdir()
+            (candidate / "state").write_bytes(b"candidate")
+            manifest_sha256 = checkpoint_manifest(candidate)["manifest_sha256"]
+            pending = {
+                "candidate_path": str(candidate),
+                "candidate_manifest_sha256": manifest_sha256,
+            }
+            with patch.dict("os.environ", {"JPH_ROOT": str(root)}):
+                self.assertEqual(
+                    distributed._validated_pending_w_candidate_path(
+                        pending=pending,
+                        candidate_path=str(candidate),
+                        candidate_dcp_manifest_sha256=manifest_sha256,
+                    ),
+                    candidate,
+                )
+
+                for changed_pending, supplied_manifest, message in (
+                    (
+                        {"candidate_manifest_sha256": manifest_sha256},
+                        manifest_sha256,
+                        "path differs from T",
+                    ),
+                    (
+                        pending,
+                        "f" * 64,
+                        "contents differ from T",
+                    ),
+                    (
+                        {
+                            "candidate_path": str(candidate),
+                            "candidate_manifest_sha256": "e" * 64,
+                        },
+                        manifest_sha256,
+                        "manifest binding differs from T",
+                    ),
+                ):
+                    with self.subTest(message=message), self.assertRaisesRegex(
+                        ArealDistributedPolicyError,
+                        message,
+                    ):
+                        distributed._validated_pending_w_candidate_path(
+                            pending=changed_pending,
+                            candidate_path=str(candidate),
+                            candidate_dcp_manifest_sha256=supplied_manifest,
+                        )
+
     def test_parent_dcp_baseline_allows_only_optional_lazy_adamw_init(self) -> None:
         distributed._require_post_parent_optimizer_baseline(
             pre_parent_dcp_step=0,
