@@ -1039,12 +1039,13 @@ class RealEightGPUIntegratedAdapters:
         try:
             actor.create_process_group()
             actor.initialize(
-                "actor",
-                FinetuneSpec(
+                addr=None,
+                ft_spec=FinetuneSpec(
                     total_train_epochs=1,
                     dataset_size=4,
                     train_batch_size=4,
                 ),
+                role="actor",
             )
             actor.set_version(0)
             _require(actor.get_version() == 0, "actor public version did not initialize")

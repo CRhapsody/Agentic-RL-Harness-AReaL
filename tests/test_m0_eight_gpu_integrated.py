@@ -5,10 +5,11 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 from jphrl.experiments.m0_eight_gpu_integrated import (
@@ -458,6 +459,104 @@ class IntegratedPreflightTests(unittest.TestCase):
 
 
 class RealAdapterCleanupTests(unittest.TestCase):
+    def test_actor_initialize_forwards_required_engine_addr_by_keyword(self) -> None:
+        class FinetuneSpec:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        class Actor:
+            def __init__(self) -> None:
+                self.initialize_args: tuple[object, ...] | None = None
+                self.initialize_kwargs: dict[str, object] | None = None
+                self.version = -1
+
+            def create_process_group(self) -> None:
+                pass
+
+            def initialize(self, *args: object, **kwargs: object) -> None:
+                self.initialize_args = args
+                self.initialize_kwargs = kwargs
+
+            def set_version(self, version: int) -> None:
+                self.version = version
+
+            def get_version(self) -> int:
+                return self.version
+
+            def destroy(self) -> None:
+                pass
+
+        actor = Actor()
+
+        class ActorType:
+            @classmethod
+            def as_controller(cls, config: object, scheduler: object) -> Actor:
+                return actor
+
+        areal_module = ModuleType("areal")
+        areal_api_module = ModuleType("areal.api")
+        areal_api_module.FinetuneSpec = FinetuneSpec
+        adapter = object.__new__(RealEightGPUIntegratedAdapters)
+        adapter.config = object()
+        adapter.actor = None
+        scheduler = IntegratedSchedulerHandle(
+            instance_id="scheduler",
+            implementation_class="areal.infra.scheduler.local.LocalScheduler",
+            gpu_ids=tuple(range(8)),
+            native_scheduler=object(),
+            execution_mode="real-gpu",
+        )
+        placements = tuple(
+            M0WorkerPlacement(
+                role="actor",
+                rank=rank,
+                physical_gpu_id=rank,
+                worker_id=f"actor/{rank}",
+            )
+            for rank in range(4)
+        )
+        with (
+            patch.dict(
+                sys.modules,
+                {"areal": areal_module, "areal.api": areal_api_module},
+            ),
+            patch(
+                "jphrl.training.areal_distributed_policy.JPHFSDPPPOActor",
+                ActorType,
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter."
+                "build_distributed_actor_config",
+                return_value=object(),
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter."
+                "assert_controller_has_no_local_optimizer",
+            ),
+            patch(
+                "jphrl.experiments.m0_eight_gpu_real_adapter."
+                "observe_local_scheduler_placements",
+                return_value=placements,
+            ),
+        ):
+            observed = adapter.start_actor(scheduler)
+
+        self.assertEqual(observed, placements)
+        self.assertEqual(actor.initialize_args, ())
+        self.assertIsNotNone(actor.initialize_kwargs)
+        assert actor.initialize_kwargs is not None
+        self.assertEqual(set(actor.initialize_kwargs), {"addr", "ft_spec", "role"})
+        self.assertIsNone(actor.initialize_kwargs["addr"])
+        self.assertEqual(actor.initialize_kwargs["role"], "actor")
+        self.assertEqual(
+            actor.initialize_kwargs["ft_spec"].kwargs,
+            {
+                "total_train_epochs": 1,
+                "dataset_size": 4,
+                "train_batch_size": 4,
+            },
+        )
+
     def test_actor_destroy_runs_even_when_pending_parent_rollback_fails(self) -> None:
         class Actor:
             def __init__(self) -> None:
