@@ -333,9 +333,10 @@ def test_upstream_patch_pinned_tree_applies_and_exposes_deployment_injection() -
     assert callback_position < patch_text.index(
         "+            merged.update(interactions)"
     )
-    assert "DataProxyConfig" not in patch_text.split(
+    main_patch = patch_text.split(
         "diff --git a/areal/v2/inference_service/data_proxy/__main__.py", 1
-    )[1]
+    )[1].split("diff --git ", 1)[0]
+    assert "DataProxyConfig" not in main_patch
 
 
 def load_tests(loader, tests, pattern):

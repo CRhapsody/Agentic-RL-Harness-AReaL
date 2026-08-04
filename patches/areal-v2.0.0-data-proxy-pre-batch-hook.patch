@@ -1,9 +1,50 @@
+diff --git a/areal/v2/inference_service/data_proxy/__main__.py b/areal/v2/inference_service/data_proxy/__main__.py
+index e0458be..a2755b3 100644
+--- a/areal/v2/inference_service/data_proxy/__main__.py
++++ b/areal/v2/inference_service/data_proxy/__main__.py
+@@ -5,6 +5,7 @@
+ from __future__ import annotations
+
+ import argparse
++import os
+
+ import uvicorn
+
+@@ -12,6 +13,7 @@ from areal.infra.utils.http import (
+     get_default_uvicorn_kwargs,
+     validate_admin_api_key,
+ )
++from areal.utils.dynamic_import import import_from_string
+ from areal.utils.logging import suppress_http_loggers
+ from areal.utils.network import format_hostport
+ from areal.v2.inference_service.data_proxy.app import create_app
+@@ -104,7 +106,20 @@ def main():
+         chat_template_type=args.chat_template_type,
+     )
+     suppress_http_loggers()
+-    app = create_app(config)
++    hook_import_path = os.environ.get("AREAL_PRE_BATCH_HOOK", "")
++    pre_batch_export_hook = (
++        import_from_string(hook_import_path) if hook_import_path else None
++    )
++    if isinstance(pre_batch_export_hook, type):
++        pre_batch_export_hook = pre_batch_export_hook()
++    if pre_batch_export_hook is not None and not callable(pre_batch_export_hook):
++        raise TypeError(
++            "AREAL_PRE_BATCH_HOOK must resolve to a callable or zero-argument class"
++        )
++    app = create_app(
++        config,
++        pre_batch_export_hook=pre_batch_export_hook,
++    )
+     uvicorn.run(
+         app,
+         host=config.host,
 diff --git a/areal/v2/inference_service/data_proxy/app.py b/areal/v2/inference_service/data_proxy/app.py
-index 297899a..9c33430 100644
+index 5f703d7..2969196 100644
 --- a/areal/v2/inference_service/data_proxy/app.py
 +++ b/areal/v2/inference_service/data_proxy/app.py
-@@ -3,11 +3,13 @@
- from __future__ import annotations
+@@ -4,10 +4,12 @@ from __future__ import annotations
  
  import asyncio
  import hmac
@@ -17,7 +58,7 @@ index 297899a..9c33430 100644
  
  import httpx
  from fastapi import FastAPI, HTTPException, Request
-@@ -47,6 +49,20 @@ from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
+@@ -53,6 +55,20 @@ from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
  logger = logging.getLogger("InferenceDataProxy")
  
  
@@ -51,7 +92,7 @@ index 297899a..9c33430 100644
      """Factory that creates the FastAPI app with lifespan-managed resources."""
  
      @asynccontextmanager
-@@ -731,13 +751,24 @@ def create_app(config: DataProxyConfig) -> FastAPI:
+@@ -731,15 +751,26 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                  continue
  
              try:
@@ -64,7 +105,7 @@ index 297899a..9c33430 100644
 -                merged.update(interactions)
              except KeyError:
                  continue
-+
+
 +            if pre_batch_export_hook is not None:
 +                hook_result = pre_batch_export_hook(
 +                    session_id=sid,
@@ -76,48 +117,7 @@ index 297899a..9c33430 100644
 +                if inspect.isawaitable(hook_result):
 +                    await hook_result
 +            merged.update(interactions)
-
++
          if all(v.has_tensor_data for v in merged.values()):
-diff --git a/areal/v2/inference_service/data_proxy/__main__.py b/areal/v2/inference_service/data_proxy/__main__.py
-index 7253459..e80f235 100644
---- a/areal/v2/inference_service/data_proxy/__main__.py
-+++ b/areal/v2/inference_service/data_proxy/__main__.py
-@@ -5,13 +5,15 @@
- from __future__ import annotations
- 
- import argparse
-+import os
- 
- import uvicorn
- 
- from areal.infra.utils.http import (
-     get_default_uvicorn_kwargs,
-     validate_admin_api_key,
- )
-+from areal.utils.dynamic_import import import_from_string
- from areal.utils.logging import suppress_http_loggers
- from areal.utils.network import format_hostport
- from areal.v2.inference_service.data_proxy.app import create_app
-@@ -103,8 +105,21 @@ def main():
-         engine_max_tokens=args.engine_max_tokens,
-         chat_template_type=args.chat_template_type,
-     )
-     suppress_http_loggers()
--    app = create_app(config)
-+    hook_import_path = os.environ.get("AREAL_PRE_BATCH_HOOK", "")
-+    pre_batch_export_hook = (
-+        import_from_string(hook_import_path) if hook_import_path else None
-+    )
-+    if isinstance(pre_batch_export_hook, type):
-+        pre_batch_export_hook = pre_batch_export_hook()
-+    if pre_batch_export_hook is not None and not callable(pre_batch_export_hook):
-+        raise TypeError(
-+            "AREAL_PRE_BATCH_HOOK must resolve to a callable or zero-argument class"
-+        )
-+    app = create_app(
-+        config,
-+        pre_batch_export_hook=pre_batch_export_hook,
-+    )
-     uvicorn.run(
-         app,
-         host=config.host,
+             traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
+             traj = RTensor.remotize(traj, node_addr=config.serving_addr)
