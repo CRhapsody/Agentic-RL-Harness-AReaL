@@ -200,7 +200,10 @@ def _load_safetensor_export(root: Path) -> dict[str, object]:
             "serving export weight shard is unsafe",
         )
         with safe_open(path, framework="pt", device="cpu") as handle:
-            for name in handle:
+            # ``safe_open`` exposes parameter names through ``keys()``.  Its
+            # context handle is not an iterable in current safetensors
+            # releases, even though older test doubles often were.
+            for name in handle.keys():
                 _require(name not in tensors, "serving export parameter is duplicated")
                 tensors[name] = handle.get_tensor(name)
     if index.is_file():

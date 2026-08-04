@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 from jphrl.training.areal_production_worker import (
     ArealProductionWorkerError,
@@ -14,6 +16,7 @@ from jphrl.training.areal_production_worker import (
     LiveArealServingExportPair,
     PinnedArealSGLangActivationWorker,
     _freeze_data_parallel_routes,
+    _load_safetensor_export,
     build_production_probe_output,
     materialize_areal_serving_export_pair,
     require_live_areal_serving_export_pair,
@@ -239,6 +242,40 @@ def _fake_worker(
 
 
 class ArealProductionWorkerTests(unittest.TestCase):
+    def test_safetensor_export_uses_context_handle_keys_api(self) -> None:
+        first = object()
+        second = object()
+
+        class SafeOpenHandle:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def keys(self):
+                return ["model.first", "model.second"]
+
+            def get_tensor(self, name):
+                return {
+                    "model.first": first,
+                    "model.second": second,
+                }[name]
+
+        safetensors = ModuleType("safetensors")
+        safetensors.safe_open = Mock(  # type: ignore[attr-defined]
+            return_value=SafeOpenHandle()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "model.safetensors").write_bytes(b"fixture")
+            with patch.dict(sys.modules, {"safetensors": safetensors}):
+                tensors = _load_safetensor_export(root)
+
+        self.assertIs(tensors["model.first"], first)
+        self.assertIs(tensors["model.second"], second)
+        safetensors.safe_open.assert_called_once()  # type: ignore[attr-defined]
+
     def test_probe_output_keeps_dcp_and_live_serving_identity_distinct(self) -> None:
         parent = _version()
         candidate = replace(
