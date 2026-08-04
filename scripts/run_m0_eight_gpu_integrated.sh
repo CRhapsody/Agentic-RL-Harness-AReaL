@@ -16,6 +16,7 @@ readonly AREAL_VENV="${JPH_ROOT}/venvs/areal-v2.0.0"
 readonly CUDA_TOOLKIT="/usr/local/cuda-12.6"
 readonly MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/qwen2.5-1.5b-snapshot.json"
 readonly DATASET_REPORT="${JPH_ROOT}/artifacts/bootstrap/gsm8k-snapshot.json"
+readonly PRE_BATCH_PATCH="${JPH_PROJECT_DIR}/patches/areal-v2.0.0-data-proxy-pre-batch-hook.patch"
 readonly EXPECTED_AREAL_COMMIT="fee938eada49208a5aabdbc1095730a13076a349"
 readonly EXPECTED_PROJECT_COMMIT="${JPH_PROJECT_COMMIT:-}"
 
@@ -46,7 +47,8 @@ for required_path in \
   "${AREAL_VENV}/bin/python3" \
   "${CUDA_TOOLKIT}/bin/nvcc" \
   "${MODEL_REPORT}" \
-  "${DATASET_REPORT}"; do
+  "${DATASET_REPORT}" \
+  "${PRE_BATCH_PATCH}"; do
   if [[ ! -e "${required_path}" ]]; then
     echo "missing formal integrated dependency: ${required_path}" >&2
     exit 2
@@ -157,6 +159,7 @@ RUN_ID="${RUN_STAMP}-m0-eight-gpu-integrated-${RUN_NONCE}"
 RUN_ROOT="${JPH_ROOT}/artifacts/m0-eight-gpu-integrated/${RUN_ID}"
 LOG_PATH="${JPH_ROOT}/logs/m0-eight-gpu-integrated-${RUN_ID}.log"
 MONITOR_ROOT="${JPH_ROOT}/tmp/${RUN_ID}-monitor"
+AREAL_CHILD_OVERLAY="${JPH_ROOT}/runtime/areal-overlays/${RUN_ID}"
 MEMORY_SAMPLES="${MONITOR_ROOT}/gpu-memory.csv"
 PROCESS_SAMPLES="${MONITOR_ROOT}/gpu-processes.csv"
 WATCHDOG_ERROR="${MONITOR_ROOT}/watchdog-observation-error.txt"
@@ -170,6 +173,60 @@ fi
 mkdir -p -m 700 "${MONITOR_ROOT}" "$(dirname "${LOG_PATH}")"
 touch "${LOG_PATH}" "${MEMORY_SAMPLES}" "${PROCESS_SAMPLES}"
 chmod 600 "${LOG_PATH}" "${MEMORY_SAMPLES}" "${PROCESS_SAMPLES}"
+
+# Keep the pinned checkout pristine while deploying the reviewed two-file
+# DataProxy hook to run-scoped child processes.  The controller imports from
+# the clean checkout before the adapter prepends this overlay for new Guards.
+AREAL_OVERLAY_PARENT="$(dirname "${AREAL_CHILD_OVERLAY}")"
+mkdir -p -m 700 "${AREAL_OVERLAY_PARENT}"
+chmod 700 "${AREAL_OVERLAY_PARENT}"
+if [[ ! -d "${AREAL_OVERLAY_PARENT}" || -L "${AREAL_OVERLAY_PARENT}" ]] ||
+   [[ "$(stat -c '%u:%a' "${AREAL_OVERLAY_PARENT}")" != "$(id -u):700" ]]; then
+  echo "formal AReaL overlay parent must be an owned private directory" >&2
+  exit 2
+fi
+if ! mkdir -m 700 "${AREAL_CHILD_OVERLAY}"; then
+  echo "formal AReaL child overlay must be atomically new" >&2
+  exit 2
+fi
+git -C "${AREAL_REPO}" archive "${EXPECTED_AREAL_COMMIT}" areal |
+  tar -x -C "${AREAL_CHILD_OVERLAY}"
+patch --batch --forward --fuzz=0 -s -d "${AREAL_CHILD_OVERLAY}" -p1 \
+  < "${PRE_BATCH_PATCH}"
+JPH_AREAL_PRE_BATCH_PATCH_SHA256="$(sha256sum "${PRE_BATCH_PATCH}" | awk '{print $1}')"
+JPH_AREAL_PATCHED_APP_SHA256="$(sha256sum \
+  "${AREAL_CHILD_OVERLAY}/areal/v2/inference_service/data_proxy/app.py" | awk '{print $1}')"
+JPH_AREAL_PATCHED_MAIN_SHA256="$(sha256sum \
+  "${AREAL_CHILD_OVERLAY}/areal/v2/inference_service/data_proxy/__main__.py" | awk '{print $1}')"
+export JPH_AREAL_CHILD_OVERLAY="${AREAL_CHILD_OVERLAY}"
+export JPH_AREAL_PRE_BATCH_PATCH_SHA256
+"${AREAL_VENV}/bin/python" - "${AREAL_CHILD_OVERLAY}/jph-overlay-manifest.json" \
+  "${PROJECT_COMMIT}" "${JPH_AREAL_PRE_BATCH_PATCH_SHA256}" \
+  "${JPH_AREAL_PATCHED_APP_SHA256}" "${JPH_AREAL_PATCHED_MAIN_SHA256}" <<'PY'
+import json
+import os
+import sys
+
+path, project_commit, patch_sha256, patched_app_sha256, patched_main_sha256 = sys.argv[1:]
+record = {
+    "schema_version": "jph.areal-child-overlay.v1",
+    "areal_base_commit": "fee938eada49208a5aabdbc1095730a13076a349",
+    "hook_import_path": (
+        "jphrl.trajectory.rlvr_online_binding."
+        "pre_batch_finalize_rlvr_v2_agent_admission"
+    ),
+    "patch_sha256": patch_sha256,
+    "patched_files": {
+        "areal/v2/inference_service/data_proxy/__main__.py": patched_main_sha256,
+        "areal/v2/inference_service/data_proxy/app.py": patched_app_sha256,
+    },
+    "project_commit": project_commit,
+}
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    json.dump(record, stream, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
 
 snapshot_all_eight_gpus "preflight"
 

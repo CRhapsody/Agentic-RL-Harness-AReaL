@@ -34,6 +34,8 @@ from jphrl.experiments.m0_eight_gpu_real_adapter import (
     M0EightGPURealAdapterError,
     NvidiaSMIGPUStateProvider,
     RealEightGPUIntegratedAdapters,
+    _activate_pinned_areal_child_overlay,
+    _bind_pinned_areal_child_environment,
     _commit_actor_with_y_compensation,
     _validate_y_actor_terminal_receipts,
 )
@@ -117,6 +119,80 @@ class _SnapshotProvider:
         value = self.snapshots[min(self.index, len(self.snapshots) - 1)]
         self.index += 1
         return value
+
+
+class ArealChildOverlayTests(unittest.TestCase):
+    def test_verified_overlay_is_bound_explicitly_without_parent_path_pollution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_root = root / "artifacts" / "m0" / "run-1"
+            overlay = root / "runtime" / "areal-overlays" / run_root.name
+            data_proxy = overlay / "areal" / "v2" / "inference_service" / "data_proxy"
+            data_proxy.mkdir(parents=True, mode=0o700)
+            (overlay / "areal" / "__init__.py").write_text("", encoding="utf-8")
+            app = data_proxy / "app.py"
+            main = data_proxy / "__main__.py"
+            app.write_text("pre_batch_export_hook = None\n", encoding="utf-8")
+            main.write_text("AREAL_PRE_BATCH_HOOK = None\n", encoding="utf-8")
+            patch_path = (
+                Path(__file__).resolve().parents[1]
+                / "patches"
+                / "areal-v2.0.0-data-proxy-pre-batch-hook.patch"
+            )
+            patch_sha = hashlib.sha256(patch_path.read_bytes()).hexdigest()
+            manifest = {
+                "schema_version": "jph.areal-child-overlay.v1",
+                "areal_base_commit": PINNED_AREAL_COMMIT,
+                "hook_import_path": (
+                    "jphrl.trajectory.rlvr_online_binding."
+                    "pre_batch_finalize_rlvr_v2_agent_admission"
+                ),
+                "patch_sha256": patch_sha,
+                "patched_files": {
+                    "areal/v2/inference_service/data_proxy/__main__.py": (
+                        hashlib.sha256(main.read_bytes()).hexdigest()
+                    ),
+                    "areal/v2/inference_service/data_proxy/app.py": (
+                        hashlib.sha256(app.read_bytes()).hexdigest()
+                    ),
+                },
+                "project_commit": "a" * 40,
+            }
+            manifest_path = overlay / "jph-overlay-manifest.json"
+            manifest_path.write_bytes(_canonical_json(manifest) + b"\n")
+            overlay.chmod(0o700)
+            manifest_path.chmod(0o600)
+            config = SimpleNamespace(
+                jph_root=root.resolve(),
+                run_root=run_root.resolve(),
+                project_commit="a" * 40,
+            )
+            rollout_config = SimpleNamespace(
+                scheduling_spec=(SimpleNamespace(env_vars={}),)
+            )
+            environment = {
+                "JPH_AREAL_CHILD_OVERLAY": str(overlay),
+                "JPH_AREAL_PRE_BATCH_PATCH_SHA256": patch_sha,
+                "PYTHONPATH": "/original/pythonpath",
+            }
+            with patch.dict(os.environ, environment, clear=False):
+                _activate_pinned_areal_child_overlay(config)
+                child_env = _bind_pinned_areal_child_environment(rollout_config)
+                self.assertEqual(os.environ["PYTHONPATH"], "/original/pythonpath")
+                self.assertEqual(
+                    child_env["PYTHONPATH"],
+                    f"{overlay.resolve()}{os.pathsep}/original/pythonpath",
+                )
+                self.assertEqual(
+                    rollout_config.scheduling_spec[0].env_vars,
+                    child_env,
+                )
+                self.assertEqual(
+                    child_env["AREAL_PRE_BATCH_HOOK"],
+                    manifest["hook_import_path"],
+                )
 
 
 def _snapshot(

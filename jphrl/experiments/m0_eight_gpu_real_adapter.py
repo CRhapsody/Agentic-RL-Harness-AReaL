@@ -733,7 +733,12 @@ def build_distributed_inference_runtime_contract(
         "areal_commit": PINNED_AREAL_COMMIT,
         "areal_version": distribution_version("areal"),
         "behavior_revision": config.behavior_revision,
-        "clean_environment_policy": "filtered-inherited-v1",
+        "clean_environment_policy": (
+            "filtered-inherited-v1+areal-pre-batch-hook@sha256:"
+            f"{os.environ.get('JPH_AREAL_PRE_BATCH_PATCH_SHA256', 'unconfigured')}"
+            "+overlay-manifest@sha256:"
+            f"{os.environ.get('JPH_AREAL_CHILD_OVERLAY_MANIFEST_SHA256', 'unconfigured')}"
+        ),
         "cuda_runtime_version": str(torch.version.cuda),
         "cuda_visible_devices_by_rank": ["4", "5", "6", "7"],
         "dataset_revision": config.dataset_revision,
@@ -773,6 +778,181 @@ def build_distributed_inference_runtime_contract(
     }
     inference_runtime_contract_sha256(contract)
     return contract
+
+
+def _activate_pinned_areal_child_overlay(config: RealEightGPUAdapterConfig) -> None:
+    """Route only new AReaL service children through the audited hook overlay.
+
+    The controller process has already passed source preflight from the clean,
+    pinned checkout.  Updating ``PYTHONPATH`` at this point affects subsequently
+    launched Guard/DataProxy processes without replacing the controller's
+    already-imported AReaL modules.
+    """
+
+    overlay_raw = os.environ.get("JPH_AREAL_CHILD_OVERLAY", "")
+    patch_sha256 = os.environ.get("JPH_AREAL_PRE_BATCH_PATCH_SHA256", "")
+    _require(
+        len(patch_sha256) == 64
+        and all(character in "0123456789abcdef" for character in patch_sha256),
+        "formal AReaL pre-batch patch SHA-256 is missing",
+    )
+    try:
+        overlay = require_outside_repository(overlay_raw)
+    except ValueError as exc:
+        raise M0EightGPURealAdapterError(str(exc)) from exc
+    expected_overlay = (
+        config.jph_root / "runtime" / "areal-overlays" / config.run_root.name
+    ).resolve()
+    _require(
+        overlay == expected_overlay
+        and (overlay / "areal" / "__init__.py").is_file()
+        and not (overlay / "areal" / "__init__.py").is_symlink(),
+        "formal AReaL child overlay is missing or differs from the run namespace",
+    )
+    overlay_stat = overlay.stat()
+    _require(
+        overlay_stat.st_uid == os.getuid() and overlay_stat.st_mode & 0o077 == 0,
+        "formal AReaL child overlay is not private to the current user",
+    )
+    manifest_path = overlay / "jph-overlay-manifest.json"
+    _require(
+        manifest_path.is_file()
+        and not manifest_path.is_symlink()
+        and manifest_path.stat().st_uid == os.getuid()
+        and manifest_path.stat().st_mode & 0o077 == 0,
+        "formal AReaL child overlay manifest is not a private regular file",
+    )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise M0EightGPURealAdapterError(
+            "cannot read formal AReaL child overlay manifest"
+        ) from exc
+    _require(
+        manifest
+        == {
+            "schema_version": "jph.areal-child-overlay.v1",
+            "areal_base_commit": PINNED_AREAL_COMMIT,
+            "hook_import_path": (
+                "jphrl.trajectory.rlvr_online_binding."
+                "pre_batch_finalize_rlvr_v2_agent_admission"
+            ),
+            "patch_sha256": patch_sha256,
+            "patched_files": manifest.get("patched_files"),
+            "project_commit": config.project_commit,
+        },
+        "formal AReaL child overlay manifest differs",
+    )
+    project_patch = (
+        repository_root()
+        / "patches"
+        / "areal-v2.0.0-data-proxy-pre-batch-hook.patch"
+    )
+    _require(
+        project_patch.is_file() and _file_sha256(project_patch) == patch_sha256,
+        "formal AReaL pre-batch patch differs from the committed project patch",
+    )
+    patched_app = overlay / "areal" / "v2" / "inference_service" / "data_proxy" / "app.py"
+    patched_main = (
+        overlay
+        / "areal"
+        / "v2"
+        / "inference_service"
+        / "data_proxy"
+        / "__main__.py"
+    )
+    patched_files = manifest.get("patched_files")
+    _require(
+        isinstance(patched_files, Mapping)
+        and set(patched_files)
+        == {
+            "areal/v2/inference_service/data_proxy/app.py",
+            "areal/v2/inference_service/data_proxy/__main__.py",
+        }
+        and patched_app.is_file()
+        and not patched_app.is_symlink()
+        and patched_main.is_file()
+        and not patched_main.is_symlink()
+        and patched_files["areal/v2/inference_service/data_proxy/app.py"]
+        == _file_sha256(patched_app)
+        and patched_files["areal/v2/inference_service/data_proxy/__main__.py"]
+        == _file_sha256(patched_main)
+        and "pre_batch_export_hook" in patched_app.read_text(encoding="utf-8")
+        and "AREAL_PRE_BATCH_HOOK" in patched_main.read_text(encoding="utf-8"),
+        "formal AReaL child overlay post-image differs",
+    )
+    admission_root = config.run_root / "rollout-admissions"
+    env = {
+        "AREAL_PRE_BATCH_HOOK": (
+            "jphrl.trajectory.rlvr_online_binding."
+            "pre_batch_finalize_rlvr_v2_agent_admission"
+        ),
+        "JPH_RLVR_V2_AGENT_JOURNAL_ROOT": str(
+            config.run_root / "rollout-v2-agent-journal"
+        ),
+        "JPH_AREAL_JOINT_BRIDGE_DIR": str(admission_root / "bridges"),
+        "JPH_AREAL_SAME_BACKEND_SCORE_DIR": str(
+            admission_root / "same-backend-scores"
+        ),
+        "JPH_RLVR_FROZEN_ESTIMATOR_TEMPLATE_PATH": str(
+            admission_root / "frozen-estimator-template.json"
+        ),
+        "JPH_RLVR_RUNNER_ADMISSION_DIR": str(
+            admission_root / "runner-admissions"
+        ),
+        "JPH_ROOT": str(config.jph_root),
+    }
+    os.environ.update(env)
+    os.environ["JPH_AREAL_CHILD_OVERLAY_MANIFEST_SHA256"] = _file_sha256(
+        manifest_path
+    )
+    inherited_pythonpath = os.environ.get("PYTHONPATH", "")
+    entries = [str(overlay)]
+    if inherited_pythonpath:
+        entries.append(inherited_pythonpath)
+    os.environ["JPH_AREAL_CHILD_PYTHONPATH"] = os.pathsep.join(entries)
+
+
+def _bind_pinned_areal_child_environment(
+    rollout_config: object,
+) -> dict[str, str]:
+    """Put the overlay and hook contract in the Guard's explicit environment.
+
+    AReaL's local scheduler deliberately constructs a small child environment
+    and caches its base ``PYTHONPATH`` at import time.  Mutating the controller
+    environment alone is therefore insufficient.  ``SchedulingSpec.env_vars``
+    is the supported, deterministic path from the controller to each Guard;
+    the Guard's forked DataProxy then inherits these exact values.
+    """
+
+    required = (
+        "AREAL_PRE_BATCH_HOOK",
+        "JPH_RLVR_V2_AGENT_JOURNAL_ROOT",
+        "JPH_AREAL_JOINT_BRIDGE_DIR",
+        "JPH_AREAL_SAME_BACKEND_SCORE_DIR",
+        "JPH_RLVR_FROZEN_ESTIMATOR_TEMPLATE_PATH",
+        "JPH_RLVR_RUNNER_ADMISSION_DIR",
+        "JPH_ROOT",
+    )
+    child_env = {key: os.environ.get(key, "") for key in required}
+    child_env["PYTHONPATH"] = os.environ.get("JPH_AREAL_CHILD_PYTHONPATH", "")
+    _require(
+        all(child_env.values()),
+        "formal AReaL Guard environment is incomplete",
+    )
+    specs = getattr(rollout_config, "scheduling_spec", None)
+    _require(
+        isinstance(specs, (list, tuple))
+        and len(specs) == 1
+        and isinstance(getattr(specs[0], "env_vars", None), dict),
+        "formal AReaL rollout scheduling spec cannot carry the hook environment",
+    )
+    specs[0].env_vars.update(child_env)
+    _require(
+        all(specs[0].env_vars.get(key) == value for key, value in child_env.items()),
+        "formal AReaL Guard environment was not bound",
+    )
+    return child_env
 
 
 def _run_nvidia_smi(arguments: Sequence[str]) -> str:
@@ -1129,7 +1309,9 @@ class RealEightGPUIntegratedAdapters:
             )
         except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover - remote gate
             raise M0EightGPURealAdapterError("AReaL DataProxy rollout is unavailable") from exc
+        _activate_pinned_areal_child_overlay(self.config)
         rollout_config = build_distributed_rollout_config(self.config)
+        _bind_pinned_areal_child_environment(rollout_config)
         server_args = build_distributed_server_args(self.config)
         gpu_uuids, gpu_names = _gpu_static_identities((4, 5, 6, 7))
         runtime_contract = build_distributed_inference_runtime_contract(
@@ -1243,7 +1425,7 @@ class RealEightGPUIntegratedAdapters:
                 temperature=1.0,
             ).new_with_stop_and_pad_token_ids(tokenizer)
             workflow_kwargs = {
-                "reward_fn": "areal.reward.gsm8k.gsm8k_reward_fn",
+                "reward_fn": "jphrl.rewards.strict_gsm8k_reward_fn",
                 "gconfig": gconfig,
                 "tokenizer": str(self.config.model_snapshot),
                 "enable_thinking": False,
@@ -1257,8 +1439,8 @@ class RealEightGPUIntegratedAdapters:
                     self.rollout.submit(
                         item,
                         workflow=(
-                            "jphrl.areal_joint_bridge_workflow."
-                            "ArealJointBridgeWorkflow"
+                            "jphrl.areal_joint_bridge_agent."
+                            "ArealJointBridgeAgent"
                         ),
                         workflow_kwargs=workflow_kwargs,
                         group_size=1,
