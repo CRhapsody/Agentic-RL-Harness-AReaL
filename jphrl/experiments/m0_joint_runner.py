@@ -391,8 +391,8 @@ def load_m0_agent_service_source_records(
         isinstance(mem_fraction, (int, float))
         and not isinstance(mem_fraction, bool)
         and math.isfinite(float(mem_fraction))
-        and 0.28 <= float(mem_fraction) <= 0.30,
-        "recorded rollout sglang.mem_fraction_static must be in [0.28, 0.30]",
+        and 0.0 < float(mem_fraction) <= 0.95,
+        "recorded rollout sglang.mem_fraction_static must be in (0, 0.95]",
     )
     session_id = p_identity.get("session_id")
     trajectory_id = p_identity.get("trajectory_id")
@@ -458,8 +458,8 @@ def load_m0_rlvr_source_records(
         isinstance(mem_fraction, (int, float))
         and not isinstance(mem_fraction, bool)
         and math.isfinite(float(mem_fraction))
-        and 0.28 <= float(mem_fraction) <= 0.30,
-        "recorded RLVR rollout sglang.mem_fraction_static must be in [0.28, 0.30]",
+        and 0.0 < float(mem_fraction) <= 0.95,
+        "recorded RLVR rollout sglang.mem_fraction_static must be in (0, 0.95]",
     )
     pre_batch = loaded.rlvr_pre_batch_record
     episode_trace_sha256 = pre_batch.get("source", {}).get(
@@ -573,7 +573,7 @@ class M0JointRunConfig:
     transaction_id: str
     macro_step: int
     rollout_sglang_mem_fraction_static: float = 0.29
-    max_new_gpu_memory_gib: float = 26.0
+    max_new_gpu_memory_gib: float | None = None
 
     def validate(self) -> Path:
         target = require_outside_repository(self.artifact_root)
@@ -588,13 +588,12 @@ class M0JointRunConfig:
         )
         _require(
             isinstance(self.rollout_sglang_mem_fraction_static, (int, float))
-            and 0.28 <= float(self.rollout_sglang_mem_fraction_static) <= 0.30,
-            "M0 rollout sglang.mem_fraction_static must remain in [0.28, 0.30]",
+            and 0.0 < float(self.rollout_sglang_mem_fraction_static) <= 0.95,
+            "M0 rollout sglang.mem_fraction_static must remain in (0, 0.95]",
         )
         _require(
-            isinstance(self.max_new_gpu_memory_gib, (int, float))
-            and 0.0 < float(self.max_new_gpu_memory_gib) <= 26.0,
-            "M0 per-process GPU peak limit must be at most 26 GiB",
+            self.max_new_gpu_memory_gib is None,
+            "M0 no longer accepts a configured GPU memory limit",
         )
         areal_root = Path(self.areal_root).expanduser().resolve()
         _require(
@@ -648,7 +647,7 @@ class M0ActivationAssets:
     joint_safety_fixture: bytes
     candidate_joint_safety_output_sha256: str
     recorded_rollout_sglang_mem_fraction_static: float
-    max_new_gpu_memory_gib: float
+    max_new_gpu_memory_gib: float | None
 
 
 # A factory must close any controllers it starts if construction itself raises;
@@ -1021,7 +1020,7 @@ def _stream_record(kind: str, item_sha256: str) -> dict[str, object]:
 def _run_harness_continuation_step(
     policy: object,
     optimizer: object,
-    s_record: Mapping[str, object],
+    s_record: Mapping[str, object] | Sequence[Mapping[str, object]],
 ) -> None:
     """Run one measured Adam step; W owns version advancement and evidence."""
 
@@ -1034,8 +1033,22 @@ def _run_harness_continuation_step(
         raise M0JointRunnerError("Torch Harness continuation is unavailable") from exc
     _require(type(policy) is TorchHarnessPolicy, "W Harness policy type differs")
     _require(type(optimizer) is torch.optim.Adam, "W Harness optimizer is not Adam")
-    samples = s_record.get("harness_samples")
-    _require(isinstance(samples, list) and bool(samples), "S has no Harness samples")
+    records = (
+        tuple(s_record)
+        if isinstance(s_record, Sequence)
+        and not isinstance(s_record, (str, bytes, bytearray, Mapping))
+        else (s_record,)
+    )
+    _require(
+        bool(records) and all(isinstance(record, Mapping) for record in records),
+        "W Harness continuation S records are invalid",
+    )
+    samples = [
+        sample
+        for record in records
+        for sample in record.get("harness_samples", ())
+    ]
+    _require(bool(samples), "S has no Harness samples")
     states: list[Any] = []
     masks: list[list[bool]] = []
     selected: list[int] = []
@@ -1113,12 +1126,11 @@ def _peak_gpu_memory_gib() -> float | None:
 
 
 def _enforce_gpu_peak(config: M0JointRunConfig) -> float | None:
-    peak = _peak_gpu_memory_gib()
     _require(
-        peak is None or peak <= float(config.max_new_gpu_memory_gib),
-        "M0 process exceeded its configured GPU peak-memory gate",
+        config.max_new_gpu_memory_gib is None,
+        "M0 GPU memory observation cannot enforce a configured limit",
     )
-    return peak
+    return _peak_gpu_memory_gib()
 
 
 def _require_areal_update_batch(value: object) -> list[dict[str, Any]]:
@@ -1523,6 +1535,7 @@ class _M0JointUpdateRunner:
 
             harness_result = trainer.update_from_frozen_joint_credit(
                 self.source.s_joint_credit,
+                transaction_id=self.run_config.transaction_id,
                 active_joint_version=self.source.active_joint_version,
                 checkpoint_path=root / "harness-candidate" / "harness-candidate.pt",
             )
@@ -1535,6 +1548,9 @@ class _M0JointUpdateRunner:
 
             bundle = seal_joint_candidate_bundle(
                 seal_root=root / "joint-candidate",
+                transaction_journal_root=(
+                    root.parent / "joint-transaction-journal"
+                ),
                 project_root=repository_root(),
                 policy_receipt=policy_receipt,
                 harness_receipt=harness_receipt,
@@ -1732,7 +1748,7 @@ class _M0JointUpdateRunner:
                 recorded_rollout_sglang_mem_fraction_static=(
                     self.source.rollout_sglang_mem_fraction_static
                 ),
-                max_new_gpu_memory_gib=float(self.run_config.max_new_gpu_memory_gib),
+                max_new_gpu_memory_gib=None,
             )
             # The held-out X evaluator has finished and V/W artifacts are sealed.
             # Release the training actor before the factory starts SGLang so the
@@ -1854,9 +1870,8 @@ class _M0JointUpdateRunner:
                     "rollout_sglang_mem_fraction_static": float(
                         self.run_config.rollout_sglang_mem_fraction_static
                     ),
-                    "max_new_gpu_memory_gib": float(
-                        self.run_config.max_new_gpu_memory_gib
-                    ),
+                    "gpu_memory_limit_enforced": False,
+                    "max_new_gpu_memory_gib": None,
                     "measured_training_peak_reserved_gib": training_peak,
                     "actor_destroyed_before_rollout_worker_start": True,
                 },

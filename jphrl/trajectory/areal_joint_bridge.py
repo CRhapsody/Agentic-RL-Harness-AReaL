@@ -25,6 +25,9 @@ from .schema import EpisodeTrace, JointVersion
 
 SCHEMA_VERSION = "jph.areal-joint-interaction-bridge.v3"
 INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = "jph.sglang-inference-runtime.v2"
+DISTRIBUTED_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = (
+    "jph.sglang-inference-runtime.v3"
+)
 LEGACY_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION = "jph.sglang-inference-runtime.v1"
 CONTEXT_BUILDER_VERSION = "gsm8k-harness-prompt-v1"
 HARNESS_ARTIFACT_VERSION = "gsm8k-bounded-prompt-actions-v1"
@@ -92,6 +95,7 @@ def inference_runtime_contract_sha256(
         in {
             LEGACY_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION,
             INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION,
+            DISTRIBUTED_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION,
         },
         "unknown inference runtime contract schema",
     )
@@ -140,6 +144,19 @@ def inference_runtime_contract_sha256(
         "torch_version",
         "transformers_version",
     }
+    if schema_version == DISTRIBUTED_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION:
+        required_fixed -= {
+            "cuda_visible_devices",
+            "gpu_name",
+            "gpu_uuid",
+            "physical_gpu_id",
+        }
+        required_fixed |= {
+            "cuda_visible_devices_by_rank",
+            "gpu_names",
+            "gpu_uuids",
+            "physical_gpu_ids",
+        }
     _require(
         set(fixed) == required_fixed,
         "inference runtime fixed field set differs from contract",
@@ -160,7 +177,10 @@ def inference_runtime_contract_sha256(
         set(treatment) == required_treatment,
         "inference runtime treatment field set differs from contract",
     )
-    if schema_version == INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION:
+    if schema_version in {
+        INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION,
+        DISTRIBUTED_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION,
+    }:
         server_args = fixed.get("server_args")
         _require(
             isinstance(server_args, Mapping)
@@ -790,28 +810,66 @@ def validate_areal_joint_bridge_record(
         and runtime_server_args.get("base_gpu_id") == 0,
         "inference runtime server args differ from behavior snapshot or topology",
     )
-    _require(
-        isinstance(runtime_rollout, Mapping)
-        and runtime_rollout.get("backend") == "sglang:d1p1t1"
-        and runtime_rollout.get("max_concurrent_rollouts") == 1,
-        "inference runtime rollout topology differs from bridge contract",
-    )
-    _require(
-        type(runtime_fixed["physical_gpu_id"]) is int
-        and runtime_fixed["physical_gpu_id"] >= 0
-        and runtime_fixed["cuda_visible_devices"]
-        == str(runtime_fixed["physical_gpu_id"])
-        and isinstance(runtime_fixed["gpu_uuid"], str)
-        and bool(runtime_fixed["gpu_uuid"]),
-        "inference runtime GPU identity is inconsistent",
-    )
+    if (
+        runtime_contract["schema_version"]
+        == DISTRIBUTED_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION
+    ):
+        _require(
+            isinstance(runtime_rollout, Mapping)
+            and runtime_rollout.get("backend") == "sglang:d4"
+            and type(runtime_rollout.get("max_concurrent_rollouts")) is int
+            and runtime_rollout["max_concurrent_rollouts"] >= 1,
+            "distributed inference runtime rollout topology differs from bridge contract",
+        )
+        physical_gpu_ids = runtime_fixed["physical_gpu_ids"]
+        cuda_visible_devices_by_rank = runtime_fixed[
+            "cuda_visible_devices_by_rank"
+        ]
+        gpu_uuids = runtime_fixed["gpu_uuids"]
+        gpu_names = runtime_fixed["gpu_names"]
+        _require(
+            isinstance(physical_gpu_ids, list)
+            and len(physical_gpu_ids) == 4
+            and all(type(gpu_id) is int and gpu_id >= 0 for gpu_id in physical_gpu_ids)
+            and len(set(physical_gpu_ids)) == 4
+            and isinstance(cuda_visible_devices_by_rank, list)
+            and cuda_visible_devices_by_rank
+            == [str(gpu_id) for gpu_id in physical_gpu_ids]
+            and isinstance(gpu_uuids, list)
+            and len(gpu_uuids) == 4
+            and all(isinstance(value, str) and bool(value) for value in gpu_uuids)
+            and len(set(gpu_uuids)) == 4
+            and isinstance(gpu_names, list)
+            and len(gpu_names) == 4
+            and all(isinstance(value, str) and bool(value) for value in gpu_names),
+            "distributed inference runtime GPU identities are inconsistent",
+        )
+    else:
+        _require(
+            isinstance(runtime_rollout, Mapping)
+            and runtime_rollout.get("backend") == "sglang:d1p1t1"
+            and runtime_rollout.get("max_concurrent_rollouts") == 1,
+            "inference runtime rollout topology differs from bridge contract",
+        )
+        _require(
+            type(runtime_fixed["physical_gpu_id"]) is int
+            and runtime_fixed["physical_gpu_id"] >= 0
+            and runtime_fixed["cuda_visible_devices"]
+            == str(runtime_fixed["physical_gpu_id"])
+            and isinstance(runtime_fixed["gpu_uuid"], str)
+            and bool(runtime_fixed["gpu_uuid"]),
+            "inference runtime GPU identity is inconsistent",
+        )
     _require(
         runtime_treatment["generation_logprob_mode"] == generation_logprob_mode
         and runtime_treatment["sglang_return_original_logprob"]
         is (generation_logprob_mode == "original-log-softmax-v1"),
         "inference runtime treatment differs from generation mode",
     )
-    if runtime_contract["schema_version"] == INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION:
+    if runtime_contract["schema_version"] in {
+        INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION,
+        DISTRIBUTED_INFERENCE_RUNTIME_CONTRACT_SCHEMA_VERSION,
+    }:
         _require(
             runtime_treatment["disable_cuda_graph"]
             is runtime_server_args.get("disable_cuda_graph"),

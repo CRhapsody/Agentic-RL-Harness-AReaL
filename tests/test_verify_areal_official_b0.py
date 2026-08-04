@@ -8,11 +8,9 @@ import unittest
 from pathlib import Path
 
 from scripts.verify_areal_official_b0 import (
-    HARD_MEMORY_CAP_MIB,
     MEMORY_AUDIT_SCHEMA,
     MEMORY_RUN_KIND,
     PINNED_AREAL_COMMIT,
-    SOFT_MEMORY_CAP_MIB,
     verify_areal_official_b0,
 )
 
@@ -192,8 +190,8 @@ ref:
                 "peak_delta_mib": 24000,
                 "peak_free_mib": 54000,
                 "sample_count": 20,
-                "soft_cap_mib": SOFT_MEMORY_CAP_MIB,
-                "hard_cap_mib": HARD_MEMORY_CAP_MIB,
+                "memory_limit_enforced": False,
+                "max_new_memory_mib": None,
                 "passed": True,
             }
             if gpu_id == 0:
@@ -205,8 +203,8 @@ ref:
                 "run_kind": MEMORY_RUN_KIND,
                 "project_commit": PROJECT_COMMIT,
                 "areal_commit": PINNED_AREAL_COMMIT,
-                "soft_cap_mib": SOFT_MEMORY_CAP_MIB,
-                "hard_cap_mib": HARD_MEMORY_CAP_MIB,
+                "memory_limit_enforced": False,
+                "max_new_memory_mib": None,
                 "gpus": gpus,
                 "passed": True,
             }
@@ -261,9 +259,14 @@ class VerifyArealOfficialB0Tests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "gpu-memory-audit.json"):
                 fixture.verify()
 
-    def test_rejects_memory_cap_sample_and_integrity_failures(self) -> None:
+    def test_accepts_arbitrary_memory_and_rejects_observation_integrity_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = OfficialB0Fixture(directory)
+            fixture._write_memory(peak_used_mib=79000, peak_delta_mib=78000)
+            fixture.verify()
+
         cases = (
-            ({"peak_used_mib": 28000, "peak_delta_mib": 27000}, "envelope"),
+            ({"memory_limit_enforced": True}, "observation"),
             ({"sample_count": 0}, "no samples"),
             ({"peak_delta_mib": 23999}, "inconsistent"),
         )

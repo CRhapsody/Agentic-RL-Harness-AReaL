@@ -256,6 +256,41 @@ class ArealPolicyOptimizerAdapterTests(unittest.TestCase):
             [[0.0, 0.75, 0.75, 0.0]],
         )
 
+        four_sample_record = deepcopy(record)
+        four_sample_record["samples"] = []
+        for index in range(4):
+            sample = deepcopy(record["samples"][0])
+            sample["sample_id"] = f"sample-{index}"
+            sample["tensor_dict"]["input_ids"][0][0] += index
+            sample["rollout_tensor_dict"]["input_ids"][0][0] += index
+            four_sample_record["samples"].append(sample)
+        four_sample_record["summary"]["sample_count"] = 4
+        four_sample_record["summary"]["trainable_token_count"] = 8
+        _resign(four_sample_record)
+        selected = materialize_areal_ppo_update_tensors(
+            four_sample_record,
+            actor=actor,
+            active_joint_version=_version(),
+            device="cpu",
+            sample_indices=(1, 3),
+        )
+        self.assertEqual(
+            [int(item["input_ids"][0, 0]) for item in selected],
+            [11, 13],
+        )
+        for invalid_indices in ((), (0, 0), (4,)):
+            with self.subTest(indices=invalid_indices), self.assertRaisesRegex(
+                ArealExternalAdvantageBatchError,
+                "empty, duplicated, or out of range",
+            ):
+                materialize_areal_ppo_update_tensors(
+                    four_sample_record,
+                    actor=actor,
+                    active_joint_version=_version(),
+                    device="cpu",
+                    sample_indices=invalid_indices,
+                )
+
         actor.config.ppo_n_minibatches = 2
         with self.assertRaisesRegex(
             ArealExternalAdvantageBatchError,

@@ -10,7 +10,7 @@ flowchart TD
         A["A. 操作性定义、验收指标、非目标<br/>已完成"]
         B["B. Git 同步、代码/数据分离、路径安全<br/>已完成"]
         C["C. AReaL v2.0.0 固定提交、远端环境<br/>已完成"]
-        D["D. 30 GiB/GPU 门禁与资源画像<br/>已完成"]
+        D["D. GPU 启动前观测与资源画像<br/>已完成：无固定显存上限"]
         E["E. 官方 AReaL policy 基线、恢复与吞吐画像<br/>部分完成：8 GPU 正式基线受资源门限制"]
     end
 
@@ -45,7 +45,7 @@ flowchart TD
     end
 
     subgraph P4["阶段 4：端到端实验与研究证据"]
-        AA["AA. M0 单步真实联合更新调试<br/>未完成：单进程预算先控制在 24–26 GiB"]
+        AA["AA. M0 单步真实联合更新调试<br/>未完成：8 卡可用显存按需使用"]
         AB["AB. M0 同步训练 pilot 与故障注入<br/>未完成"]
         AC["AC. 四个因果对照：M00/M10/M01/M11<br/>未完成"]
         AD["AD. 慢速 artifact 候选、shadow、canary、回滚<br/>未完成"]

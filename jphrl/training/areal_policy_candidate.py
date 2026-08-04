@@ -751,6 +751,19 @@ def validate_areal_policy_candidate(
     active_joint_version: JointVersion | None = None,
     require_checkpoints: bool = False,
 ) -> ValidatedArealPolicyCandidate:
+    if record.get("schema_version") == "jph.areal-distributed-policy-candidate.v1":
+        # Lazy import avoids a module cycle: the distributed implementation
+        # reuses this module's DCP manifest hashing, while V/W keep one public
+        # candidate-validation entry point with explicit schema dispatch.
+        from .areal_distributed_policy import (
+            validate_distributed_policy_candidate,
+        )
+
+        return validate_distributed_policy_candidate(  # type: ignore[return-value]
+            record,
+            active_joint_version=active_joint_version,
+            require_checkpoints=require_checkpoints,
+        )
     _require(
         set(record)
         == {

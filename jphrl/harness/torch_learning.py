@@ -18,6 +18,12 @@ from jphrl.trajectory.joint_credit_alignment import (
     JointCreditAlignmentError,
     validate_frozen_joint_credit_alignment,
 )
+from jphrl.trajectory.multi_s_frozen_training_batch import (
+    ValidatedMultiSFrozenTrainingBatch,
+    iter_member_s_records,
+    multi_s_source_binding,
+    validate_multi_s_source_binding,
+)
 from jphrl.trajectory.schema import JointVersion
 
 from .controller import HarnessDecision, HarnessState
@@ -25,9 +31,11 @@ from .spec import HarnessAction
 
 ACTION_IDS = tuple(action.value for action in HarnessAction)
 POLICY_SCHEMA_VERSION = "torch-harness-categorical-v1"
-CHECKPOINT_SCHEMA_VERSION = "jph.torch-harness-checkpoint.v1"
+CHECKPOINT_SCHEMA_VERSION = "jph.torch-harness-checkpoint.v2"
+MULTI_S_CHECKPOINT_SCHEMA_VERSION = "jph.torch-harness-multi-s-checkpoint.v1"
 ROLLOUT_CHECKPOINT_SCHEMA_VERSION = "jph.torch-harness-rollout-checkpoint.v1"
-HARNESS_CANDIDATE_SCHEMA_VERSION = "jph.torch-harness-candidate.v1"
+HARNESS_CANDIDATE_SCHEMA_VERSION = "jph.torch-harness-candidate.v2"
+MULTI_S_HARNESS_CANDIDATE_SCHEMA_VERSION = "jph.torch-harness-multi-s-candidate.v1"
 _STATE_FEATURE_SCHEMA_VERSION = "jph.harness-state-features.v1"
 _STATE_FEATURE_DIM = 32
 _SECRET_FIELD_NAMES = {
@@ -48,6 +56,12 @@ _HARNESS_EVIDENCE_SCOPE = {
     "rng_state_persisted": True,
     "policy_optimizer_update": False,
     "harness_optimizer_update": True,
+}
+_MULTI_S_HARNESS_EVIDENCE_SCOPE = {
+    **_HARNESS_EVIDENCE_SCOPE,
+    "validated_multi_s_batch_consumed": True,
+    "every_member_s_revalidated_lag_zero": True,
+    "one_adam_step_for_all_members": True,
 }
 _CHECKPOINT_METRIC_FIELDS = {
     "batch_size",
@@ -637,6 +651,7 @@ def load_torch_harness_rollout_checkpoint(
 
 @dataclass(frozen=True)
 class TorchHarnessUpdateEvidence:
+    transaction_id: str
     source_joint_credit_sha256: str
     parent_joint_version: JointVersion
     parent_joint_version_id: str
@@ -674,6 +689,47 @@ class TorchHarnessUpdateResult:
     evidence: TorchHarnessUpdateEvidence
 
 
+@dataclass(frozen=True)
+class TorchHarnessMultiSUpdateEvidence:
+    transaction_id: str
+    source_joint_credit_sha256: str
+    source_binding: Mapping[str, object]
+    parent_joint_version: JointVersion
+    parent_joint_version_id: str
+    behavior_version: str
+    candidate_version: str
+    parameter_digest_before: str
+    parameter_digest_after: str
+    optimizer_step_before: int
+    optimizer_step_after: int
+    batch_size: int
+    effective_batch_size: int
+    loss: float
+    mean_ratio: float
+    clip_fraction: float
+    gradient_norm: float
+    checkpoint_path: str
+    checkpoint_sha256: str
+
+    def to_record(self) -> dict[str, object]:
+        record = asdict(self)
+        record["schema_version"] = MULTI_S_HARNESS_CANDIDATE_SCHEMA_VERSION
+        record["evidence_scope"] = dict(_MULTI_S_HARNESS_EVIDENCE_SCOPE)
+        record["record_sha256"] = _record_sha256(record)
+        validate_torch_harness_multi_s_update_evidence(
+            record,
+            active_joint_version=self.parent_joint_version,
+        )
+        return record
+
+
+@dataclass(frozen=True)
+class TorchHarnessMultiSUpdateResult:
+    candidate_policy: TorchHarnessPolicy
+    candidate_optimizer: TorchHarnessOptimizer
+    evidence: TorchHarnessMultiSUpdateEvidence
+
+
 def _checkpoint_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -687,9 +743,15 @@ def validate_torch_harness_update_evidence(
     *,
     active_joint_version: JointVersion | None = None,
     require_checkpoint: bool = True,
-) -> TorchHarnessUpdateEvidence:
+) -> TorchHarnessUpdateEvidence | TorchHarnessMultiSUpdateEvidence:
     """Revalidate a persisted real Harness optimizer receipt."""
 
+    if record.get("schema_version") == MULTI_S_HARNESS_CANDIDATE_SCHEMA_VERSION:
+        return validate_torch_harness_multi_s_update_evidence(
+            record,
+            active_joint_version=active_joint_version,
+            require_checkpoint=require_checkpoint,
+        )
     _assert_no_secret_fields(record)
     evidence_fields = set(TorchHarnessUpdateEvidence.__dataclass_fields__)
     _require(
@@ -704,6 +766,11 @@ def validate_torch_harness_update_evidence(
     _require(
         record.get("record_sha256") == _record_sha256(record),
         "Harness candidate evidence hash mismatch",
+    )
+    transaction_id = record.get("transaction_id")
+    _require(
+        isinstance(transaction_id, str) and bool(transaction_id),
+        "Harness candidate transaction ID is missing",
     )
     raw_joint_version = record.get("parent_joint_version")
     _require(
@@ -815,7 +882,8 @@ def validate_torch_harness_update_evidence(
             "Harness candidate checkpoint model differs from evidence",
         )
         _require(
-            source["joint_credit_record_sha256"]
+            source["transaction_id"] == transaction_id
+            and source["joint_credit_record_sha256"]
             == record.get("source_joint_credit_sha256")
             and source["parent_joint_version_id"]
             == record.get("parent_joint_version_id"),
@@ -850,6 +918,186 @@ def validate_torch_harness_update_evidence(
     )
 
 
+def validate_torch_harness_multi_s_update_evidence(
+    record: Mapping[str, object],
+    *,
+    active_joint_version: JointVersion | None = None,
+    validated_batch: ValidatedMultiSFrozenTrainingBatch | None = None,
+    require_checkpoint: bool = True,
+) -> TorchHarnessMultiSUpdateEvidence:
+    """Revalidate one Adam receipt over an ordered validated multi-S batch."""
+
+    _assert_no_secret_fields(record)
+    evidence_fields = set(TorchHarnessMultiSUpdateEvidence.__dataclass_fields__)
+    _require(
+        set(record)
+        == evidence_fields | {"schema_version", "evidence_scope", "record_sha256"},
+        "multi-S Harness candidate evidence field set differs",
+    )
+    _require(
+        record.get("schema_version") == MULTI_S_HARNESS_CANDIDATE_SCHEMA_VERSION,
+        "unknown multi-S Harness candidate evidence schema",
+    )
+    _require(
+        record.get("record_sha256") == _record_sha256(record),
+        "multi-S Harness candidate evidence hash mismatch",
+    )
+    transaction_id = record.get("transaction_id")
+    _require(
+        isinstance(transaction_id, str) and bool(transaction_id),
+        "multi-S Harness candidate transaction ID is missing",
+    )
+    raw_joint_version = record.get("parent_joint_version")
+    _require(
+        isinstance(raw_joint_version, Mapping),
+        "multi-S Harness candidate parent JointVersion is missing",
+    )
+    try:
+        parent_joint_version = JointVersion(**dict(raw_joint_version))
+    except TypeError as exc:
+        raise TorchHarnessLearningError(
+            "multi-S Harness candidate parent JointVersion is invalid"
+        ) from exc
+    if active_joint_version is not None:
+        _require(
+            parent_joint_version == active_joint_version,
+            "multi-S Harness candidate differs from lag-zero active JointVersion",
+        )
+    _require(
+        record.get("parent_joint_version_id") == parent_joint_version.version_id
+        and record.get("behavior_version") == parent_joint_version.harness_controller,
+        "multi-S Harness candidate parent identity differs from JointVersion",
+    )
+    try:
+        source_binding = validate_multi_s_source_binding(
+            record.get("source_binding"),  # type: ignore[arg-type]
+            batch=validated_batch,
+        )
+    except ValueError as exc:
+        raise TorchHarnessLearningError(str(exc)) from exc
+    _require(
+        source_binding["joint_version_id"] == parent_joint_version.version_id,
+        "multi-S Harness source binding differs from parent JointVersion",
+    )
+    _require(
+        record.get("source_joint_credit_sha256") == source_binding["record_sha256"],
+        "multi-S Harness source digest differs from source binding",
+    )
+    before_digest = record.get("parameter_digest_before")
+    after_digest = record.get("parameter_digest_after")
+    step_before = record.get("optimizer_step_before")
+    step_after = record.get("optimizer_step_after")
+    _require(
+        _is_sha256(before_digest)
+        and _is_sha256(after_digest)
+        and before_digest != after_digest
+        and type(step_before) is int
+        and step_before >= 0
+        and step_after == step_before + 1,
+        "multi-S Harness candidate did not prove exactly one optimizer step",
+    )
+    _require(
+        record.get("behavior_version")
+        == f"{POLICY_SCHEMA_VERSION}-step{step_before:06d}-{before_digest[:16]}"
+        and record.get("candidate_version")
+        == f"{POLICY_SCHEMA_VERSION}-step{step_after:06d}-{after_digest[:16]}",
+        "multi-S Harness behavior or candidate version differs",
+    )
+    batch_size = record.get("batch_size")
+    effective_batch_size = record.get("effective_batch_size")
+    _require(
+        type(batch_size) is int
+        and type(effective_batch_size) is int
+        and 0 < effective_batch_size <= batch_size,
+        "multi-S Harness candidate batch sizes are invalid",
+    )
+    for field in ("loss", "mean_ratio", "clip_fraction", "gradient_norm"):
+        value = record.get(field)
+        _require(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value)),
+            f"multi-S Harness candidate {field} is not finite",
+        )
+    _require(
+        float(record["gradient_norm"]) > 0.0
+        and float(record["mean_ratio"]) > 0.0
+        and 0.0 <= float(record["clip_fraction"]) <= 1.0,
+        "multi-S Harness candidate optimizer metrics are invalid",
+    )
+    checkpoint_path = record.get("checkpoint_path")
+    checkpoint_sha256 = record.get("checkpoint_sha256")
+    _require(
+        isinstance(checkpoint_path, str)
+        and bool(checkpoint_path)
+        and _is_sha256(checkpoint_sha256),
+        "multi-S Harness candidate checkpoint identity is invalid",
+    )
+    if require_checkpoint:
+        unresolved_path = Path(checkpoint_path).expanduser()
+        _require(
+            not unresolved_path.is_symlink(),
+            "multi-S Harness candidate checkpoint is missing or unsafe",
+        )
+        path = require_outside_repository(checkpoint_path)
+        _require(
+            path.is_file()
+            and not path.is_symlink()
+            and _checkpoint_sha256(path) == checkpoint_sha256,
+            "multi-S Harness candidate checkpoint hash mismatch",
+        )
+        restored_policy, restored_optimizer, checkpoint = load_torch_harness_checkpoint(
+            path, map_location="cpu"
+        )
+        del restored_optimizer
+        source = checkpoint["source"]
+        metrics = checkpoint["update_metrics"]
+        _require(
+            checkpoint["schema_version"] == MULTI_S_CHECKPOINT_SCHEMA_VERSION
+            and restored_policy.version == record.get("candidate_version")
+            and restored_policy.parameter_digest == after_digest
+            and restored_policy.update_step == step_after,
+            "multi-S Harness candidate checkpoint model differs from evidence",
+        )
+        _require(
+            source
+            == {
+                "transaction_id": transaction_id,
+                "multi_s_source_binding": source_binding,
+                "parent_joint_version_id": parent_joint_version.version_id,
+            },
+            "multi-S Harness candidate checkpoint source differs from evidence",
+        )
+        _require(
+            metrics
+            == {
+                "batch_size": batch_size,
+                "effective_batch_size": effective_batch_size,
+                "loss": record["loss"],
+                "mean_ratio": record["mean_ratio"],
+                "clip_fraction": record["clip_fraction"],
+                "gradient_norm": record["gradient_norm"],
+                "parameter_digest_before": before_digest,
+                "parameter_digest_after": after_digest,
+            },
+            "multi-S Harness candidate checkpoint metrics differ from evidence",
+        )
+    _require(
+        record.get("evidence_scope") == _MULTI_S_HARNESS_EVIDENCE_SCOPE,
+        "multi-S Harness candidate evidence scope differs from contract",
+    )
+    payload = {
+        field: record[field]
+        for field in evidence_fields
+        if field not in {"parent_joint_version", "source_binding"}
+    }
+    return TorchHarnessMultiSUpdateEvidence(
+        parent_joint_version=parent_joint_version,
+        source_binding=source_binding,
+        **payload,
+    )
+
+
 def _safe_torch_load(path: Path, *, map_location: str | torch.device) -> object:
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
@@ -867,12 +1115,12 @@ def _checkpoint_payload(
     *,
     policy: TorchHarnessPolicy,
     optimizer: torch.optim.Adam,
-    source_joint_credit_sha256: str,
-    parent_joint_version_id: str,
+    schema_version: str,
+    source: Mapping[str, object],
     metrics: Mapping[str, object],
 ) -> dict[str, object]:
     return {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "policy_schema_version": policy.schema_version,
         "state_feature_schema_version": policy.state_feature_schema_version,
         "action_ids": list(ACTION_IDS),
@@ -896,10 +1144,7 @@ def _checkpoint_payload(
             # to checkpoint this small, independently optimized controller.
             "torch_cuda_rng_states": [],
         },
-        "source": {
-            "joint_credit_record_sha256": source_joint_credit_sha256,
-            "parent_joint_version_id": parent_joint_version_id,
-        },
+        "source": deepcopy(dict(source)),
         "update_metrics": dict(metrics),
     }
 
@@ -939,8 +1184,10 @@ def load_torch_harness_checkpoint(
         "update_metrics",
     }
     _require(set(raw) == required, "Harness checkpoint field set differs")
+    checkpoint_schema = raw["schema_version"]
     _require(
-        raw["schema_version"] == CHECKPOINT_SCHEMA_VERSION,
+        checkpoint_schema
+        in {CHECKPOINT_SCHEMA_VERSION, MULTI_S_CHECKPOINT_SCHEMA_VERSION},
         "unknown Harness checkpoint schema",
     )
     _require(
@@ -1061,14 +1308,46 @@ def load_torch_harness_checkpoint(
     )
     source = raw["source"]
     metrics = raw["update_metrics"]
-    _require(
-        isinstance(source, Mapping)
-        and set(source) == {"joint_credit_record_sha256", "parent_joint_version_id"}
-        and _is_sha256(source.get("joint_credit_record_sha256"))
+    _require(isinstance(source, Mapping), "Harness checkpoint source identity differs")
+    common_source_valid = (
+        isinstance(source.get("transaction_id"), str)
+        and bool(source["transaction_id"])
         and isinstance(source.get("parent_joint_version_id"), str)
-        and bool(source["parent_joint_version_id"]),
-        "Harness checkpoint source identity differs",
+        and bool(source["parent_joint_version_id"])
     )
+    if checkpoint_schema == CHECKPOINT_SCHEMA_VERSION:
+        _require(
+            common_source_valid
+            and set(source)
+            == {
+                "transaction_id",
+                "joint_credit_record_sha256",
+                "parent_joint_version_id",
+            }
+            and _is_sha256(source.get("joint_credit_record_sha256")),
+            "Harness checkpoint source identity differs",
+        )
+    else:
+        _require(
+            common_source_valid
+            and set(source)
+            == {
+                "transaction_id",
+                "multi_s_source_binding",
+                "parent_joint_version_id",
+            },
+            "multi-S Harness checkpoint source identity differs",
+        )
+        try:
+            checkpoint_binding = validate_multi_s_source_binding(
+                source.get("multi_s_source_binding"),  # type: ignore[arg-type]
+            )
+        except ValueError as exc:
+            raise TorchHarnessLearningError(str(exc)) from exc
+        _require(
+            source["parent_joint_version_id"] == checkpoint_binding["joint_version_id"],
+            "multi-S Harness checkpoint source JointVersion differs",
+        )
     _require(
         isinstance(metrics, Mapping) and set(metrics) == _CHECKPOINT_METRIC_FIELDS,
         "Harness checkpoint metrics field set differs",
@@ -1099,6 +1378,133 @@ def load_torch_harness_checkpoint(
         "Harness checkpoint optimizer metrics are inconsistent",
     )
     return policy, optimizer, dict(raw)
+
+
+@dataclass(frozen=True)
+class _PreparedHarnessBatch:
+    samples: tuple[Mapping[str, object], ...]
+    states: tuple[HarnessState, ...]
+    masks: tuple[tuple[bool, ...], ...]
+    selected_indexes: tuple[int, ...]
+    recorded_logits: tuple[tuple[float, ...], ...]
+    old_logprobs: tuple[float, ...]
+    advantages: tuple[float, ...]
+    loss_masks: tuple[int, ...]
+
+
+def _prepare_harness_batch(
+    policy: TorchHarnessPolicy,
+    samples: Sequence[object],
+    *,
+    expected_trainable_count: int,
+) -> _PreparedHarnessBatch:
+    _require(bool(samples), "Harness optimizer requires at least one admitted sample")
+    _require(
+        type(expected_trainable_count) is int and expected_trainable_count >= 0,
+        "Harness trainable action count is invalid",
+    )
+    parsed_samples: list[Mapping[str, object]] = []
+    states: list[HarnessState] = []
+    masks: list[tuple[bool, ...]] = []
+    selected_indexes: list[int] = []
+    recorded_logits: list[tuple[float, ...]] = []
+    old_logprobs: list[float] = []
+    advantages: list[float] = []
+    loss_masks: list[int] = []
+    for sample in samples:
+        _require(isinstance(sample, Mapping), "Harness sample must be an object")
+        action = sample.get("action")
+        _require(isinstance(action, Mapping), "Harness action record is missing")
+        state_raw = action.get("state")
+        _require(isinstance(state_raw, Mapping), "Harness state record is missing")
+        _require(
+            set(state_raw) == set(HarnessState.__dataclass_fields__),
+            "Harness state field set differs from schema",
+        )
+        try:
+            state = HarnessState(**dict(state_raw))
+        except TypeError as exc:
+            raise TorchHarnessLearningError("invalid Harness state") from exc
+        _state_payload(state)
+        action_ids = tuple(action.get("action_ids", ()))
+        _require(
+            action_ids == ACTION_IDS,
+            "Harness action IDs differ from fixed five-action schema",
+        )
+        mask = _normalize_action_mask(action.get("action_mask"))
+        selected_action = action.get("action")
+        _require(
+            selected_action in ACTION_IDS,
+            "Harness selected action differs from fixed schema",
+        )
+        selected = ACTION_IDS.index(str(selected_action))
+        _require(mask[selected], "chosen Harness action is masked out")
+        logits = action.get("pre_mask_logits")
+        _require(
+            isinstance(logits, (list, tuple))
+            and len(logits) == len(ACTION_IDS)
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in logits
+            ),
+            "Harness behavior logits are invalid",
+        )
+        old_logprob = action.get("old_harness_logprob")
+        loss_mask = action.get("harness_loss_mask")
+        masked_advantage = sample.get("masked_advantage")
+        _require(
+            isinstance(old_logprob, (int, float))
+            and not isinstance(old_logprob, bool)
+            and math.isfinite(float(old_logprob)),
+            "Harness old log-prob is invalid",
+        )
+        _require(
+            type(loss_mask) is int and loss_mask in (0, 1),
+            "Harness loss mask must be integer 0 or 1",
+        )
+        _require(
+            isinstance(masked_advantage, (int, float))
+            and not isinstance(masked_advantage, bool)
+            and math.isfinite(float(masked_advantage)),
+            "Harness masked advantage is invalid",
+        )
+        _require(
+            action.get("harness_behavior_version") == policy.version,
+            "Harness sample behavior version differs from policy snapshot",
+        )
+        parsed_samples.append(sample)
+        states.append(state)
+        masks.append(mask)
+        selected_indexes.append(selected)
+        recorded_logits.append(tuple(float(value) for value in logits))
+        old_logprobs.append(float(old_logprob))
+        advantages.append(float(masked_advantage))
+        loss_masks.append(loss_mask)
+
+    _require(
+        sum(loss_masks) == expected_trainable_count,
+        "Harness loss masks differ from validated S summary",
+    )
+    _require(sum(loss_masks) > 0, "Harness batch has zero trainable credit")
+    _require(
+        any(
+            mask and abs(advantage) > 0.0
+            for mask, advantage in zip(loss_masks, advantages)
+        ),
+        "Harness batch has zero effective credit",
+    )
+    return _PreparedHarnessBatch(
+        samples=tuple(parsed_samples),
+        states=tuple(states),
+        masks=tuple(masks),
+        selected_indexes=tuple(selected_indexes),
+        recorded_logits=tuple(recorded_logits),
+        old_logprobs=tuple(old_logprobs),
+        advantages=tuple(advantages),
+        loss_masks=tuple(loss_masks),
+    )
 
 
 class TorchHarnessOptimizer:
@@ -1163,10 +1569,197 @@ class TorchHarnessOptimizer:
         )
         return candidate, optimizer
 
+    def _execute_prepared_batch(
+        self,
+        prepared: _PreparedHarnessBatch,
+        *,
+        checkpoint_path: str | os.PathLike[str],
+        checkpoint_schema_version: str,
+        checkpoint_source: Mapping[str, object],
+    ) -> tuple[
+        TorchHarnessPolicy,
+        torch.optim.Adam,
+        dict[str, object],
+        Path,
+    ]:
+        target = require_outside_repository(checkpoint_path)
+        _require(not target.exists(), "Harness checkpoint path already exists")
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        candidate, optimizer = self._candidate()
+        logits = candidate.logits_for(prepared.states)
+        device = logits.device
+        dtype = logits.dtype
+        recorded_logits_tensor = torch.tensor(
+            prepared.recorded_logits,
+            dtype=dtype,
+            device=device,
+        )
+        _require(
+            torch.isfinite(logits).all().item(),
+            "recomputed Harness logits are not finite",
+        )
+        _require(
+            torch.allclose(
+                logits.detach(),
+                recorded_logits_tensor,
+                rtol=0.0,
+                atol=1e-6,
+            ),
+            "recorded Harness logits differ from behavior snapshot",
+        )
+        mask_tensor = torch.tensor(prepared.masks, dtype=torch.bool, device=device)
+        selected_tensor = torch.tensor(
+            prepared.selected_indexes,
+            dtype=torch.long,
+            device=device,
+        )
+        masked_logits = logits.masked_fill(~mask_tensor, -torch.inf)
+        current_logprobs = torch.log_softmax(masked_logits, dim=-1).gather(
+            1,
+            selected_tensor[:, None],
+        )[:, 0]
+        old_logprob_tensor = torch.tensor(
+            prepared.old_logprobs,
+            dtype=dtype,
+            device=device,
+        )
+        _require(
+            torch.allclose(
+                current_logprobs.detach(),
+                old_logprob_tensor,
+                rtol=0.0,
+                atol=1e-6,
+            ),
+            "recorded old log-prob differs from behavior snapshot",
+        )
+        advantage_tensor = torch.tensor(
+            prepared.advantages,
+            dtype=dtype,
+            device=device,
+        )
+        loss_mask_tensor = torch.tensor(
+            prepared.loss_masks,
+            dtype=dtype,
+            device=device,
+        )
+        ratio = torch.exp(current_logprobs - old_logprob_tensor)
+        unclipped = ratio * advantage_tensor
+        clipped = (
+            torch.clamp(
+                ratio,
+                1.0 - self.clip_ratio,
+                1.0 + self.clip_ratio,
+            )
+            * advantage_tensor
+        )
+        loss = (
+            -(torch.minimum(unclipped, clipped) * loss_mask_tensor).sum()
+            / loss_mask_tensor.sum()
+        )
+        _require(torch.isfinite(loss).item(), "Harness PPO loss is not finite")
+
+        parameter_digest_before = self.policy.parameter_digest
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        gradient_squared = torch.zeros((), dtype=torch.float64, device=device)
+        for parameter in candidate.parameters():
+            if parameter.grad is not None:
+                gradient_squared += parameter.grad.detach().double().square().sum()
+        gradient_norm = float(torch.sqrt(gradient_squared).item())
+        _require(
+            math.isfinite(gradient_norm) and gradient_norm > 0.0,
+            "Harness PPO gradient norm must be finite and non-zero",
+        )
+        torch.nn.utils.clip_grad_norm_(candidate.parameters(), self.max_grad_norm)
+        optimizer.step()
+        candidate.update_step = self.policy.update_step + 1
+        _validate_adam_optimizer_state(
+            candidate,
+            optimizer,
+            allow_uninitialized_step_zero=False,
+        )
+        parameter_digest_after = candidate.parameter_digest
+        _require(
+            parameter_digest_after != parameter_digest_before,
+            "Harness Adam step did not change the parameter digest",
+        )
+        _require(
+            candidate.version != self.policy.version,
+            "Harness candidate version did not advance",
+        )
+        metrics: dict[str, object] = {
+            "batch_size": len(prepared.samples),
+            "effective_batch_size": sum(prepared.loss_masks),
+            "loss": float(loss.detach().item()),
+            "mean_ratio": float(ratio.detach().mean().item()),
+            "clip_fraction": float(
+                ((ratio.detach() - 1.0).abs() > self.clip_ratio).float().mean().item()
+            ),
+            "gradient_norm": gradient_norm,
+            "parameter_digest_before": parameter_digest_before,
+            "parameter_digest_after": parameter_digest_after,
+        }
+        checkpoint = _checkpoint_payload(
+            policy=candidate,
+            optimizer=optimizer,
+            schema_version=checkpoint_schema_version,
+            source=checkpoint_source,
+            metrics=metrics,
+        )
+        temporary_path: Path | None = None
+        target_created = False
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                dir=target.parent,
+                delete=False,
+            ) as stream:
+                temporary_path = Path(stream.name)
+                torch.save(checkpoint, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.link(temporary_path, target)
+            target_created = True
+            temporary_path.unlink()
+            temporary_path = None
+            restored_policy, restored_optimizer, restored = (
+                load_torch_harness_checkpoint(target, map_location=candidate.device)
+            )
+            _require(
+                restored_policy.parameter_digest == parameter_digest_after
+                and restored_policy.version == candidate.version,
+                "Harness checkpoint model round trip differs from candidate",
+            )
+            _require(
+                bool(restored_optimizer.state)
+                and restored["schema_version"] == checkpoint_schema_version
+                and restored["source"] == checkpoint_source,
+                "Harness checkpoint optimizer or source round trip differs",
+            )
+            _require(
+                torch.equal(
+                    restored_policy._generator.get_state(),
+                    candidate._generator.get_state(),
+                ),
+                "Harness checkpoint sampling RNG round trip differs",
+            )
+        except Exception:
+            if target_created:
+                target.unlink(missing_ok=True)
+            raise
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        return candidate, optimizer, metrics, target
+
     def update_from_frozen_joint_credit(
         self,
         record: Mapping[str, object],
         *,
+        transaction_id: str,
         active_joint_version: JointVersion,
         checkpoint_path: str | os.PathLike[str],
     ) -> TorchHarnessUpdateResult:
@@ -1175,6 +1768,10 @@ class TorchHarnessOptimizer:
         _require(
             isinstance(record, Mapping),
             "Harness optimizer requires a frozen joint-credit record",
+        )
+        _require(
+            isinstance(transaction_id, str) and bool(transaction_id),
+            "Harness optimizer transaction ID is missing",
         )
         _assert_no_secret_fields(record)
         _require(
@@ -1399,8 +1996,12 @@ class TorchHarnessOptimizer:
         checkpoint = _checkpoint_payload(
             policy=candidate,
             optimizer=optimizer,
-            source_joint_credit_sha256=str(record["record_sha256"]),
-            parent_joint_version_id=active_joint_version.version_id,
+            schema_version=CHECKPOINT_SCHEMA_VERSION,
+            source={
+                "transaction_id": transaction_id,
+                "joint_credit_record_sha256": str(record["record_sha256"]),
+                "parent_joint_version_id": active_joint_version.version_id,
+            },
             metrics=metrics,
         )
         temporary_path: Path | None = None
@@ -1433,6 +2034,7 @@ class TorchHarnessOptimizer:
             )
             _require(
                 bool(restored_optimizer.state)
+                and restored["source"]["transaction_id"] == transaction_id
                 and restored["source"]["joint_credit_record_sha256"]
                 == record["record_sha256"]
                 and restored["source"]["parent_joint_version_id"]
@@ -1455,6 +2057,7 @@ class TorchHarnessOptimizer:
                 temporary_path.unlink(missing_ok=True)
 
         evidence = TorchHarnessUpdateEvidence(
+            transaction_id=transaction_id,
             source_joint_credit_sha256=str(record["record_sha256"]),
             parent_joint_version=active_joint_version,
             parent_joint_version_id=active_joint_version.version_id,
@@ -1486,14 +2089,210 @@ class TorchHarnessOptimizer:
             evidence=evidence,
         )
 
+    def update_from_validated_multi_s_frozen_training_batch(
+        self,
+        batch: ValidatedMultiSFrozenTrainingBatch,
+        *,
+        transaction_id: str,
+        active_joint_version: JointVersion,
+        checkpoint_path: str | os.PathLike[str],
+    ) -> TorchHarnessMultiSUpdateResult:
+        """Run exactly one Adam step over every ordered Harness sample in T/U's batch."""
+
+        _require(
+            type(batch) is ValidatedMultiSFrozenTrainingBatch,
+            "multi-S Harness optimizer requires a validated batch object",
+        )
+        _require(
+            isinstance(transaction_id, str) and bool(transaction_id),
+            "multi-S Harness optimizer transaction ID is missing",
+        )
+        _require(
+            type(active_joint_version) is JointVersion,
+            "multi-S Harness optimizer requires an active JointVersion",
+        )
+        _require(
+            batch.joint_version == active_joint_version,
+            "multi-S Harness batch differs from lag-zero active JointVersion",
+        )
+        _require(
+            self.policy.version == active_joint_version.harness_controller,
+            "Harness behavior version differs from lag-zero JointVersion",
+        )
+        try:
+            source_binding = multi_s_source_binding(batch)
+            validate_multi_s_source_binding(source_binding, batch=batch)
+            ordered_records = tuple(iter_member_s_records(batch))
+        except ValueError as exc:
+            raise TorchHarnessLearningError(str(exc)) from exc
+        _assert_no_secret_fields(source_binding, "source_binding")
+        _require(
+            len(ordered_records) == len(batch.members) >= 4,
+            "multi-S Harness optimizer requires at least four ordered members",
+        )
+
+        merged_samples: list[object] = []
+        trainable_action_count = 0
+        policy_sample_count = 0
+        member_claims: set[str] = set()
+        stable_s_claims: set[str] = set()
+        for expected_index, ((member_claim, s_record), member) in enumerate(
+            zip(ordered_records, batch.members)
+        ):
+            _require(
+                member.member_index == expected_index
+                and member_claim == member.member_claim_sha256,
+                "multi-S Harness member order or claim differs",
+            )
+            _require(
+                member_claim not in member_claims
+                and member.s_record_sha256 not in stable_s_claims,
+                "multi-S Harness member claims must be unique",
+            )
+            member_claims.add(member_claim)
+            stable_s_claims.add(member.s_record_sha256)
+            _assert_no_secret_fields(s_record, f"members[{expected_index}].s_record")
+            _require(
+                s_record.get("record_sha256") == member.s_record_sha256
+                and _record_sha256(s_record) == member.s_record_sha256,
+                "multi-S Harness member S digest differs",
+            )
+            try:
+                audit = validate_frozen_joint_credit_alignment(
+                    s_record,
+                    active_joint_version=active_joint_version,
+                )
+            except (JointCreditAlignmentError, ValueError) as exc:
+                raise TorchHarnessLearningError(str(exc)) from exc
+            _require(
+                audit["joint_version_id"] == active_joint_version.version_id,
+                "multi-S Harness member differs from lag-zero JointVersion",
+            )
+            admissions = s_record.get("admissions")
+            _require(
+                isinstance(admissions, Mapping)
+                and admissions.get("policy_export_style") == "individual",
+                "multi-S Harness optimizer rejects concat/post-batch records",
+            )
+            samples = s_record.get("harness_samples")
+            policy_samples = s_record.get("policy_samples")
+            _require(
+                isinstance(samples, list)
+                and bool(samples)
+                and isinstance(policy_samples, list)
+                and bool(policy_samples),
+                "multi-S Harness member samples are missing",
+            )
+            _require(
+                len(samples) == len(member.harness_decision_ids)
+                and len(policy_samples) == len(member.policy_sample_ids),
+                "multi-S Harness member sample counts differ from claims",
+            )
+            persisted_path = member.source_path.expanduser()
+            _require(
+                not persisted_path.is_symlink(),
+                "multi-S Harness persisted S source is unsafe",
+            )
+            persisted_path = require_outside_repository(persisted_path)
+            _require(
+                persisted_path.is_file() and not persisted_path.is_symlink(),
+                "multi-S Harness persisted S source is missing or unsafe",
+            )
+            raw = persisted_path.read_bytes()
+            _require(
+                hashlib.sha256(raw).hexdigest() == member.source_file_sha256,
+                "multi-S Harness persisted S source file hash mismatch",
+            )
+            try:
+                persisted_s_record = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise TorchHarnessLearningError(
+                    "multi-S Harness persisted S source is invalid JSON"
+                ) from exc
+            _require(
+                _canonical_json(persisted_s_record) == _canonical_json(s_record),
+                "multi-S Harness persisted S source differs from embedded member",
+            )
+            merged_samples.extend(samples)
+            policy_sample_count += len(policy_samples)
+            trainable_action_count += int(audit["harness_trainable_action_count"])
+
+        _require(
+            len(merged_samples)
+            == batch.harness_action_count
+            == source_binding["harness_action_count"]
+            and policy_sample_count
+            == batch.policy_sample_count
+            == source_binding["policy_sample_count"],
+            "multi-S Harness merged sample counts differ from source binding",
+        )
+        prepared = _prepare_harness_batch(
+            self.policy,
+            merged_samples,
+            expected_trainable_count=trainable_action_count,
+        )
+        checkpoint_source: dict[str, object] = {
+            "transaction_id": transaction_id,
+            "multi_s_source_binding": deepcopy(source_binding),
+            "parent_joint_version_id": active_joint_version.version_id,
+        }
+        candidate, optimizer, metrics, target = self._execute_prepared_batch(
+            prepared,
+            checkpoint_path=checkpoint_path,
+            checkpoint_schema_version=MULTI_S_CHECKPOINT_SCHEMA_VERSION,
+            checkpoint_source=checkpoint_source,
+        )
+        evidence = TorchHarnessMultiSUpdateEvidence(
+            transaction_id=transaction_id,
+            source_joint_credit_sha256=str(source_binding["record_sha256"]),
+            source_binding=deepcopy(source_binding),
+            parent_joint_version=active_joint_version,
+            parent_joint_version_id=active_joint_version.version_id,
+            behavior_version=self.policy.version,
+            candidate_version=candidate.version,
+            parameter_digest_before=str(metrics["parameter_digest_before"]),
+            parameter_digest_after=str(metrics["parameter_digest_after"]),
+            optimizer_step_before=self.policy.update_step,
+            optimizer_step_after=candidate.update_step,
+            batch_size=int(metrics["batch_size"]),
+            effective_batch_size=int(metrics["effective_batch_size"]),
+            loss=float(metrics["loss"]),
+            mean_ratio=float(metrics["mean_ratio"]),
+            clip_fraction=float(metrics["clip_fraction"]),
+            gradient_norm=float(metrics["gradient_norm"]),
+            checkpoint_path=str(target.resolve()),
+            checkpoint_sha256=_checkpoint_sha256(target),
+        )
+        validate_torch_harness_multi_s_update_evidence(
+            evidence.to_record(),
+            active_joint_version=active_joint_version,
+            validated_batch=batch,
+        )
+        candidate_trainer = TorchHarnessOptimizer(
+            candidate,
+            learning_rate=float(optimizer.param_groups[0]["lr"]),
+            clip_ratio=self.clip_ratio,
+            max_grad_norm=self.max_grad_norm,
+            _optimizer=optimizer,
+        )
+        return TorchHarnessMultiSUpdateResult(
+            candidate_policy=candidate,
+            candidate_optimizer=candidate_trainer,
+            evidence=evidence,
+        )
+
 
 __all__ = [
     "ACTION_IDS",
     "CHECKPOINT_SCHEMA_VERSION",
     "HARNESS_CANDIDATE_SCHEMA_VERSION",
+    "MULTI_S_CHECKPOINT_SCHEMA_VERSION",
+    "MULTI_S_HARNESS_CANDIDATE_SCHEMA_VERSION",
     "POLICY_SCHEMA_VERSION",
     "ROLLOUT_CHECKPOINT_SCHEMA_VERSION",
     "TorchHarnessLearningError",
+    "TorchHarnessMultiSUpdateEvidence",
+    "TorchHarnessMultiSUpdateResult",
     "TorchHarnessOptimizer",
     "TorchHarnessPolicy",
     "TorchHarnessUpdateEvidence",
@@ -1502,5 +2301,6 @@ __all__ = [
     "encode_harness_state",
     "load_torch_harness_checkpoint",
     "load_torch_harness_rollout_checkpoint",
+    "validate_torch_harness_multi_s_update_evidence",
     "validate_torch_harness_update_evidence",
 ]

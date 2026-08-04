@@ -21,8 +21,6 @@ EXPECTED_AREAL_COMMIT="fee938eada49208a5aabdbc1095730a13076a349"
 MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/qwen2.5-1.5b-snapshot.json"
 DATASET_REPORT="${JPH_ROOT}/artifacts/bootstrap/gsm8k-snapshot.json"
 CUDA_TOOLKIT_ROOT="${JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6}"
-MAX_USED_MEMORY_MIB="${JPH_TRACE_MAX_USED_MEMORY_MIB:-10240}"
-MIN_FREE_MEMORY_MIB="${JPH_TRACE_MIN_FREE_MEMORY_MIB:-65536}"
 
 for path in "${AREAL_REPO}/.git" "${AREAL_VENV}/bin/python" "${MODEL_REPORT}" "${DATASET_REPORT}" "${CUDA_TOOLKIT_ROOT}/bin/nvcc"; do
   if [[ ! -e "${path}" ]]; then
@@ -83,10 +81,11 @@ if [[ ! "${GPU_MEMORY_USED}" =~ ^[0-9]+$ ]] || [[ ! "${GPU_MEMORY_FREE}" =~ ^[0-
   echo "Cannot read GPU ${GPU_ID} memory state" >&2
   exit 3
 fi
-if ((GPU_MEMORY_USED > MAX_USED_MEMORY_MIB || GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB)); then
-  echo "GPU ${GPU_ID} lacks headroom: used=${GPU_MEMORY_USED}MiB free=${GPU_MEMORY_FREE}MiB" >&2
-  exit 3
-fi
+GPU_PROCESS_SNAPSHOT="$(
+  nvidia-smi -i "${GPU_ID}" \
+    --query-compute-apps=pid,process_name,used_memory \
+    --format=csv,noheader,nounits
+)"
 
 RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ROOT="${JPH_ROOT}/artifacts/areal-trace-b0/${RUN_STAMP}"
@@ -109,6 +108,9 @@ nvidia-smi dmon -i "${GPU_ID}" -s pucm -d 5 -o TD > "${RUN_ROOT}/gpu-dmon.log" 2
 GPU_MONITOR_PID="$!"
 
 echo "AReaL=${ACTUAL_AREAL_COMMIT} physical_gpu=${GPU_ID} model_revision=${MODEL_REVISION}"
+printf 'gpu_memory_limit_enforced=false used=%sMiB free=%sMiB processes=%s\n' \
+  "${GPU_MEMORY_USED}" "${GPU_MEMORY_FREE}" \
+  "$([[ -n "${GPU_PROCESS_SNAPSHOT}" ]] && printf observed || printf none)"
 echo "run_root=${RUN_ROOT} trace_dir=${TRACE_DIR}"
 
 cd "${AREAL_REPO}"

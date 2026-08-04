@@ -9,7 +9,7 @@ from pathlib import Path
 
 from jphrl.paths import require_outside_repository
 
-SCHEMA_VERSION = "jph.gpu-memory-envelope.v1"
+SCHEMA_VERSION = "jph.gpu-memory-observation.v2"
 
 
 def _canonical_json(value: object) -> bytes:
@@ -57,14 +57,16 @@ def audit_gpu_memory_envelope(
     output_path: str | Path,
     physical_gpu_id: int,
     baseline_used_mib: int,
-    max_new_memory_mib: int,
+    max_new_memory_mib: int | None = None,
     run_kind: str,
     project_commit: str,
 ) -> dict[str, object]:
     if physical_gpu_id < 0:
         raise ValueError("physical GPU ID must be non-negative")
-    if baseline_used_mib < 0 or max_new_memory_mib <= 0:
-        raise ValueError("GPU memory envelope values must be positive")
+    if baseline_used_mib < 0:
+        raise ValueError("GPU memory baseline must be non-negative")
+    if max_new_memory_mib is not None and max_new_memory_mib <= 0:
+        raise ValueError("optional GPU memory limit must be positive")
     if not run_kind:
         raise ValueError("run kind is missing")
     if len(project_commit) != 40 or any(
@@ -99,7 +101,12 @@ def audit_gpu_memory_envelope(
         },
         "measured_new_memory_mib": measured_new_mib,
         "max_new_memory_mib": max_new_memory_mib,
-        "passed": measured_new_mib <= max_new_memory_mib,
+        "memory_limit_enforced": max_new_memory_mib is not None,
+        "passed": (
+            True
+            if max_new_memory_mib is None
+            else measured_new_mib <= max_new_memory_mib
+        ),
         "evidence_scope": {
             "gpu_memory_observed": True,
             "policy_optimizer_update": False,
@@ -132,7 +139,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--physical-gpu-id", required=True, type=int)
     parser.add_argument("--baseline-used-mib", required=True, type=int)
-    parser.add_argument("--max-new-memory-mib", required=True, type=int)
+    parser.add_argument("--max-new-memory-mib", type=int)
     parser.add_argument("--run-kind", required=True)
     parser.add_argument("--project-commit", required=True)
     args = parser.parse_args(argv)

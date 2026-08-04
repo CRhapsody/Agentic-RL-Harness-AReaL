@@ -5,21 +5,27 @@ import json
 import tempfile
 import unittest
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from jphrl.training.production_checkpoint import (
+    LiveExactDistributedJointRecovery,
     LiveExactJointRecovery,
+    PolicyRankCheckpointState,
+    PolicySchedulerCheckpointState,
     ProductionCheckpointError,
     RuntimeCursorState,
     RuntimeTopology,
     capture_rank_runtime_state,
+    distributed_policy_checkpoint_inputs,
     dry_load_production_joint_checkpoint,
     require_live_exact_joint_recovery,
     save_production_joint_checkpoint,
     validate_exact_joint_recovery_evidence,
     validate_production_joint_checkpoint,
+    verify_exact_distributed_joint_recovery,
     verify_exact_joint_recovery,
 )
 from jphrl.training.production_checkpoint import (
@@ -74,6 +80,13 @@ class FakeActor:
         return 7
 
 
+class FakeDistributedController:
+    """Deliberately has no local scheduler or optimizer state."""
+
+    def get_version(self) -> int:
+        return 7
+
+
 def _dcp_manifest(root: Path) -> dict[str, object]:
     files = []
     for path in sorted(root.rglob("*")):
@@ -88,28 +101,67 @@ def _dcp_manifest(root: Path) -> dict[str, object]:
     return {"files": files, "manifest_sha256": _sha256_json({"files": files})}
 
 
-def _bundle(root: Path) -> tuple[dict[str, object], SimpleNamespace]:
+def _bundle(
+    root: Path,
+    *,
+    world_size: int = 1,
+) -> tuple[dict[str, object], SimpleNamespace]:
     parent_version = _version("policy-parent", "harness-parent")
     candidate_version = _version("areal-policy-candidate", "harness-candidate")
     parent = root / "policy-parent.dcp"
     candidate = root / "policy-candidate.dcp"
     parent.mkdir()
     candidate.mkdir()
-    (parent / "rank0.distcp").write_bytes(b"parent-model-and-optim")
-    (candidate / "rank0.distcp").write_bytes(b"candidate-model-and-optim")
+    for rank in range(world_size):
+        (parent / f"rank{rank}.distcp").write_bytes(
+            f"parent-model-and-optim-rank-{rank}".encode()
+        )
+        (candidate / f"rank{rank}.distcp").write_bytes(
+            f"candidate-model-and-optim-rank-{rank}".encode()
+        )
     harness = root / "harness-candidate.pt"
     harness.write_bytes(b"harness-model-adam-generator")
     source = "a" * 64
     policy_receipt = {
+        "schema_version": "jph.areal-policy-candidate.v2",
+        "transaction": {
+            "transaction_id": "macro-7",
+            "episode_id": "episode-7",
+            "source_admission_sha256": "e" * 64,
+            "source_joint_credit_sha256": source,
+            "trainable_token_count": 3,
+        },
+        "optimizer": {
+            "actor_type": "areal.engine.fsdp_engine.FSDPPPOActor",
+            "optimizer_type": "torch.optim.adamw.AdamW",
+            "config": {},
+            "stats": {
+                "grad_norm": 1.0,
+                "grad_norm_count": 1,
+                "learning_rate": 0.001,
+                "learning_rate_count": 1,
+                "optimizer_step_before": 7,
+                "optimizer_step_after": 8,
+                "update_successful": 1.0,
+                "update_successful_count": 1,
+            },
+            "lr_scheduler": {
+                "state_before_sha256": "f" * 64,
+                "state_after_sha256": _sha256_json(FakeScheduler().state),
+                "step_completed": True,
+            },
+        },
         "checkpoints": {
             "parent_path": str(parent),
             "parent_manifest": _dcp_manifest(parent),
             "candidate_path": str(candidate),
             "candidate_manifest": _dcp_manifest(candidate),
-        }
+        },
+        "record_sha256": "b" * 64,
     }
     harness_receipt = {
-        "schema_version": "jph.torch-harness-candidate.v1",
+        "schema_version": "jph.torch-harness-candidate.v2",
+        "transaction_id": "macro-7",
         "checkpoint_path": str(harness),
         "checkpoint_sha256": _sha256_bytes(harness.read_bytes()),
     }
@@ -145,6 +197,70 @@ def _topology() -> RuntimeTopology:
     )
 
 
+def _topology4() -> RuntimeTopology:
+    return RuntimeTopology(
+        world_size=4,
+        data_parallel_size=4,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        rank_to_device=("cpu",) * 4,
+    )
+
+
+def _four_rank_inputs(
+    bundle: dict[str, object],
+    audit: SimpleNamespace,
+) -> tuple[
+    tuple[object, ...],
+    tuple[PolicyRankCheckpointState, ...],
+    PolicySchedulerCheckpointState,
+]:
+    runtime_states = tuple(
+        capture_rank_runtime_state(
+            rank=rank,
+            local_rank=0,
+            device="cpu",
+        )
+        for rank in range(4)
+    )
+    policy_receipt = bundle["receipts"]["policy"]
+    checkpoints = policy_receipt["checkpoints"]
+    stats = policy_receipt["optimizer"]["stats"]
+    scheduler = policy_receipt["optimizer"]["lr_scheduler"]
+    policy_states = tuple(
+        PolicyRankCheckpointState(
+            rank=runtime.rank,
+            local_rank=runtime.local_rank,
+            world_size=4,
+            device=runtime.device,
+            hostname=runtime.hostname,
+            physical_gpu_id=str(runtime.rank),
+            cuda_visible_devices=str(runtime.rank),
+            transaction_id=audit.macro_step_id,
+            source_joint_credit_sha256=audit.source_joint_credit_sha256,
+            policy_candidate_receipt_sha256=policy_receipt["record_sha256"],
+            parent_dcp_manifest_sha256=checkpoints["parent_manifest"][
+                "manifest_sha256"
+            ],
+            candidate_dcp_manifest_sha256=checkpoints["candidate_manifest"][
+                "manifest_sha256"
+            ],
+            actor_public_version=audit.policy_engine_version,
+            actor_reserved_version=audit.candidate_policy_engine_version,
+            optimizer_step_before=stats["optimizer_step_before"],
+            optimizer_step_after=stats["optimizer_step_after"],
+            lr_scheduler_state_after_sha256=scheduler["state_after_sha256"],
+        )
+        for runtime in runtime_states
+    )
+    scheduler_state = PolicySchedulerCheckpointState(
+        owner_rank=0,
+        scheduler_class=(f"{FakeScheduler.__module__}.{FakeScheduler.__qualname__}"),
+        state=FakeScheduler().state,
+    )
+    return runtime_states, policy_states, scheduler_state
+
+
 def _resign(record: dict[str, object]) -> None:
     unsigned = {key: value for key, value in record.items() if key != "record_sha256"}
     record["record_sha256"] = _sha256_json(unsigned)
@@ -174,6 +290,35 @@ class ProductionCheckpointTests(unittest.TestCase):
                 harness_policy=None,
                 topology=_topology(),
                 rank_states=(state,),
+                macro_step=7,
+                rollout_cursor=11,
+                dataloader_cursor=13,
+            )
+        return manifest, audit
+
+    def _saved4(self, root: Path) -> tuple[Path, SimpleNamespace]:
+        project = root / "src" / "repo"
+        project.mkdir(parents=True)
+        components = root / "runs" / "components"
+        components.mkdir(parents=True)
+        bundle, audit = _bundle(components, world_size=4)
+        runtime_states, policy_states, scheduler_state = _four_rank_inputs(
+            bundle, audit
+        )
+        with patch(
+            "jphrl.training.production_checkpoint.validate_joint_candidate_bundle",
+            return_value=audit,
+        ):
+            manifest = save_production_joint_checkpoint(
+                checkpoint_root=root / "runs" / "checkpoint-7",
+                project_root=project,
+                joint_candidate_bundle=bundle,
+                actor=FakeDistributedController(),
+                harness_policy=None,
+                topology=_topology4(),
+                rank_states=runtime_states,
+                policy_rank_states=policy_states,
+                policy_scheduler_state=scheduler_state,
                 macro_step=7,
                 rollout_cursor=11,
                 dataloader_cursor=13,
@@ -235,6 +380,190 @@ class ProductionCheckpointTests(unittest.TestCase):
             self.assertEqual(len(record["rng"]["rank_states"]), 1)
             self.assertEqual(record["topology"]["rank_to_device"], ["cpu"])
             self.assertFalse(record["evidence_scope"]["exact_joint_recovery"])
+
+    def test_four_rank_checkpoint_binds_every_actor_rank_without_controller_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with patch.dict("os.environ", {"JPH_ROOT": str(root)}):
+                manifest, audit = self._saved4(root)
+                with patch(
+                    "jphrl.training.production_checkpoint.validate_joint_candidate_bundle",
+                    return_value=audit,
+                ):
+                    result = validate_production_joint_checkpoint(
+                        manifest,
+                        current_topology=_topology4(),
+                    )
+                record = json.loads(manifest.read_text())
+
+            self.assertEqual(result.policy_rank_state_count, 4)
+            self.assertEqual(result.topology.data_parallel_size, 4)
+            self.assertFalse(result.real_areal_checkpoint)
+            self.assertFalse(result.exact_joint_recovery)
+            self.assertEqual(record["policy"]["fsdp_world_size"], 4)
+            self.assertEqual(len(record["policy"]["rank_checkpoint_states"]), 4)
+            self.assertEqual(len(record["rng"]["rank_states"]), 4)
+            scheduler_path = manifest.parent / record["policy"]["lr_scheduler"]["path"]
+            self.assertEqual(json.loads(scheduler_path.read_text())["owner_rank"], 0)
+            self.assertTrue(
+                record["evidence_scope"]["all_actor_ranks_bound_to_policy_candidate"]
+            )
+            self.assertEqual(record["harness"]["transaction_id"], "macro-7")
+
+    def test_live_distributed_candidate_adapts_all_worker_states_without_controller_optimizer(self) -> None:
+        from tests.test_areal_distributed_policy import _live_candidate
+
+        live = _live_candidate()
+        checkpoints = live.receipt["checkpoints"]
+
+        def observed_manifest(source):
+            return (
+                checkpoints["parent_manifest"]
+                if str(source) == checkpoints["parent_path"]
+                else checkpoints["candidate_manifest"]
+            )
+
+        with patch(
+            "jphrl.training.areal_distributed_policy.checkpoint_manifest",
+            side_effect=observed_manifest,
+        ):
+            runtime, policy, scheduler = distributed_policy_checkpoint_inputs(
+                live,
+                harness_policy=None,
+            )
+        self.assertEqual([state.rank for state in runtime], list(range(4)))
+        self.assertEqual([state.rank for state in policy], list(range(4)))
+        self.assertEqual(
+            [state.physical_gpu_id for state in policy],
+            [str(rank) for rank in range(4)],
+        )
+        self.assertTrue(
+            all(state.world_size == 4 for state in policy)
+        )
+        self.assertEqual(scheduler.owner_rank, 0)
+        self.assertNotIn("optimizer", vars(FakeDistributedController()))
+
+    def test_cpu_fake_controller_cannot_mint_distributed_live_exact(self) -> None:
+        from tests.test_areal_distributed_policy import _live_candidate
+
+        with self.assertRaisesRegex(
+            ProductionCheckpointError,
+            "real project fsdp:d4 controller",
+        ):
+            verify_exact_distributed_joint_recovery(
+                "/unused/manifest.json",
+                controller=FakeDistributedController(),
+                live_policy_candidate=_live_candidate(),
+                harness_policy=object(),
+                harness_optimizer=object(),
+                current_topology=_topology4(),
+                run_harness_optimizer_step=lambda _policy, _optimizer: None,
+            )
+
+    def test_four_rank_missing_crossed_or_colliding_worker_state_fails_closed(
+        self,
+    ) -> None:
+        mutations = {
+            "missing_policy_rank": lambda runtime, policy: (runtime, policy[:-1]),
+            "crossed_source": lambda runtime, policy: (
+                runtime,
+                (replace(policy[0], source_joint_credit_sha256="9" * 64),) + policy[1:],
+            ),
+            "duplicate_physical_gpu": lambda runtime, policy: (
+                runtime,
+                (
+                    policy[0],
+                    replace(
+                        policy[1],
+                        physical_gpu_id=policy[0].physical_gpu_id,
+                        cuda_visible_devices=policy[0].cuda_visible_devices,
+                    ),
+                )
+                + policy[2:],
+            ),
+            "nonzero_harness_generator": lambda runtime, policy: (
+                (runtime[0], replace(runtime[1], harness_generator_state=[1]))
+                + runtime[2:],
+                policy,
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                project = root / "src" / "repo"
+                project.mkdir(parents=True)
+                components = root / "runs" / "components"
+                components.mkdir(parents=True)
+                bundle, audit = _bundle(components, world_size=4)
+                runtime, policy, scheduler = _four_rank_inputs(bundle, audit)
+                runtime, policy = mutate(runtime, policy)
+                with (
+                    patch.dict("os.environ", {"JPH_ROOT": str(root)}),
+                    patch(
+                        "jphrl.training.production_checkpoint.validate_joint_candidate_bundle",
+                        return_value=audit,
+                    ),
+                    self.assertRaises(ProductionCheckpointError),
+                ):
+                    save_production_joint_checkpoint(
+                        checkpoint_root=root / "runs" / "checkpoint-7",
+                        project_root=project,
+                        joint_candidate_bundle=bundle,
+                        actor=FakeDistributedController(),
+                        harness_policy=None,
+                        topology=_topology4(),
+                        rank_states=runtime,
+                        policy_rank_states=policy,
+                        policy_scheduler_state=scheduler,
+                        macro_step=7,
+                        rollout_cursor=11,
+                        dataloader_cursor=13,
+                    )
+
+    def test_four_rank_requires_aggregated_scheduler_and_policy_worker_receipts(
+        self,
+    ) -> None:
+        for omitted in ("policy", "scheduler"):
+            with (
+                self.subTest(omitted=omitted),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory).resolve()
+                project = root / "src" / "repo"
+                project.mkdir(parents=True)
+                components = root / "runs" / "components"
+                components.mkdir(parents=True)
+                bundle, audit = _bundle(components, world_size=4)
+                runtime, policy, scheduler = _four_rank_inputs(bundle, audit)
+                with (
+                    patch.dict("os.environ", {"JPH_ROOT": str(root)}),
+                    patch(
+                        "jphrl.training.production_checkpoint.validate_joint_candidate_bundle",
+                        return_value=audit,
+                    ),
+                    self.assertRaisesRegex(
+                        ProductionCheckpointError,
+                        "multi-rank W requires",
+                    ),
+                ):
+                    save_production_joint_checkpoint(
+                        checkpoint_root=root / "runs" / "checkpoint-7",
+                        project_root=project,
+                        joint_candidate_bundle=bundle,
+                        actor=FakeDistributedController(),
+                        harness_policy=None,
+                        topology=_topology4(),
+                        rank_states=runtime,
+                        policy_rank_states=None if omitted == "policy" else policy,
+                        policy_scheduler_state=(
+                            None if omitted == "scheduler" else scheduler
+                        ),
+                        macro_step=7,
+                        rollout_cursor=11,
+                        dataloader_cursor=13,
+                    )
 
     def test_missing_scheduler_rng_cursor_joint_version_or_optimizer_ref_fails(
         self,
@@ -574,7 +903,11 @@ class ProductionCheckpointTests(unittest.TestCase):
             )
 
     def test_forged_live_capability_type_fails_closed(self) -> None:
-        for forged in ({"exact_joint_recovery": True}, LiveExactJointRecovery()):
+        for forged in (
+            {"exact_joint_recovery": True},
+            LiveExactJointRecovery(),
+            LiveExactDistributedJointRecovery(),
+        ):
             with (
                 self.subTest(type=type(forged).__qualname__),
                 self.assertRaisesRegex(

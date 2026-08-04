@@ -41,7 +41,7 @@ from jphrl.training.production_checkpoint import (
 from jphrl.trajectory.schema import JointVersion
 
 M0_LIVE_VERIFICATION_SCHEMA = "jph.m0-live-joint-verification.v1"
-GPU_MEMORY_AUDIT_SCHEMA = "jph.gpu-memory-envelope.v1"
+GPU_MEMORY_AUDIT_SCHEMA = "jph.gpu-memory-observation.v2"
 
 _SECRET_FIELDS = {
     "access_token",
@@ -239,7 +239,8 @@ def verify_m0_live_joint(
         or provenance.get("project_commit") != expected_project_commit
         or provenance.get("areal_commit") != expected_areal_commit
         or resource.get("rollout_sglang_mem_fraction_static") != 0.29
-        or resource.get("max_new_gpu_memory_gib") != 26.0
+        or resource.get("gpu_memory_limit_enforced") is not False
+        or resource.get("max_new_gpu_memory_gib") is not None
         or resource.get("actor_destroyed_before_rollout_worker_start") is not True
     ):
         raise ValueError("M0 summary lineage, stages, or resource gate differs")
@@ -367,17 +368,19 @@ def verify_m0_live_joint(
             audit.get("schema_version") != M0_GPU_LAUNCH_AUDIT_SCHEMA
             or audit.get("phase") != phase
             or audit.get("passed") is not True
-            or audit.get("unexpected_compute_process_count") != 0
+            or audit.get("memory_limit_enforced") is not False
+            or audit.get("compute_processes_observation_only") is not True
         ):
             raise ValueError(f"{phase} live GPU launch audit failed")
     if (
         memory.get("schema_version") != GPU_MEMORY_AUDIT_SCHEMA
         or memory.get("run_kind") != "m0-live-joint-v1"
         or memory.get("project_commit") != expected_project_commit
-        or memory.get("max_new_memory_mib") != 26624
+        or memory.get("memory_limit_enforced") is not False
+        or memory.get("max_new_memory_mib") is not None
         or memory.get("passed") is not True
     ):
-        raise ValueError("M0 GPU memory envelope audit failed")
+        raise ValueError("M0 GPU memory observation audit failed")
 
     record: dict[str, object] = {
         "schema_version": M0_LIVE_VERIFICATION_SCHEMA,

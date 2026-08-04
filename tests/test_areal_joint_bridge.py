@@ -73,7 +73,40 @@ class ArealJointBridgeTests(unittest.TestCase):
             },
         }
 
-    def _record(self, controller: object | None = None) -> dict[str, object]:
+    def _distributed_runtime_contract(self) -> dict[str, object]:
+        contract = self._runtime_contract()
+        contract["schema_version"] = "jph.sglang-inference-runtime.v3"
+        fixed = contract["fixed"]
+        del fixed["cuda_visible_devices"]
+        del fixed["gpu_name"]
+        del fixed["gpu_uuid"]
+        del fixed["physical_gpu_id"]
+        fixed.update(
+            {
+                "cuda_visible_devices_by_rank": ["4", "5", "6", "7"],
+                "gpu_names": ["test-gpu"] * 4,
+                "gpu_uuids": [f"GPU-test-{rank}" for rank in range(4)],
+                "physical_gpu_ids": [4, 5, 6, 7],
+            }
+        )
+        fixed["rollout"] = {
+            "backend": "sglang:d4",
+            "max_concurrent_rollouts": 8,
+        }
+        contract["treatment"].update(
+            {
+                "disable_cuda_graph": False,
+                "experimental_axis": "none-v1",
+            }
+        )
+        return contract
+
+    def _record(
+        self,
+        controller: object | None = None,
+        *,
+        runtime_contract: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         state = HarnessState(
             turn=0,
             remaining_tool_calls=0,
@@ -129,7 +162,7 @@ class ArealJointBridgeTests(unittest.TestCase):
             "attention_mask": [[True, True, True, True, True]],
             "rewards": [1.0],
         }
-        runtime_contract = self._runtime_contract()
+        runtime_contract = runtime_contract or self._runtime_contract()
         joint_version = build_joint_version(
             policy_release_id="areal-sglang@model-commit:engine-v0",
             harness_controller_version=controller.version,
@@ -224,6 +257,33 @@ class ArealJointBridgeTests(unittest.TestCase):
             record["credit_binding"]["policy_target_model_call_id"],
             binding["model_call_id"],
         )
+
+    def test_distributed_d4_runtime_contract_is_bound(self) -> None:
+        runtime_contract = self._distributed_runtime_contract()
+        record = self._record(runtime_contract=runtime_contract)
+
+        audit = validate_areal_joint_bridge_record(record, expected_policy_version=0)
+
+        self.assertTrue(audit["ok"])
+        self.assertEqual(
+            record["policy_binding"]["inference_runtime_contract"]["fixed"][
+                "physical_gpu_ids"
+            ],
+            [4, 5, 6, 7],
+        )
+
+    def test_distributed_d4_runtime_contract_rejects_duplicate_gpu_identity(self) -> None:
+        runtime_contract = self._distributed_runtime_contract()
+        runtime_contract["fixed"]["gpu_uuids"][3] = "GPU-test-2"
+
+        with self.assertRaisesRegex(
+            ArealJointBridgeError,
+            "distributed inference runtime GPU identities are inconsistent",
+        ):
+            validate_areal_joint_bridge_record(
+                self._record(runtime_contract=runtime_contract),
+                expected_policy_version=0,
+            )
 
     @unittest.skipUnless(
         importlib.util.find_spec("torch") is not None,

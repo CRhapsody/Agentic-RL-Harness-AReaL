@@ -187,7 +187,7 @@ class LiveM0ProductionFactoryTests(unittest.TestCase):
                 joint_safety_fixture=b"held-out",
                 candidate_joint_safety_output_sha256="4" * 64,
                 recorded_rollout_sglang_mem_fraction_static=0.29,
-                max_new_gpu_memory_gib=26.0,
+                max_new_gpu_memory_gib=None,
             )
             factory = build_live_production_worker_factory(
                 selection=selection,
@@ -274,7 +274,7 @@ class LiveM0GPULaunchGuardTests(unittest.TestCase):
             ):
                 self.assertIsNone(guard("production-sglang"))
 
-    def test_foreign_process_wrong_visibility_and_reused_phase_fail_closed(self) -> None:
+    def test_foreign_process_is_observed_but_wrong_visibility_and_reuse_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             audit_root = Path(directory) / "audits"
             guard = LiveM0GPULaunchGuard(physical_gpu_id=2, audit_root=audit_root)
@@ -284,14 +284,15 @@ class LiveM0GPULaunchGuardTests(unittest.TestCase):
                     "jphrl.experiments.m0_live_joint._run_nvidia_smi",
                     side_effect=("1024, 79000", "999999, foreign, 256"),
                 ),
-                self.assertRaisesRegex(M0LiveJointError, "not safe"),
             ):
-                guard("training-actor")
-            rejected = json.loads(
+                self.assertIsNone(guard("training-actor"))
+            observed = json.loads(
                 (audit_root / "training-actor.json").read_text(encoding="utf-8")
             )
-            self.assertFalse(rejected["passed"])
-            self.assertEqual(rejected["unexpected_compute_process_count"], 1)
+            self.assertTrue(observed["passed"])
+            self.assertFalse(observed["memory_limit_enforced"])
+            self.assertTrue(observed["compute_processes_observation_only"])
+            self.assertEqual(observed["observed_compute_process_count"], 1)
 
             with (
                 patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1"}),

@@ -4,12 +4,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from jphrl.experiments.m0_joint_runner import load_m0_rlvr_source_records
 from jphrl.experiments.m0_live_evaluator import (
     M0LiveEvaluatorError,
     RealRlvrM0CandidateEvaluator,
 )
+from jphrl.training.areal_distributed_policy import JPHPPOActorController
 from jphrl.trajectory.rlvr_workflow_admission import (
     prepare_rlvr_workflow_joint_admission,
 )
@@ -158,6 +160,29 @@ class RealRlvrM0CandidateEvaluatorTests(unittest.TestCase):
                     joint_version.harness_controller
                 ),
             )
+
+    def test_distributed_actor_rejects_missing_current_state_before_compute(self) -> None:
+        temporary, joint_version, sources = self._sources()
+        self.addCleanup(temporary.cleanup)
+        evaluator = RealRlvrM0CandidateEvaluator(
+            training_source=sources[0], holdout_sources=sources[1:]
+        )
+        actor = object.__new__(JPHPPOActorController)
+        actor.compute_logp = Mock(return_value=[])
+        actor.get_version = Mock(return_value=7)
+
+        with self.assertRaisesRegex(
+            M0LiveEvaluatorError, "current-state evidence is missing"
+        ):
+            evaluator.observe(
+                joint_version=joint_version,
+                gate=evaluator.acceptance_gates[0],
+                actor=actor,
+                harness_policy=TorchHarnessPolicy(
+                    joint_version.harness_controller
+                ),
+            )
+        actor.compute_logp.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -22,9 +22,6 @@ AREAL_REPO="${JPH_ROOT}/src/AReaL-v2.0.0"
 AREAL_VENV="${JPH_ROOT}/venvs/areal-v2.0.0"
 EXPECTED_AREAL_COMMIT="fee938eada49208a5aabdbc1095730a13076a349"
 MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/qwen2.5-1.5b-snapshot.json"
-MAX_USED_MEMORY_MIB=10240
-MIN_FREE_MEMORY_MIB=65536
-MAX_NEW_GPU_MEMORY_MIB=26624
 EXPECTED_MASTER_PORT="$((61000 + GPU_ID))"
 M0_MASTER_PORT="${JPH_M0_MASTER_PORT:-${EXPECTED_MASTER_PORT}}"
 if [[ "${M0_MASTER_PORT}" != "${EXPECTED_MASTER_PORT}" ]]; then
@@ -116,7 +113,7 @@ read_gpu_processes() {
     --query-compute-apps=pid,process_name,used_memory \
     --format=csv,noheader,nounits
 }
-require_idle_gpu() {
+observe_gpu() {
   local stage="$1"
   local memory_used memory_free processes
   IFS=, read -r memory_used memory_free < <(read_gpu_memory)
@@ -126,21 +123,15 @@ require_idle_gpu() {
     echo "Cannot read GPU ${GPU_ID} memory at ${stage}" >&2
     exit 3
   fi
-  if ((memory_used > MAX_USED_MEMORY_MIB || memory_free < MIN_FREE_MEMORY_MIB)); then
-    echo "GPU ${GPU_ID} lacks M0 headroom at ${stage}: used=${memory_used}MiB free=${memory_free}MiB" >&2
-    exit 3
-  fi
-  if [[ -n "${processes}" ]]; then
-    echo "GPU ${GPU_ID} has an existing compute process at ${stage}; M0 remains fail closed" >&2
-    exit 3
-  fi
   GPU_MEMORY_USED_SNAPSHOT="${memory_used}"
   GPU_MEMORY_FREE_SNAPSHOT="${memory_free}"
+  GPU_PROCESS_SNAPSHOT="${processes}"
 }
 
-require_idle_gpu "preflight"
+observe_gpu "preflight"
 GPU_MEMORY_USED_PREFLIGHT="${GPU_MEMORY_USED_SNAPSHOT}"
 GPU_MEMORY_FREE_PREFLIGHT="${GPU_MEMORY_FREE_SNAPSHOT}"
+GPU_PROCESSES_PREFLIGHT="${GPU_PROCESS_SNAPSHOT}"
 GPU_MEMORY_USED_AT_LAUNCH="${GPU_MEMORY_USED_PREFLIGHT}"
 GPU_MEMORY_FREE_AT_LAUNCH="${GPU_MEMORY_FREE_PREFLIGHT}"
 GPU_UUID="$(
@@ -164,8 +155,7 @@ SELECTION_ROOT="${RUN_ROOT}/selection"
 ARTIFACT_ROOT="${RUN_ROOT}/joint-update"
 LOG_PATH="${RUN_ROOT}/run.log"
 MEMORY_SAMPLES="${RUN_ROOT}/gpu-memory.csv"
-MEMORY_BREACH="${RUN_ROOT}/gpu-memory-breach.txt"
-WATCHDOG_TARGET="${RUN_ROOT}/watchdog-target-pgid.txt"
+GPU_PROCESS_AUDIT="${RUN_ROOT}/gpu-process-observations.txt"
 mkdir -m 700 -p "${RUN_ROOT}"
 touch "${LOG_PATH}" "${MEMORY_SAMPLES}"
 chmod 600 "${LOG_PATH}" "${MEMORY_SAMPLES}"
@@ -214,7 +204,6 @@ stop_run_process_group() {
       kill -KILL ${run_pids} >/dev/null 2>&1 || true
     fi
   fi
-  rm -f "${WATCHDOG_TARGET}"
 }
 redact_and_check_secret() {
   if [[ ! -d "${RUN_ROOT}" ]]; then
@@ -238,7 +227,6 @@ audit_memory_if_possible() {
     --output "${RUN_ROOT}/gpu-memory-audit.json" \
     --physical-gpu-id "${GPU_ID}" \
     --baseline-used-mib "${GPU_MEMORY_USED_AT_LAUNCH}" \
-    --max-new-memory-mib "${MAX_NEW_GPU_MEMORY_MIB}" \
     --run-kind m0-live-joint-v1 \
     --project-commit "${PROJECT_COMMIT}" \
     >> "${LOG_PATH}"
@@ -297,9 +285,15 @@ echo "project=${PROJECT_COMMIT} AReaL=${ACTUAL_AREAL_COMMIT} physical_gpu=${GPU_
 echo "gpu_uuid=${GPU_UUID} gpu_name=${GPU_NAME} driver=${GPU_DRIVER_VERSION} preflight_used=${GPU_MEMORY_USED_PREFLIGHT}MiB preflight_free=${GPU_MEMORY_FREE_PREFLIGHT}MiB" | tee -a "${LOG_PATH}"
 echo "source_rollout=${ROLLOUT_RUN_ROOT} run_root=${RUN_ROOT}" | tee -a "${LOG_PATH}"
 
-require_idle_gpu "immediately-before-python"
+observe_gpu "immediately-before-python"
 GPU_MEMORY_USED_AT_LAUNCH="${GPU_MEMORY_USED_SNAPSHOT}"
 GPU_MEMORY_FREE_AT_LAUNCH="${GPU_MEMORY_FREE_SNAPSHOT}"
+GPU_PROCESSES_AT_LAUNCH="${GPU_PROCESS_SNAPSHOT}"
+{
+  printf 'stage=preflight\n%s\n' "${GPU_PROCESSES_PREFLIGHT}"
+  printf 'stage=immediately-before-python\n%s\n' "${GPU_PROCESSES_AT_LAUNCH}"
+} > "${GPU_PROCESS_AUDIT}"
+chmod 600 "${GPU_PROCESS_AUDIT}"
 if ! "${AREAL_VENV}/bin/python" - "${M0_MASTER_PORT}" <<'PY'
 import socket
 import sys
@@ -317,7 +311,7 @@ printf '%s,%s,%s\n' \
   "${GPU_MEMORY_USED_AT_LAUNCH}" \
   "${GPU_MEMORY_FREE_AT_LAUNCH}" >> "${MEMORY_SAMPLES}"
 
-rm -f "${MEMORY_BREACH}" "${WATCHDOG_TARGET}"
+rm -f "${WATCHDOG_TARGET:-}"
 CUDA_VISIBLE_DEVICES="${GPU_ID}" \
 WORLD_SIZE=1 \
 RANK=0 \
@@ -342,8 +336,6 @@ JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
     --trial-name "${RUN_ID}" \
     > >(tee -a "${LOG_PATH}") 2>&1 &
 RUN_COMMAND_PGID="$!"
-printf '%s\n' "${RUN_COMMAND_PGID}" > "${WATCHDOG_TARGET}"
-chmod 600 "${WATCHDOG_TARGET}"
 (
   while true; do
     IFS=, read -r sample_used sample_free < <(read_gpu_memory)
@@ -351,33 +343,15 @@ chmod 600 "${WATCHDOG_TARGET}"
       && [[ "${sample_free}" =~ ^[0-9]+$ ]]; then
       printf '%s,%s,%s\n' "$(date +%s)" "${sample_used}" "${sample_free}" \
         >> "${MEMORY_SAMPLES}"
-      if ((sample_used - GPU_MEMORY_USED_AT_LAUNCH > MAX_NEW_GPU_MEMORY_MIB)); then
-        printf 'used=%s baseline=%s delta=%s limit=%s\n' \
-          "${sample_used}" \
-          "${GPU_MEMORY_USED_AT_LAUNCH}" \
-          "$((sample_used - GPU_MEMORY_USED_AT_LAUNCH))" \
-          "${MAX_NEW_GPU_MEMORY_MIB}" > "${MEMORY_BREACH}"
-        chmod 600 "${MEMORY_BREACH}"
-        target_pgid="$(tr -d ' ' < "${WATCHDOG_TARGET}" 2>/dev/null || true)"
-        if [[ "${target_pgid}" =~ ^[0-9]+$ ]]; then
-          kill -TERM -- "-${target_pgid}" >/dev/null 2>&1 || true
-        fi
-        exit 4
-      fi
     fi
     sleep 1
   done
 ) &
 GPU_MEMORY_MONITOR_PID="$!"
 if ! wait "${RUN_COMMAND_PGID}"; then
-  if [[ -f "${MEMORY_BREACH}" ]]; then
-    echo "M0 was stopped by the 26 GiB GPU memory watchdog" >&2
-  else
-    echo "M0 live joint Python process failed" >&2
-  fi
+  echo "M0 live joint Python process failed" >&2
   exit 4
 fi
-rm -f "${WATCHDOG_TARGET}"
 
 stop_monitors
 audit_memory_if_possible

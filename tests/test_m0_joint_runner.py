@@ -304,7 +304,19 @@ class M0JointRunnerScaffoldTests(unittest.TestCase):
                 macro_step=0,
             )
             self.assertEqual(valid.validate(), root / "run")
-            for fraction in (0.27, 0.31):
+            high_memory_fraction = M0JointRunConfig(
+                artifact_root=str(root / "run-high-fraction"),
+                project_commit="1" * 40,
+                areal_root=str(areal),
+                transaction_id="m0-step-high-fraction",
+                macro_step=0,
+                rollout_sglang_mem_fraction_static=0.95,
+            )
+            self.assertEqual(
+                high_memory_fraction.validate(),
+                root / "run-high-fraction",
+            )
+            for fraction in (0.0, 0.96):
                 with self.assertRaisesRegex(M0JointRunnerError, "mem_fraction_static"):
                     M0JointRunConfig(
                         artifact_root=str(root / f"run-{fraction}"),
@@ -314,14 +326,14 @@ class M0JointRunnerScaffoldTests(unittest.TestCase):
                         macro_step=0,
                         rollout_sglang_mem_fraction_static=fraction,
                     ).validate()
-            with self.assertRaisesRegex(M0JointRunnerError, "at most 26 GiB"):
+            with self.assertRaisesRegex(M0JointRunnerError, "no longer accepts"):
                 M0JointRunConfig(
                     artifact_root=str(root / "run-too-large"),
                     project_commit="1" * 40,
                     areal_root=str(areal),
                     transaction_id="m0-step-0",
                     macro_step=0,
-                    max_new_gpu_memory_gib=26.1,
+                    max_new_gpu_memory_gib=26.0,
                 ).validate()
 
             ledger = _StageLedger()

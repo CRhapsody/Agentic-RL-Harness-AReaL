@@ -13,8 +13,6 @@ umask 077
 
 POLL_SECONDS="${JPH_M0_POLL_SECONDS:-60}"
 MAX_WAIT_SECONDS="${JPH_M0_MAX_WAIT_SECONDS:-604800}"
-MAX_USED_MEMORY_MIB=10240
-MIN_FREE_MEMORY_MIB=65536
 
 if [[ ! "${POLL_SECONDS}" =~ ^[1-9][0-9]*$ ]] \
   || [[ ! "${MAX_WAIT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -35,7 +33,7 @@ if [[ -n "$(
 fi
 
 deadline="$(( $(date +%s) + MAX_WAIT_SECONDS ))"
-echo "Waiting for one idle M0 GPU: project=${PROJECT_COMMIT} deadline=${deadline}"
+echo "Selecting one observed M0 GPU without a configured memory limit: project=${PROJECT_COMMIT} deadline=${deadline}"
 while (( $(date +%s) < deadline )); do
   for gpu_id in 0 1 2 3 4 5 6 7; do
     if ! snapshot="$(
@@ -65,10 +63,9 @@ while (( $(date +%s) < deadline )); do
       process_count="$(printf '%s\n' "${processes}" | wc -l | tr -d ' ')"
     fi
     echo "$(date -u +%FT%TZ) gpu=${gpu_id} used=${memory_used}MiB free=${memory_free}MiB processes=${process_count}"
-    if ((memory_used <= MAX_USED_MEMORY_MIB \
-      && memory_free >= MIN_FREE_MEMORY_MIB)) \
-      && [[ -z "${processes}" ]]; then
-      echo "GPU ${gpu_id} passed the waiter snapshot; handing it to the launcher's fresh checks"
+    if [[ "${memory_used}" =~ ^[0-9]+$ ]] \
+      && [[ "${memory_free}" =~ ^[0-9]+$ ]]; then
+      echo "GPU ${gpu_id} was observed; handing it to the launcher's fresh checks"
       set +e
       JPH_PROJECT_COMMIT="${PROJECT_COMMIT}" \
         bash "${SCRIPT_DIR}/run_m0_live_pipeline.sh" "${gpu_id}"
@@ -88,5 +85,5 @@ while (( $(date +%s) < deadline )); do
   sleep "${POLL_SECONDS}"
 done
 
-echo "No GPU met the M0 launch gate before the wait deadline" >&2
+echo "No GPU could be observed before the wait deadline" >&2
 exit 3

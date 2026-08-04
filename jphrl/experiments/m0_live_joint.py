@@ -335,19 +335,13 @@ def _run_nvidia_smi(arguments: Sequence[str]) -> str:
 
 @dataclass
 class LiveM0GPULaunchGuard:
-    """Persist and enforce a fresh resource snapshot before both GPU launches."""
+    """Persist a fresh resource snapshot before both GPU launches."""
 
     physical_gpu_id: int
     audit_root: str | Path
-    max_used_memory_mib: int = 10240
-    min_free_memory_mib: int = 65536
 
     def __post_init__(self) -> None:
         _require(self.physical_gpu_id >= 0, "physical GPU ID must be non-negative")
-        _require(
-            self.max_used_memory_mib >= 0 and self.min_free_memory_mib > 0,
-            "GPU headroom thresholds are invalid",
-        )
         require_outside_repository(self.audit_root)
 
     def __call__(self, phase: str) -> None:
@@ -400,30 +394,20 @@ class LiveM0GPULaunchGuard:
                     "used_memory_mib": int(memory),
                 }
             )
-        allowed_pids: set[int] = set()
-        if phase == "production-sglang":
-            allowed_pids.add(os.getpid())
-        unexpected = [
-            process for process in processes if process["pid"] not in allowed_pids
-        ]
-        passed = (
-            used_mib <= self.max_used_memory_mib
-            and free_mib >= self.min_free_memory_mib
-            and not unexpected
-            and (phase != "training-actor" or not processes)
-        )
         record: dict[str, object] = {
             "schema_version": M0_GPU_LAUNCH_AUDIT_SCHEMA,
             "phase": phase,
             "physical_gpu_id": self.physical_gpu_id,
             "memory_used_mib": used_mib,
             "memory_free_mib": free_mib,
-            "max_used_memory_mib": self.max_used_memory_mib,
-            "min_free_memory_mib": self.min_free_memory_mib,
+            "memory_limit_enforced": False,
+            "max_used_memory_mib": None,
+            "min_free_memory_mib": None,
             "current_process_pid": os.getpid(),
             "compute_processes": processes,
-            "unexpected_compute_process_count": len(unexpected),
-            "passed": passed,
+            "compute_processes_observation_only": True,
+            "observed_compute_process_count": len(processes),
+            "passed": True,
             "evidence_scope": {
                 "live_gpu_memory_observed": True,
                 "live_compute_processes_observed": True,
@@ -434,7 +418,6 @@ class LiveM0GPULaunchGuard:
         record["record_sha256"] = _record_sha256(record)
         audit_root = require_outside_repository(self.audit_root)
         _write_new_json(audit_root / f"{phase}.json", record)
-        _require(passed, f"GPU {self.physical_gpu_id} is not safe for {phase}")
 
 
 def _recorded_server_args(source: RLVRM0SourceRecords) -> dict[str, object]:
@@ -507,10 +490,8 @@ def build_live_production_worker_factory(
         _require(
             float(server_args.get("mem_fraction_static", -1.0))
             == assets.recorded_rollout_sglang_mem_fraction_static
-            and 0.28
-            <= float(server_args["mem_fraction_static"])
-            <= 0.30,
-            "production memory fraction left the recorded M0 envelope",
+            and 0.0 < float(server_args["mem_fraction_static"]) <= 0.95,
+            "production memory fraction left the recorded valid range",
         )
         try:
             from areal.api.cli_args import InferenceEngineConfig, SchedulingSpec
@@ -638,7 +619,7 @@ def run_live_m0_joint(
         transaction_id=transaction_id,
         macro_step=macro_step,
         rollout_sglang_mem_fraction_static=0.29,
-        max_new_gpu_memory_gib=26.0,
+        max_new_gpu_memory_gib=None,
     )
     factory = build_live_production_worker_factory(
         selection=selection,

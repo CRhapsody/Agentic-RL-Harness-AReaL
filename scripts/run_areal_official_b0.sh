@@ -22,11 +22,6 @@ readonly EXPECTED_AREAL_COMMIT="fee938eada49208a5aabdbc1095730a13076a349"
 readonly MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/qwen2.5-1.5b-snapshot.json"
 readonly DATASET_REPORT="${JPH_ROOT}/artifacts/bootstrap/gsm8k-snapshot.json"
 readonly CUDA_TOOLKIT_ROOT="${JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6}"
-readonly MIN_FREE_MEMORY_MIB="${JPH_B0_MIN_FREE_MEMORY_MIB:-71680}"
-readonly MAX_USED_MEMORY_MIB="${JPH_B0_MAX_USED_MEMORY_MIB:-10240}"
-readonly ALLOWED_EXISTING_COMPUTE_UIDS="${JPH_B0_ALLOWED_EXISTING_COMPUTE_UIDS:-}"
-readonly SOFT_MAX_NEW_GPU_MEMORY_MIB=26624
-readonly HARD_MAX_NEW_GPU_MEMORY_MIB=30720
 readonly RUN_MODE="${JPH_B0_RUN_MODE:-official}"
 readonly HOLDER_TOTAL_TRAIN_STEPS="${JPH_HOLDER_TOTAL_TRAIN_STEPS:-10000}"
 readonly HOLDER_MAX_RUNTIME_SECONDS="${JPH_HOLDER_MAX_RUNTIME_SECONDS:-21600}"
@@ -50,39 +45,6 @@ if [[ "${RUN_MODE}" == holder ]]; then
     echo "JPH_HOLDER_MAX_RUNTIME_SECONDS must be in [300, 86400]" >&2
     exit 2
   fi
-fi
-
-if [[ ! "${MIN_FREE_MEMORY_MIB}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "JPH_B0_MIN_FREE_MEMORY_MIB must be a positive integer" >&2
-  exit 2
-fi
-if [[ ! "${MAX_USED_MEMORY_MIB}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "JPH_B0_MAX_USED_MEMORY_MIB must be a positive integer" >&2
-  exit 2
-fi
-if ((MIN_FREE_MEMORY_MIB < 71680)); then
-  echo "JPH_B0_MIN_FREE_MEMORY_MIB cannot relax the 71680 MiB floor" >&2
-  exit 2
-fi
-if ((MAX_USED_MEMORY_MIB > 10240)); then
-  echo "JPH_B0_MAX_USED_MEMORY_MIB cannot relax the 10240 MiB ceiling" >&2
-  exit 2
-fi
-declare -A SEEN_ALLOWED_COMPUTE_UIDS=()
-if [[ -n "${ALLOWED_EXISTING_COMPUTE_UIDS}" ]]; then
-  IFS=, read -r -a allowed_compute_uids <<< "${ALLOWED_EXISTING_COMPUTE_UIDS}"
-  for allowed_compute_uid in "${allowed_compute_uids[@]}"; do
-    if [[ ! "${allowed_compute_uid}" =~ ^[1-9][0-9]*$ ]] \
-      || [[ -n "${SEEN_ALLOWED_COMPUTE_UIDS[${allowed_compute_uid}]:-}" ]]; then
-      echo "JPH_B0_ALLOWED_EXISTING_COMPUTE_UIDS must be unique positive UIDs" >&2
-      exit 2
-    fi
-    SEEN_ALLOWED_COMPUTE_UIDS[${allowed_compute_uid}]=1
-  done
-fi
-if ((SOFT_MAX_NEW_GPU_MEMORY_MIB > HARD_MAX_NEW_GPU_MEMORY_MIB)); then
-  echo "B0 soft GPU-memory cap exceeds the immutable hard cap" >&2
-  exit 2
 fi
 
 for path in \
@@ -209,7 +171,7 @@ if [[ "${RUN_MODE}" == holder ]]; then
   RUN_ID="${JPH_HOLDER_RUN_ID}"
   RUN_ROOT="${JPH_ROOT}/artifacts/areal-gpu-holder/${RUN_ID}"
   LOG_PATH="${JPH_ROOT}/logs/areal-gpu-holder-${RUN_ID}.log"
-  MEMORY_AUDIT_SCHEMA="jph.areal-gpu-holder-gpu-memory-audit.v1"
+  MEMORY_AUDIT_SCHEMA="jph.areal-gpu-holder-gpu-memory-observation.v2"
   MEMORY_RUN_KIND="areal-gpu-holder-v1"
   EXPERIMENT_NAME="jph-gpu-holder"
   TOTAL_TRAIN_STEPS="${HOLDER_TOTAL_TRAIN_STEPS}"
@@ -219,7 +181,7 @@ else
   RUN_ID="${RUN_STAMP}-official-b0-${RUN_NONCE}"
   RUN_ROOT="${JPH_ROOT}/artifacts/areal-b0/${RUN_ID}"
   LOG_PATH="${JPH_ROOT}/logs/areal-b0-${RUN_ID}.log"
-  MEMORY_AUDIT_SCHEMA="jph.areal-official-b0-gpu-memory-audit.v1"
+  MEMORY_AUDIT_SCHEMA="jph.areal-official-b0-gpu-memory-observation.v2"
   MEMORY_RUN_KIND="areal-official-b0-v1"
   EXPERIMENT_NAME="jph-b0"
   TOTAL_TRAIN_STEPS=1
@@ -318,30 +280,43 @@ is_owned_job_leader() {
     && [[ "${JOB_SESSION_ID}" == "${JOB_PID}" ]]
 }
 
+session_pids() {
+  local exact_sid="$1"
+  if [[ ! "${exact_sid}" =~ ^[0-9]+$ ]] || ((exact_sid <= 1)); then
+    return 1
+  fi
+  ps -eo pid=,sid= | awk -v sid="${exact_sid}" '$2 == sid && $1 > 1 {print $1}'
+}
+
 stop_owned_job_session() {
   local attempt can_signal=0
+  local -a pids=()
   if is_owned_job_leader; then
     can_signal=1
-  elif ((JOB_LEADER_REAPED != 0)) \
-    && [[ -n "${JOB_SESSION_ID}" ]] \
-    && pgrep -s "${JOB_SESSION_ID}" >/dev/null 2>&1; then
+  elif ((JOB_LEADER_REAPED != 0)) && [[ -n "${JOB_SESSION_ID}" ]]; then
     # The leader identity was bound before launch and has just been reaped by
     # this shell.  Any remaining member of that still-live SID is a straggler
     # from the same owned session; an external process cannot join it.
-    can_signal=1
+    mapfile -t pids < <(session_pids "${JOB_SESSION_ID}")
+    ((${#pids[@]} > 0)) && can_signal=1
   fi
   if ((can_signal == 0)); then
     return 0
   fi
-  pkill -TERM -s "${JOB_SESSION_ID}" >/dev/null 2>&1 || true
+  mapfile -t pids < <(session_pids "${JOB_SESSION_ID}")
+  if ((${#pids[@]} > 0)); then
+    kill -TERM -- "${pids[@]}" >/dev/null 2>&1 || true
+  fi
   for attempt in $(seq 1 150); do
-    if ! pgrep -s "${JOB_SESSION_ID}" >/dev/null 2>&1; then
+    mapfile -t pids < <(session_pids "${JOB_SESSION_ID}")
+    if ((${#pids[@]} == 0)); then
       break
     fi
     sleep 0.1
   done
-  if pgrep -s "${JOB_SESSION_ID}" >/dev/null 2>&1; then
-    pkill -KILL -s "${JOB_SESSION_ID}" >/dev/null 2>&1 || true
+  mapfile -t pids < <(session_pids "${JOB_SESSION_ID}")
+  if ((${#pids[@]} > 0)); then
+    kill -KILL -- "${pids[@]}" >/dev/null 2>&1 || true
   fi
   if ((JOB_LEADER_REAPED == 0)); then
     wait "${JOB_PID}" >/dev/null 2>&1 || true
@@ -417,36 +392,11 @@ read_gpu_state() {
     echo "Cannot read GPU ${gpu_id} compute processes at ${stage}" >&2
     return 1
   fi
-  printf 'stage=%s\ngpu_id=%s\nmemory_used_mib=%s\nmemory_free_mib=%s\nallowed_existing_compute_uids=%s\ncompute_processes=%s\n' \
+  printf 'stage=%s\ngpu_id=%s\nmemory_used_mib=%s\nmemory_free_mib=%s\nmemory_limit_enforced=false\ncompute_processes=%s\n' \
     "${stage}" "${gpu_id}" "${memory_used}" "${memory_free}" \
-    "${ALLOWED_EXISTING_COMPUTE_UIDS:-none}" "${processes:-none}" \
+    "${processes:-none}" \
     > "${snapshot_path}"
   chmod 600 "${snapshot_path}"
-  if ((memory_used > MAX_USED_MEMORY_MIB || memory_free < MIN_FREE_MEMORY_MIB)); then
-    echo "GPU ${gpu_id} lacks B0 headroom at ${stage}: used=${memory_used}MiB free=${memory_free}MiB" >&2
-    return 1
-  fi
-  if [[ -n "${processes}" ]]; then
-    local process_line process_pid process_uid
-    if [[ -z "${ALLOWED_EXISTING_COMPUTE_UIDS}" ]]; then
-      echo "GPU ${gpu_id} has an existing compute process at ${stage}" >&2
-      return 1
-    fi
-    while IFS= read -r process_line; do
-      process_pid="${process_line%%,*}"
-      process_pid="${process_pid// /}"
-      if [[ ! "${process_pid}" =~ ^[1-9][0-9]*$ ]]; then
-        echo "GPU ${gpu_id} has an invalid compute PID at ${stage}" >&2
-        return 1
-      fi
-      process_uid="$(ps -o uid= -p "${process_pid}" 2>/dev/null | tr -d ' ' || true)"
-      if [[ ! "${process_uid}" =~ ^[1-9][0-9]*$ ]] \
-        || [[ -z "${SEEN_ALLOWED_COMPUTE_UIDS[${process_uid}]:-}" ]]; then
-        echo "GPU ${gpu_id} compute PID ${process_pid} has disallowed or unresolved UID ${process_uid:-unknown} at ${stage}" >&2
-        return 1
-      fi
-    done <<< "${processes}"
-  fi
   if [[ "${stage}" == immediately-before-launch ]]; then
     GPU_BASELINE_USED[${gpu_id}]="${memory_used}"
     GPU_BASELINE_FREE[${gpu_id}]="${memory_free}"
@@ -463,7 +413,7 @@ run_all_gpu_gate() {
     fi
   done
   if ((failed != 0)); then
-    echo "At least one GPU failed the ${stage} gate; official B0 was not launched" >&2
+    echo "At least one GPU could not be observed at ${stage}; official B0 was not launched" >&2
     return 1
   fi
 }
@@ -518,8 +468,7 @@ write_gpu_memory_audit() {
   if JPH_B0_RUN_FAILURE_REASON="${RUN_FAILURE_REASON}" \
     "${AREAL_VENV}/bin/python" - \
       "${RUN_ROOT}" "${AUDIT_PATH}" "${PROJECT_COMMIT}" \
-      "${ACTUAL_AREAL_COMMIT}" "${SOFT_MAX_NEW_GPU_MEMORY_MIB}" \
-      "${HARD_MAX_NEW_GPU_MEMORY_MIB}" "${MEMORY_AUDIT_SCHEMA}" \
+      "${ACTUAL_AREAL_COMMIT}" "${MEMORY_AUDIT_SCHEMA}" \
       "${MEMORY_RUN_KIND}" \
       "${GPU_BASELINE_USED[0]}" "${GPU_BASELINE_USED[1]}" \
       "${GPU_BASELINE_USED[2]}" "${GPU_BASELINE_USED[3]}" \
@@ -537,16 +486,12 @@ from pathlib import Path
     output_raw,
     project_commit,
     areal_commit,
-    soft_raw,
-    hard_raw,
     memory_audit_schema,
     memory_run_kind,
     *baseline_raw,
 ) = sys.argv[1:]
 run_root = Path(run_root_raw).resolve(strict=True)
 output = Path(output_raw)
-soft_cap = int(soft_raw)
-hard_cap = int(hard_raw)
 baselines = [int(value) for value in baseline_raw]
 failure_reason = os.environ.get("JPH_B0_RUN_FAILURE_REASON", "")
 breach_path = run_root / "gpu-memory-breach.txt"
@@ -568,7 +513,6 @@ for gpu_id, baseline in enumerate(baselines):
         raise ValueError(f"GPU {gpu_id} has no measured memory sample")
     _, peak_used, peak_free = max(samples, key=lambda item: item[1])
     delta = max(0, peak_used - baseline)
-    gpu_passed = delta <= soft_cap and delta <= hard_cap
     gpus.append(
         {
             "physical_gpu_id": gpu_id,
@@ -576,15 +520,14 @@ for gpu_id, baseline in enumerate(baselines):
             "peak_used_mib": peak_used,
             "peak_free_mib": peak_free,
             "peak_delta_mib": delta,
-            "soft_cap_mib": soft_cap,
-            "hard_cap_mib": hard_cap,
+            "memory_limit_enforced": False,
+            "max_new_memory_mib": None,
             "sample_count": len(samples),
-            "passed": gpu_passed,
+            "passed": True,
         }
     )
 passed = (
-    soft_cap <= hard_cap
-    and not failure_reason
+    not failure_reason
     and not breach_path.exists()
     and all(gpu["passed"] for gpu in gpus)
 )
@@ -593,8 +536,8 @@ record = {
     "run_kind": memory_run_kind,
     "project_commit": project_commit,
     "areal_commit": areal_commit,
-    "soft_cap_mib": soft_cap,
-    "hard_cap_mib": hard_cap,
+    "memory_limit_enforced": False,
+    "max_new_memory_mib": None,
     "passed": passed,
     "gpus": gpus,
 }
@@ -958,8 +901,8 @@ AUDIT_READY=1
 printf 'project=%s AReaL=%s GPUs=0,1,2,3,4,5,6,7 run_root=%s\n' \
   "${PROJECT_COMMIT}" "${ACTUAL_AREAL_COMMIT}" "${RUN_ROOT}" \
   | tee -a "${LOG_PATH}"
-printf 'allowed_existing_compute_uids=%s\n' \
-  "${ALLOWED_EXISTING_COMPUTE_UIDS:-none}" | tee -a "${LOG_PATH}"
+printf 'gpu_memory_limit_enforced=false; existing_compute_processes_are_observed_only=true\n' \
+  | tee -a "${LOG_PATH}"
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 HF_HUB_OFFLINE=1 \
@@ -1030,13 +973,6 @@ fi
       fi
       printf '%s,%s,%s\n' "$(date -u +%s)" "${sample_used}" "${sample_free}" \
         >> "${RUN_ROOT}/gpu-${gpu_id}-memory.csv"
-      delta=$((sample_used - GPU_BASELINE_USED[${gpu_id}]))
-      if ((delta > SOFT_MAX_NEW_GPU_MEMORY_MIB)); then
-        record_breach_once \
-          "soft-cap-exceeded gpu=${gpu_id} used=${sample_used} baseline=${GPU_BASELINE_USED[${gpu_id}]} delta=${delta} soft_cap=${SOFT_MAX_NEW_GPU_MEMORY_MIB} hard_cap=${HARD_MAX_NEW_GPU_MEMORY_MIB}"
-        kill -TERM "${B0_ORCHESTRATOR_PID}" >/dev/null 2>&1 || true
-        exit 4
-      fi
     done
     sleep 1
   done
@@ -1058,11 +994,7 @@ JOB_START_TIME=""
 JOB_SESSION_ID=""
 JOB_LEADER_REAPED=0
 if ((job_exit_code != 0)); then
-  if [[ -e "${MEMORY_BREACH}" ]]; then
-    RUN_FAILURE_REASON="gpu-memory-watchdog-stopped-job"
-  else
-    RUN_FAILURE_REASON="areal-coordinator-exit-${job_exit_code}"
-  fi
+  RUN_FAILURE_REASON="areal-coordinator-exit-${job_exit_code}"
   exit 4
 fi
 exit 0

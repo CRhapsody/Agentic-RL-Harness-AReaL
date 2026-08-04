@@ -19,6 +19,30 @@ SCRIPTS = PROJECT_ROOT / "scripts"
 
 
 class RemoteScriptContractTests(unittest.TestCase):
+    def test_gpu_shell_scripts_have_no_broad_kill_or_fixed_memory_cap(self) -> None:
+        gpu_markers = (
+            "nvidia-smi",
+            "CUDA_VISIBLE_DEVICES",
+            "gpu_memory_utilization",
+            "eight-GPU",
+            "8gpu",
+        )
+        gpu_scripts = {
+            path: path.read_text(encoding="utf-8")
+            for path in SCRIPTS.glob("*.sh")
+            if any(marker in path.read_text(encoding="utf-8") for marker in gpu_markers)
+        }
+        self.assertTrue(gpu_scripts)
+        for path, text in gpu_scripts.items():
+            with self.subTest(script=path.name):
+                self.assertNotIn("killall", text)
+                self.assertNotIn("pkill", text)
+                self.assertNotIn("sudo kill", text)
+                self.assertNotIn("SOFT_MAX_NEW_GPU_MEMORY_MIB", text)
+                self.assertNotIn("HARD_MAX_NEW_GPU_MEMORY_MIB", text)
+                for obsolete_limit_mib in (24576, 25600, 26624, 30720):
+                    self.assertNotIn(str(obsolete_limit_mib), text)
+
     def test_agent_service_adapter_verifier_is_cpu_only_and_uses_premerge_hook(
         self,
     ) -> None:
@@ -75,13 +99,12 @@ class RemoteScriptContractTests(unittest.TestCase):
         )
         self.assertGreaterEqual(launcher.count("--query-compute-apps"), 2)
         self.assertIn("GPU_MEMORY_USED_AT_LAUNCH", launcher)
-        self.assertIn("MAX_NEW_GPU_MEMORY_MIB=26624", launcher)
-        self.assertIn("REQUIRE_EMPTY_COMPUTE_PROCESSES=true", launcher)
-        self.assertIn("gained a compute process before launch", launcher)
+        self.assertNotIn("MAX_NEW_GPU_MEMORY_MIB", launcher)
+        self.assertNotIn("REQUIRE_EMPTY_COMPUTE_PROCESSES", launcher)
         self.assertIn("audit_gpu_memory_envelope.py", launcher)
         self.assertIn('>> "${MEMORY_SAMPLES}"', launcher)
         self.assertIn("setsid", launcher)
-        self.assertIn("GPU memory watchdog", launcher)
+        self.assertNotIn("GPU memory watchdog", launcher)
         self.assertIn("stop_run_session", launcher)
         self.assertIn("redact_and_check_secret", launcher)
         self.assertIn("assert_no_run_gpu_processes", launcher)
@@ -137,20 +160,20 @@ class RemoteScriptContractTests(unittest.TestCase):
             PROJECT_ROOT / "jphrl" / "experiments" / "m0_live_joint.py"
         ).read_text(encoding="utf-8")
         self.assertIn("umask 077", launcher)
-        self.assertIn('MAX_NEW_GPU_MEMORY_MIB=26624', launcher)
-        self.assertIn('MAX_USED_MEMORY_MIB=10240', launcher)
-        self.assertIn('MIN_FREE_MEMORY_MIB=65536', launcher)
+        self.assertNotIn('MAX_NEW_GPU_MEMORY_MIB', launcher)
+        self.assertNotIn('MAX_USED_MEMORY_MIB', launcher)
+        self.assertNotIn('MIN_FREE_MEMORY_MIB', launcher)
         self.assertGreaterEqual(
             launcher.count("--query-gpu=memory.used,memory.free"),
             1,
         )
         self.assertIn("--query-compute-apps", launcher)
-        self.assertIn('require_idle_gpu "preflight"', launcher)
-        self.assertIn('require_idle_gpu "immediately-before-python"', launcher)
+        self.assertIn('observe_gpu "preflight"', launcher)
+        self.assertIn('observe_gpu "immediately-before-python"', launcher)
         self.assertIn("gpu-memory.csv", launcher)
         self.assertIn("audit_gpu_memory_envelope.py", launcher)
         self.assertIn("setsid", launcher)
-        self.assertIn("26 GiB GPU memory watchdog", launcher)
+        self.assertNotIn("GPU memory watchdog", launcher)
         self.assertIn("stop_run_process_group", launcher)
         self.assertIn("redact_and_check_secret", launcher)
         self.assertIn("assert_no_run_processes", launcher)
@@ -168,7 +191,7 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("InferenceEngineConfig", entry)
         self.assertIn('backend="sglang:d1"', entry)
         self.assertIn('rollout_sglang_mem_fraction_static=0.29', entry)
-        self.assertIn('max_new_gpu_memory_gib=26.0', entry)
+        self.assertIn('max_new_gpu_memory_gib=None', entry)
         self.assertIn("write_m0_rlvr_estimator_template.py", pipeline)
         self.assertIn("m0-torch-joint-v1", pipeline)
         self.assertIn("JPH_RLVR_FROZEN_ESTIMATOR_TEMPLATE_PATH", pipeline)
@@ -182,8 +205,8 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn('JPH_M0_MAX_WAIT_SECONDS:-604800', waiter)
         self.assertIn("--query-gpu=memory.used,memory.free", waiter)
         self.assertIn("--query-compute-apps", waiter)
-        self.assertIn("MAX_USED_MEMORY_MIB=10240", waiter)
-        self.assertIn("MIN_FREE_MEMORY_MIB=65536", waiter)
+        self.assertNotIn("MAX_USED_MEMORY_MIB", waiter)
+        self.assertNotIn("MIN_FREE_MEMORY_MIB", waiter)
         self.assertIn("run_m0_live_pipeline.sh", waiter)
         self.assertNotIn("pkill", waiter)
         self.assertNotIn("kill ", waiter)
@@ -474,31 +497,33 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("process_start_time", text)
         self.assertIn("bind_job_identity", text)
         self.assertIn('[[ "${JOB_SESSION_ID}" == "${JOB_PID}" ]]', text)
-        self.assertIn('pkill -TERM -s "${JOB_SESSION_ID}"', text)
-        self.assertIn('pkill -KILL -s "${JOB_SESSION_ID}"', text)
+        self.assertIn('session_pids "${JOB_SESSION_ID}"', text)
+        self.assertIn('kill -TERM -- "${pids[@]}"', text)
+        self.assertIn('kill -KILL -- "${pids[@]}"', text)
         self.assertIn("JOB_LEADER_REAPED", text)
         self.assertIn("areal-session-straggler-after-coordinator-exit", text)
         self.assertNotIn("nvidia-smi --gpu-reset", text)
         self.assertNotIn("killall", text)
+        self.assertNotIn("pkill", text)
         self.assertIn("trap 'exit 129' HUP", text)
         self.assertIn("trap 'exit 130' INT", text)
         self.assertIn("trap 'exit 143' TERM", text)
 
-    def test_areal_b0_persists_fail_closed_eight_gpu_memory_audit(self) -> None:
+    def test_areal_b0_persists_eight_gpu_memory_observations_without_caps(self) -> None:
         text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
-        self.assertIn("SOFT_MAX_NEW_GPU_MEMORY_MIB=26624", text)
-        self.assertIn("HARD_MAX_NEW_GPU_MEMORY_MIB=30720", text)
+        self.assertNotIn("SOFT_MAX_NEW_GPU_MEMORY_MIB", text)
+        self.assertNotIn("HARD_MAX_NEW_GPU_MEMORY_MIB", text)
         self.assertIn('AUDIT_PATH="${RUN_ROOT}/gpu-memory-audit.json"', text)
-        self.assertIn("jph.areal-official-b0-gpu-memory-audit.v1", text)
+        self.assertIn("jph.areal-official-b0-gpu-memory-observation.v2", text)
         self.assertIn('MEMORY_RUN_KIND="areal-official-b0-v1"', text)
         self.assertIn('"baseline_used_mib": baseline', text)
         self.assertIn('"peak_used_mib": peak_used', text)
         self.assertIn('"peak_delta_mib": delta', text)
-        self.assertIn('"soft_cap_mib": soft_cap', text)
-        self.assertIn('"hard_cap_mib": hard_cap', text)
+        self.assertIn('"memory_limit_enforced": False', text)
+        self.assertIn('"max_new_memory_mib": None', text)
         self.assertIn('"sample_count": len(samples)', text)
         self.assertIn('record["record_sha256"] = hashlib.sha256(canonical)', text)
-        self.assertIn('delta > SOFT_MAX_NEW_GPU_MEMORY_MIB', text)
+        self.assertNotIn('delta > SOFT_MAX_NEW_GPU_MEMORY_MIB', text)
         self.assertIn('kill -TERM "${B0_ORCHESTRATOR_PID}"', text)
         self.assertIn("append_final_samples", text)
         self.assertIn("write_gpu_memory_audit", text)
@@ -584,14 +609,13 @@ class RemoteScriptContractTests(unittest.TestCase):
         self.assertIn("torch.cuda.synchronize()", text)
         self.assertIn('"peak_memory_bytes"', text)
 
-    def test_b0_waiter_is_bounded_and_never_kills_gpu_processes(self) -> None:
+    def test_b0_waiter_observes_all_cards_and_never_kills_gpu_processes(self) -> None:
         text = (SCRIPTS / "wait_and_run_areal_b0.sh").read_text(encoding="utf-8")
-        self.assertIn("JPH_B0_MAX_WAIT_SECONDS:-86400", text)
-        self.assertIn("JPH_B0_POLL_SECONDS:-60", text)
-        self.assertIn("JPH_B0_MIN_FREE_MEMORY_MIB:-71680", text)
-        self.assertIn("JPH_B0_MAX_USED_MEMORY_MIB:-10240", text)
-        self.assertIn("GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB", text)
-        self.assertIn("GPU_MEMORY_USED > MAX_USED_MEMORY_MIB", text)
+        self.assertIn("--query-gpu=memory.used,memory.free", text)
+        self.assertIn("--query-compute-apps=pid,process_name,used_memory", text)
+        self.assertIn("without a configured memory limit", text)
+        self.assertNotIn("MIN_FREE_MEMORY_MIB", text)
+        self.assertNotIn("MAX_USED_MEMORY_MIB", text)
         self.assertIn('exec /bin/bash "${SCRIPT_DIR}/run_areal_official_b0.sh"', text)
         self.assertNotIn("pkill", text)
         self.assertNotIn("kill -", text)
@@ -661,25 +685,15 @@ class RemoteScriptContractTests(unittest.TestCase):
                     text=True,
                 )
 
-    def test_b0_launcher_rechecks_memory_headroom(self) -> None:
+    def test_b0_launcher_rechecks_memory_and_process_observations(self) -> None:
         text = (SCRIPTS / "run_areal_official_b0.sh").read_text(encoding="utf-8")
-        self.assertIn("JPH_B0_MIN_FREE_MEMORY_MIB:-71680", text)
-        self.assertIn("JPH_B0_MAX_USED_MEMORY_MIB:-10240", text)
         self.assertIn("--query-gpu=memory.used,memory.free", text)
         self.assertIn("--query-compute-apps=pid,process_name,used_memory", text)
-        self.assertIn(
-            'JPH_B0_ALLOWED_EXISTING_COMPUTE_UIDS:-',
-            text,
-        )
-        self.assertIn("must be unique positive UIDs", text)
-        self.assertIn('ps -o uid= -p "${process_pid}"', text)
-        self.assertIn("has disallowed or unresolved UID", text)
-        self.assertIn('[[ -z "${ALLOWED_EXISTING_COMPUTE_UIDS}" ]]', text)
-        self.assertIn("allowed_existing_compute_uids=%s", text)
-        self.assertIn("memory_free < MIN_FREE_MEMORY_MIB", text)
-        self.assertIn("memory_used > MAX_USED_MEMORY_MIB", text)
-        self.assertIn("MIN_FREE_MEMORY_MIB < 71680", text)
-        self.assertIn("MAX_USED_MEMORY_MIB > 10240", text)
+        self.assertIn("memory_limit_enforced=false", text)
+        self.assertIn("existing_compute_processes_are_observed_only=true", text)
+        self.assertNotIn("ALLOWED_EXISTING_COMPUTE_UIDS", text)
+        self.assertNotIn("MIN_FREE_MEMORY_MIB", text)
+        self.assertNotIn("MAX_USED_MEMORY_MIB", text)
         self.assertIn("run_all_gpu_gate preflight", text)
         self.assertIn("run_all_gpu_gate immediately-before-launch", text)
         preflight = text.index("run_all_gpu_gate preflight")

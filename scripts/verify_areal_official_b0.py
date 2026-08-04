@@ -15,11 +15,9 @@ from pathlib import Path
 
 
 PINNED_AREAL_COMMIT = "fee938eada49208a5aabdbc1095730a13076a349"
-MEMORY_AUDIT_SCHEMA = "jph.areal-official-b0-gpu-memory-audit.v1"
+MEMORY_AUDIT_SCHEMA = "jph.areal-official-b0-gpu-memory-observation.v2"
 MEMORY_RUN_KIND = "areal-official-b0-v1"
 VERIFICATION_SCHEMA = "jph.areal-official-b0-verification.v1"
-SOFT_MEMORY_CAP_MIB = 26 * 1024
-HARD_MEMORY_CAP_MIB = 30 * 1024
 EXPECTED_GPU_IDS = tuple(range(8))
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -60,8 +58,8 @@ _REQUIRED_MEMORY_KEYS = {
     "run_kind",
     "project_commit",
     "areal_commit",
-    "soft_cap_mib",
-    "hard_cap_mib",
+    "memory_limit_enforced",
+    "max_new_memory_mib",
     "gpus",
     "passed",
     "record_sha256",
@@ -72,8 +70,8 @@ _REQUIRED_GPU_MEMORY_KEYS = {
     "peak_used_mib",
     "peak_delta_mib",
     "sample_count",
-    "soft_cap_mib",
-    "hard_cap_mib",
+    "memory_limit_enforced",
+    "max_new_memory_mib",
     "passed",
 }
 _OPTIONAL_GPU_MEMORY_KEYS = {"peak_free_mib"}
@@ -508,8 +506,8 @@ def _verify_memory_audit(
         or record.get("run_kind") != MEMORY_RUN_KIND
         or record.get("project_commit") != expected_project_commit
         or record.get("areal_commit") != expected_areal_commit
-        or record.get("soft_cap_mib") != SOFT_MEMORY_CAP_MIB
-        or record.get("hard_cap_mib") != HARD_MEMORY_CAP_MIB
+        or record.get("memory_limit_enforced") is not False
+        or record.get("max_new_memory_mib") is not None
         or record.get("passed") is not True
     ):
         raise ValueError("gpu-memory-audit.json run contract or result differs")
@@ -548,13 +546,11 @@ def _verify_memory_audit(
         if sample_count <= 0:
             raise ValueError(f"GPU {gpu_id} memory audit has no samples")
         if (
-            raw.get("soft_cap_mib") != SOFT_MEMORY_CAP_MIB
-            or raw.get("hard_cap_mib") != HARD_MEMORY_CAP_MIB
-            or delta > SOFT_MEMORY_CAP_MIB
-            or delta > HARD_MEMORY_CAP_MIB
+            raw.get("memory_limit_enforced") is not False
+            or raw.get("max_new_memory_mib") is not None
             or raw.get("passed") is not True
         ):
-            raise ValueError(f"GPU {gpu_id} memory envelope failed")
+            raise ValueError(f"GPU {gpu_id} memory observation failed")
         if "peak_free_mib" in raw:
             peak_free = raw["peak_free_mib"]
             if not _is_int(peak_free) or peak_free < 0:
@@ -775,8 +771,8 @@ def verify_areal_official_b0(
         "topology": {**topology, **actor},
         "training": training,
         "memory": {
-            "soft_cap_mib": SOFT_MEMORY_CAP_MIB,
-            "hard_cap_mib": HARD_MEMORY_CAP_MIB,
+            "memory_limit_enforced": False,
+            "max_new_memory_mib": None,
             "gpus": list(gpu_summaries),
         },
         "claims": {

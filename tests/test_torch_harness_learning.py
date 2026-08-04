@@ -19,12 +19,14 @@ except ModuleNotFoundError:
 if torch is not None:
     from jphrl.harness.torch_learning import (
         ACTION_IDS,
+        MULTI_S_CHECKPOINT_SCHEMA_VERSION,
         TorchHarnessLearningError,
         TorchHarnessOptimizer,
         TorchHarnessPolicy,
         build_torch_harness_rollout_checkpoint,
         load_torch_harness_checkpoint,
         load_torch_harness_rollout_checkpoint,
+        validate_torch_harness_multi_s_update_evidence,
         validate_torch_harness_update_evidence,
     )
 
@@ -49,6 +51,11 @@ from jphrl.trajectory.joint_credit_alignment import (
     ESTIMATOR_VERSION,
     DualCreditEstimatorSpec,
     build_frozen_joint_credit_alignment,
+)
+from jphrl.trajectory.multi_s_frozen_training_batch import (
+    multi_s_source_binding,
+    prepare_multi_s_frozen_training_batch,
+    validate_multi_s_frozen_training_batch,
 )
 
 
@@ -287,6 +294,44 @@ def _real_s_record(policy, *, baseline: float = 0.2, loss_mask: int = 1):
     )
 
 
+def _validated_multi_s_batch(policy, root: Path, *, baseline: float = 0.2):
+    paths: list[Path] = []
+    active_version = None
+    for index in range(4):
+        record, version = _real_s_record(policy, baseline=baseline)
+        if active_version is None:
+            active_version = version
+        elif version != active_version:
+            raise AssertionError("test multi-S members do not share JointVersion")
+        path = root / f"s-member-{index}.json"
+        path.write_text(
+            json.dumps(
+                record,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        paths.append(path)
+    if active_version is None:
+        raise AssertionError("test multi-S batch has no active JointVersion")
+    envelope = prepare_multi_s_frozen_training_batch(
+        paths,
+        active_joint_version=active_version,
+    )
+    return (
+        validate_multi_s_frozen_training_batch(
+            envelope,
+            active_joint_version=active_version,
+            verify_source_files=True,
+        ),
+        active_version,
+        envelope,
+    )
+
+
 @unittest.skipUnless(
     torch is not None,
     "torch is required for production Harness tests",
@@ -405,6 +450,7 @@ class TorchHarnessLearningTests(unittest.TestCase):
                 clip_ratio=0.2,
             ).update_from_frozen_joint_credit(
                 record,
+                transaction_id="macro-u-round-trip",
                 active_joint_version=version,
                 checkpoint_path=path,
             )
@@ -439,6 +485,11 @@ class TorchHarnessLearningTests(unittest.TestCase):
             )
             self.assertTrue(evidence["evidence_scope"]["harness_optimizer_update"])
             self.assertFalse(evidence["evidence_scope"]["policy_optimizer_update"])
+            self.assertEqual(evidence["transaction_id"], "macro-u-round-trip")
+            self.assertEqual(
+                load_torch_harness_checkpoint(path)[2]["source"]["transaction_id"],
+                "macro-u-round-trip",
+            )
             self.assertEqual(audit.optimizer_step_after, 1)
 
             false_claim = deepcopy(evidence)
@@ -483,6 +534,7 @@ class TorchHarnessLearningTests(unittest.TestCase):
                 learning_rate=1e-2,
             ).update_from_frozen_joint_credit(
                 record,
+                transaction_id="macro-u-tamper",
                 active_joint_version=version,
                 checkpoint_path=path,
             )
@@ -539,6 +591,7 @@ class TorchHarnessLearningTests(unittest.TestCase):
                 policy, learning_rate=1e-2
             ).update_from_frozen_joint_credit(
                 record,
+                transaction_id="macro-u-unsafe-path",
                 active_joint_version=version,
                 checkpoint_path=unsafe_path,
             )
@@ -548,6 +601,20 @@ class TorchHarnessLearningTests(unittest.TestCase):
         policy = TorchHarnessPolicy(seed=41, hidden_size=16)
         record, version = _real_s_record(policy)
         optimizer = TorchHarnessOptimizer(policy, learning_rate=1e-2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing-transaction.pt"
+            with self.assertRaisesRegex(
+                TorchHarnessLearningError,
+                "transaction ID is missing",
+            ):
+                optimizer.update_from_frozen_joint_credit(
+                    record,
+                    transaction_id="",
+                    active_joint_version=version,
+                    checkpoint_path=path,
+                )
+            self.assertFalse(path.exists())
 
         invalid = deepcopy(record)
         invalid["record_sha256"] = "0" * 64
@@ -590,6 +657,7 @@ class TorchHarnessLearningTests(unittest.TestCase):
                 ):
                     optimizer.update_from_frozen_joint_credit(
                         value,
+                        transaction_id=f"macro-u-negative-{name}",
                         active_joint_version=active,
                         checkpoint_path=Path(directory) / name,
                     )
@@ -602,9 +670,242 @@ class TorchHarnessLearningTests(unittest.TestCase):
         ):
             TorchHarnessOptimizer(zero_policy).update_from_frozen_joint_credit(
                 zero_record,
+                transaction_id="macro-u-zero-credit",
                 active_joint_version=zero_version,
                 checkpoint_path=Path(directory) / "zero.pt",
             )
+
+    def test_validated_multi_s_batch_runs_one_adam_step_with_complete_binding(
+        self,
+    ) -> None:
+        policy = TorchHarnessPolicy(seed=59, hidden_size=16)
+        digest_before = policy.parameter_digest
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            batch, version, _ = _validated_multi_s_batch(policy, root)
+            binding = multi_s_source_binding(batch)
+            path = root / "multi-s-harness-candidate.pt"
+            result = TorchHarnessOptimizer(
+                policy,
+                learning_rate=1e-2,
+                clip_ratio=0.2,
+            ).update_from_validated_multi_s_frozen_training_batch(
+                batch,
+                transaction_id="macro-u-multi-s",
+                active_joint_version=version,
+                checkpoint_path=path,
+            )
+
+            self.assertEqual(policy.update_step, 0)
+            self.assertEqual(policy.parameter_digest, digest_before)
+            self.assertEqual(result.candidate_policy.update_step, 1)
+            self.assertNotEqual(result.candidate_policy.parameter_digest, digest_before)
+            self.assertEqual(result.evidence.batch_size, batch.harness_action_count)
+            self.assertEqual(
+                result.evidence.batch_size,
+                sum(
+                    len(member.s_record["harness_samples"]) for member in batch.members
+                ),
+            )
+            self.assertEqual(result.evidence.effective_batch_size, 8)
+            self.assertEqual(result.evidence.source_binding, binding)
+            self.assertEqual(
+                result.evidence.source_joint_credit_sha256,
+                binding["record_sha256"],
+            )
+            restored, restored_optimizer, checkpoint = load_torch_harness_checkpoint(
+                path
+            )
+            self.assertEqual(
+                checkpoint["schema_version"], MULTI_S_CHECKPOINT_SCHEMA_VERSION
+            )
+            self.assertEqual(
+                checkpoint["source"]["multi_s_source_binding"],
+                binding,
+            )
+            self.assertEqual(restored.update_step, 1)
+            self.assertEqual(
+                {
+                    int(state["step"].detach().cpu().item())
+                    for state in restored_optimizer.state.values()
+                },
+                {1},
+            )
+            receipt = result.evidence.to_record()
+            audit = validate_torch_harness_multi_s_update_evidence(
+                json.loads(json.dumps(receipt)),
+                active_joint_version=version,
+                validated_batch=batch,
+            )
+            generic_audit = validate_torch_harness_update_evidence(
+                json.loads(json.dumps(receipt)),
+                active_joint_version=version,
+            )
+            self.assertEqual(audit.source_binding, binding)
+            self.assertEqual(
+                generic_audit.source_joint_credit_sha256,
+                binding["record_sha256"],
+            )
+            self.assertTrue(receipt["evidence_scope"]["one_adam_step_for_all_members"])
+            self.assertFalse(receipt["evidence_scope"]["policy_optimizer_update"])
+
+    def test_multi_s_rejects_unvalidated_post_batch_tamper_order_and_duplicate(
+        self,
+    ) -> None:
+        policy = TorchHarnessPolicy(seed=61, hidden_size=16)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            batch, version, envelope = _validated_multi_s_batch(policy, root)
+            optimizer = TorchHarnessOptimizer(policy, learning_rate=1e-2)
+            tampered_s = deepcopy(batch.members[0].s_record)
+            tampered_s["harness_samples"][0]["masked_advantage"] += 0.125
+            _resign(tampered_s)
+            tampered_members = (
+                replace(batch.members[0], s_record=tampered_s),
+                *batch.members[1:],
+            )
+            cases = (
+                (envelope, "raw-unvalidated", "validated batch object"),
+                (
+                    {"input_ids": [[1, 2]], "loss_mask": [[0, 1]]},
+                    "post-batch",
+                    "validated batch object",
+                ),
+                (
+                    replace(batch, members=tampered_members),
+                    "member-tamper",
+                    "S digest differs",
+                ),
+                (
+                    replace(
+                        batch,
+                        members=(
+                            batch.members[1],
+                            batch.members[0],
+                            *batch.members[2:],
+                        ),
+                    ),
+                    "member-order",
+                    "order or claim differs",
+                ),
+                (
+                    replace(
+                        batch,
+                        members=(
+                            batch.members[0],
+                            batch.members[0],
+                            *batch.members[2:],
+                        ),
+                    ),
+                    "member-duplicate",
+                    "member claims are invalid|order or claim differs|unique",
+                ),
+            )
+            for value, name, message in cases:
+                target = root / f"{name}.pt"
+                with (
+                    self.subTest(name=name),
+                    self.assertRaisesRegex(TorchHarnessLearningError, message),
+                ):
+                    optimizer.update_from_validated_multi_s_frozen_training_batch(
+                        value,
+                        transaction_id=f"macro-u-{name}",
+                        active_joint_version=version,
+                        checkpoint_path=target,
+                    )
+                self.assertFalse(target.exists())
+            self.assertEqual(policy.update_step, 0)
+
+    def test_multi_s_zero_credit_double_step_and_checkpoint_source_tamper_fail(
+        self,
+    ) -> None:
+        zero_policy = TorchHarnessPolicy(seed=67, hidden_size=16)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            zero_batch, zero_version, _ = _validated_multi_s_batch(
+                zero_policy,
+                root,
+                baseline=1.0,
+            )
+            with self.assertRaisesRegex(
+                TorchHarnessLearningError,
+                "zero effective credit",
+            ):
+                TorchHarnessOptimizer(
+                    zero_policy
+                ).update_from_validated_multi_s_frozen_training_batch(
+                    zero_batch,
+                    transaction_id="macro-u-multi-zero",
+                    active_joint_version=zero_version,
+                    checkpoint_path=root / "zero.pt",
+                )
+            self.assertFalse((root / "zero.pt").exists())
+
+        policy = TorchHarnessPolicy(seed=71, hidden_size=16)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            batch, version, _ = _validated_multi_s_batch(policy, root)
+            path = root / "candidate.pt"
+            result = TorchHarnessOptimizer(
+                policy,
+                learning_rate=1e-2,
+            ).update_from_validated_multi_s_frozen_training_batch(
+                batch,
+                transaction_id="macro-u-multi-tamper",
+                active_joint_version=version,
+                checkpoint_path=path,
+            )
+            receipt = result.evidence.to_record()
+
+            false_double_step = deepcopy(receipt)
+            false_double_step["optimizer_step_after"] += 1
+            _resign(false_double_step)
+            with self.assertRaisesRegex(
+                TorchHarnessLearningError,
+                "exactly one optimizer step",
+            ):
+                validate_torch_harness_update_evidence(
+                    false_double_step,
+                    active_joint_version=version,
+                )
+
+            _, _, checkpoint = load_torch_harness_checkpoint(path)
+            rebound = deepcopy(checkpoint)
+            rebound["source"]["transaction_id"] = "other-transaction"
+            rebound_path = root / "source-rebound.pt"
+            torch.save(rebound, rebound_path)
+            rebound_receipt = deepcopy(receipt)
+            rebound_receipt["checkpoint_path"] = str(rebound_path)
+            rebound_receipt["checkpoint_sha256"] = _file_sha256(rebound_path)
+            _resign(rebound_receipt)
+            with self.assertRaisesRegex(
+                TorchHarnessLearningError,
+                "source differs from evidence",
+            ):
+                validate_torch_harness_multi_s_update_evidence(
+                    rebound_receipt,
+                    active_joint_version=version,
+                    validated_batch=batch,
+                )
+
+            two_step = deepcopy(checkpoint)
+            for state in two_step["optimizer_state_dict"]["state"].values():
+                state["step"] = state["step"] + 1
+            two_step_path = root / "adam-two-step.pt"
+            torch.save(two_step, two_step_path)
+            two_step_receipt = deepcopy(receipt)
+            two_step_receipt["checkpoint_path"] = str(two_step_path)
+            two_step_receipt["checkpoint_sha256"] = _file_sha256(two_step_path)
+            _resign(two_step_receipt)
+            with self.assertRaisesRegex(
+                TorchHarnessLearningError,
+                "Adam step differs",
+            ):
+                validate_torch_harness_multi_s_update_evidence(
+                    two_step_receipt,
+                    active_joint_version=version,
+                    validated_batch=batch,
+                )
 
     def test_zero_loss_mask_and_behavior_policy_mismatch_fail_closed(self) -> None:
         masked_policy = TorchHarnessPolicy(seed=47, hidden_size=16)
@@ -615,12 +916,14 @@ class TorchHarnessLearningTests(unittest.TestCase):
             with self.assertRaisesRegex(TorchHarnessLearningError, "zero trainable"):
                 TorchHarnessOptimizer(masked_policy).update_from_frozen_joint_credit(
                     masked_record,
+                    transaction_id="macro-u-zero-mask",
                     active_joint_version=masked_version,
                     checkpoint_path=Path(directory) / "masked.pt",
                 )
             with self.assertRaisesRegex(TorchHarnessLearningError, "behavior version"):
                 TorchHarnessOptimizer(other_policy).update_from_frozen_joint_credit(
                     masked_record,
+                    transaction_id="macro-u-behavior-mismatch",
                     active_joint_version=masked_version,
                     checkpoint_path=Path(directory) / "behavior.pt",
                 )

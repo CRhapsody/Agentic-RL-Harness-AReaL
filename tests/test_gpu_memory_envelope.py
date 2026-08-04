@@ -9,8 +9,8 @@ from pathlib import Path
 from scripts.audit_gpu_memory_envelope import audit_gpu_memory_envelope
 
 
-class GpuMemoryEnvelopeTests(unittest.TestCase):
-    def test_passes_at_limit_and_persists_observation_only_scope(self) -> None:
+class GpuMemoryObservationTests(unittest.TestCase):
+    def test_arbitrary_usage_passes_without_a_limit_and_persists_scope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             samples = root / "gpu-memory.csv"
@@ -21,19 +21,20 @@ class GpuMemoryEnvelopeTests(unittest.TestCase):
                 output_path=output,
                 physical_gpu_id=0,
                 baseline_used_mib=100,
-                max_new_memory_mib=26 * 1024,
                 run_kind="m0-torch-joint-v1",
                 project_commit="a" * 40,
             )
             self.assertTrue(record["passed"])
             self.assertEqual(record["measured_new_memory_mib"], 26 * 1024)
+            self.assertFalse(record["memory_limit_enforced"])
+            self.assertIsNone(record["max_new_memory_mib"])
             self.assertFalse(
                 record["evidence_scope"]["policy_optimizer_update"]  # type: ignore[index]
             )
             self.assertEqual(json.loads(output.read_text()), record)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
 
-    def test_exceeded_envelope_writes_failed_audit_then_raises(self) -> None:
+    def test_optional_legacy_limit_still_fails_closed_when_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             samples = root / "gpu-memory.csv"

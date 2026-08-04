@@ -6,7 +6,7 @@ import os
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -157,7 +157,9 @@ def _parameter_digest(tensors: Mapping[str, object]) -> str:
             shape = list(value.shape)  # type: ignore[attr-defined]
             dtype = str(value.dtype)  # type: ignore[attr-defined]
         except AttributeError as exc:
-            raise ArealProductionWorkerError("serving parameter is not a tensor") from exc
+            raise ArealProductionWorkerError(
+                "serving parameter is not a tensor"
+            ) from exc
         digest.update(name.encode("utf-8"))
         digest.update(dtype.encode("ascii"))
         digest.update(_canonical_json(shape))
@@ -179,7 +181,9 @@ def _load_safetensor_export(root: Path) -> dict[str, object]:
         except (OSError, json.JSONDecodeError) as exc:
             raise ArealProductionWorkerError("serving export index is invalid") from exc
         weight_map = record.get("weight_map")
-        _require(isinstance(weight_map, Mapping), "serving export weight map is missing")
+        _require(
+            isinstance(weight_map, Mapping), "serving export weight map is missing"
+        )
         shard_names = sorted(set(weight_map.values()))
         _require(
             all(isinstance(name, str) and name for name in shard_names),
@@ -200,7 +204,9 @@ def _load_safetensor_export(root: Path) -> dict[str, object]:
                 _require(name not in tensors, "serving export parameter is duplicated")
                 tensors[name] = handle.get_tensor(name)
     if index.is_file():
-        _require(set(tensors) == set(weight_map), "serving export index differs from weights")
+        _require(
+            set(tensors) == set(weight_map), "serving export index differs from weights"
+        )
     return tensors
 
 
@@ -334,8 +340,12 @@ def _materialize_one(
     try:
         from areal.api import SaveLoadMeta
     except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover
-        raise ArealProductionWorkerError("pinned AReaL SaveLoadMeta is unavailable") from exc
-    actor.load(meta=SaveLoadMeta(path=str(source), weight_format="dcp", with_optim=True))
+        raise ArealProductionWorkerError(
+            "pinned AReaL SaveLoadMeta is unavailable"
+        ) from exc
+    actor.load(
+        meta=SaveLoadMeta(path=str(source), weight_format="dcp", with_optim=True)
+    )
     actor.save(
         meta=SaveLoadMeta(
             path=str(export_path),
@@ -386,10 +396,113 @@ def materialize_areal_serving_export_pair(
     export_root: str | Path,
     parent_joint_version: JointVersion,
     candidate_joint_version: JointVersion,
+    live_policy_candidate: object | None = None,
 ) -> LiveArealServingExportPair:
     """Load each sealed DCP into the live actor and emit serving-compatible HF."""
 
     module = type(actor).__module__
+    if (
+        module == "jphrl.training.areal_distributed_policy"
+        and type(actor).__name__ == "JPHPPOActorController"
+    ):
+        from .areal_distributed_policy import (
+            require_live_remote_policy_candidate,
+            validate_distributed_policy_candidate,
+        )
+
+        live = require_live_remote_policy_candidate(live_policy_candidate)
+        _require(
+            live.receipt == policy_candidate_record,
+            "distributed serving export live candidate differs from T",
+        )
+        policy = validate_distributed_policy_candidate(
+            policy_candidate_record,
+            active_joint_version=parent_joint_version,
+            require_checkpoints=True,
+        )
+        _require(
+            candidate_joint_version.policy == policy.candidate_policy_version,
+            "distributed serving export candidate JointVersion differs from T",
+        )
+        root = require_outside_repository(export_root)
+        aggregate = actor.materialize_m0_serving_export_pair(
+            live,
+            export_root=root,
+        )
+
+        def _collective_audit(
+            kind: str,
+            joint_version: JointVersion,
+            policy_engine_version: int,
+        ) -> ArealServingExportAudit:
+            value = aggregate[kind]
+            _require(isinstance(value, Mapping), "distributed export branch is missing")
+            export_path = require_within_configured_root(value["export_path"])
+            actual_manifest = _directory_manifest(export_path)
+            actual_parameters = _parameter_digest(
+                _load_safetensor_export(export_path)
+            )
+            _require(
+                actual_manifest == value["export_manifest"]
+                and actual_parameters == value["parameter_sha256"],
+                f"distributed {kind} export differs from rank receipts",
+            )
+            record_path = root / f"policy-{kind}-hf-lineage.json"
+            record: dict[str, object] = {
+                "schema_version": SERVING_EXPORT_SCHEMA,
+                "areal_commit": PINNED_AREAL_COMMIT,
+                "joint_version": asdict(joint_version),
+                "joint_version_id": joint_version.version_id,
+                "policy_engine_version": policy_engine_version,
+                "policy_candidate_record_sha256": policy.record_sha256,
+                "source_dcp_path": value["dcp_path"],
+                "source_dcp_manifest_sha256": value[
+                    "dcp_manifest_sha256"
+                ],
+                "serving_export_path": str(export_path),
+                "serving_export_manifest": actual_manifest,
+                "serving_parameter_sha256": actual_parameters,
+                "distributed_export_receipt_sha256": aggregate["record_sha256"],
+                "exporter": (
+                    "jphrl.training.areal_distributed_policy."
+                    "JPHFSDPPPOActor.SaveLoadMeta(hf)-collective-d4"
+                ),
+            }
+            _assert_no_secrets(record)
+            record["record_sha256"] = _record_sha256(record)
+            _write_new_json(record_path, record)
+            return ArealServingExportAudit(
+                joint_version=joint_version,
+                policy_engine_version=policy_engine_version,
+                policy_candidate_record_sha256=policy.record_sha256,
+                source_dcp_path=str(value["dcp_path"]),
+                source_dcp_manifest_sha256=str(
+                    value["dcp_manifest_sha256"]
+                ),
+                serving_export_path=str(export_path),
+                serving_export_manifest_sha256=str(
+                    actual_manifest["manifest_sha256"]
+                ),
+                serving_parameter_sha256=actual_parameters,
+                record_path=str(record_path),
+                record_sha256=str(record["record_sha256"]),
+            )
+
+        parent = _collective_audit(
+            "parent",
+            parent_joint_version,
+            policy.parent_engine_version,
+        )
+        candidate = _collective_audit(
+            "candidate",
+            candidate_joint_version,
+            policy.reserved_candidate_engine_version,
+        )
+        return LiveArealServingExportPair._create(
+            parent=parent,
+            candidate=candidate,
+            token=_LIVE_EXPORT_TOKEN,
+        )
     _require(
         type(actor).__name__ == "FSDPPPOActor" and module.startswith("areal."),
         "serving export requires the real pinned AReaL FSDPPPOActor",
@@ -411,9 +524,7 @@ def materialize_areal_serving_export_pair(
         parent = _materialize_one(
             actor=actor,
             dcp_path=str(checkpoints["parent_path"]),
-            expected_dcp_sha256=str(
-                checkpoints["parent_manifest"]["manifest_sha256"]
-            ),
+            expected_dcp_sha256=str(checkpoints["parent_manifest"]["manifest_sha256"]),
             export_path=root / "policy-parent-hf",
             joint_version=parent_joint_version,
             policy_engine_version=policy.parent_engine_version,
@@ -494,12 +605,81 @@ class HarnessServingCheckpoint:
     kind: str
 
     def validate(self) -> None:
-        _require(self.kind in {"rollout_json", "candidate_pt"}, "Harness checkpoint kind is invalid")
-        _require(_is_sha256(self.checkpoint_sha256), "Harness checkpoint hash is invalid")
+        _require(
+            self.kind in {"rollout_json", "candidate_pt"},
+            "Harness checkpoint kind is invalid",
+        )
+        _require(
+            _is_sha256(self.checkpoint_sha256), "Harness checkpoint hash is invalid"
+        )
+
+
+@dataclass(frozen=True)
+class _ArealDataParallelRoute:
+    """Frozen one-to-one AReaL DP route; never synthesized from another worker."""
+
+    index: int
+    inference_url: str
+    data_proxy_url: str
+    routed_worker_id: str
+
+
+def _freeze_data_parallel_routes(
+    controller: object,
+) -> tuple[_ArealDataParallelRoute, ...]:
+    """Bind fixed-AReaL's group-ordered inference/DataProxy route vectors."""
+
+    inference_urls = tuple(
+        str(url).rstrip("/") for url in controller.inference_worker_urls
+    )
+    worker_ids = controller.worker_ids
+    _require(isinstance(worker_ids, Mapping), "AReaL worker ID registry is invalid")
+    data_proxy_urls = tuple(str(url).rstrip("/") for url in worker_ids)
+    registered_worker_ids = tuple(str(worker_ids[url]) for url in worker_ids)
+    controller_data_proxy_urls = tuple(
+        str(url).rstrip("/") for url in getattr(controller, "_data_proxy_addrs", ())
+    )
+    allocation = getattr(controller, "rollout_alloc", None)
+    parallel = getattr(allocation, "parallel", None)
+    expected_dp = getattr(parallel, "dp_size", None)
+    _require(
+        getattr(allocation, "backend", None) == "sglang"
+        and type(expected_dp) is int
+        and expected_dp in {1, 4}
+        and getattr(parallel, "tp_size", None) == 1
+        and getattr(parallel, "pp_size", None) == 1,
+        "production rollout must use exactly sglang:d1 or sglang:d4",
+    )
+    _require(
+        len(inference_urls)
+        == len(data_proxy_urls)
+        == len(registered_worker_ids)
+        == expected_dp
+        and data_proxy_urls == controller_data_proxy_urls,
+        "AReaL inference/DataProxy worker coverage or route order differs",
+    )
+    _require(
+        all(inference_urls)
+        and all(data_proxy_urls)
+        and all(registered_worker_ids)
+        and len(set(inference_urls)) == expected_dp
+        and len(set(data_proxy_urls)) == expected_dp
+        and len(set(registered_worker_ids)) == expected_dp,
+        "AReaL inference/DataProxy worker identities are missing or duplicated",
+    )
+    return tuple(
+        _ArealDataParallelRoute(
+            index=index,
+            inference_url=inference_urls[index],
+            data_proxy_url=data_proxy_urls[index],
+            routed_worker_id=registered_worker_ids[index],
+        )
+        for index in range(expected_dp)
+    )
 
 
 class PinnedArealSGLangActivationWorker(ProductionActivationWorker):
-    """M0 single-worker adapter with active SGLang tensor observations."""
+    """M0 adapter with exact observations from every SGLang DP replica."""
 
     def __init__(
         self,
@@ -534,18 +714,31 @@ class PinnedArealSGLangActivationWorker(ProductionActivationWorker):
             parent_release_id: self._exports.parent,
             candidate_release_id: self._exports.candidate,
         }
-        _require(set(harness_checkpoints) == set(self._targets), "Harness checkpoint coverage differs")
+        _require(
+            set(harness_checkpoints) == set(self._targets),
+            "Harness checkpoint coverage differs",
+        )
         self._harness_specs = dict(harness_checkpoints)
         for spec in self._harness_specs.values():
-            _require(type(spec) is HarnessServingCheckpoint, "Harness checkpoint spec is untyped")
+            _require(
+                type(spec) is HarnessServingCheckpoint,
+                "Harness checkpoint spec is untyped",
+            )
             spec.validate()
-        urls = tuple(controller.inference_worker_urls)
-        _require(len(urls) == 1, "M0 production adapter supports exactly one inference worker")
-        worker_ids = controller.worker_ids
-        _require(len(worker_ids) == 1, "M0 production adapter supports exactly one data proxy")
-        self._inference_url = str(urls[0]).rstrip("/")
-        self._data_proxy_url, routed_worker_id = next(iter(worker_ids.items()))
-        self._worker_id = f"areal-v2-{routed_worker_id}"
+        self._routes = _freeze_data_parallel_routes(controller)
+        if len(self._routes) == 1:
+            self._worker_id = f"areal-v2-{self._routes[0].routed_worker_id}"
+        else:
+            roster = [
+                {
+                    "index": route.index,
+                    "inference_url": route.inference_url,
+                    "data_proxy_url": route.data_proxy_url,
+                    "routed_worker_id": route.routed_worker_id,
+                }
+                for route in self._routes
+            ]
+            self._worker_id = f"areal-v2-dp{len(self._routes)}-{_sha256(roster)[:16]}"
         _require(
             bool(parent_release_id)
             and bool(candidate_release_id)
@@ -600,7 +793,23 @@ class PinnedArealSGLangActivationWorker(ProductionActivationWorker):
     def worker_id(self) -> str:
         return self._worker_id
 
-    def _http_json(self, method: str, url: str, body: Mapping[str, object] | None = None) -> Mapping[str, object]:
+    @property
+    def data_parallel_worker_ids(self) -> tuple[str, ...]:
+        """Router identities frozen at construction, in AReaL DP-group order."""
+
+        return tuple(route.routed_worker_id for route in self._routes)
+
+    def _require_frozen_routes(self) -> tuple[_ArealDataParallelRoute, ...]:
+        _require(
+            not bool(getattr(self._controller, "_destroyed", False))
+            and _freeze_data_parallel_routes(self._controller) == self._routes,
+            "AReaL inference/DataProxy worker roster changed while Y was live",
+        )
+        return self._routes
+
+    def _http_json(
+        self, method: str, url: str, body: Mapping[str, object] | None = None
+    ) -> Mapping[str, object]:
         payload = None if body is None else _canonical_json(body)
         request = urllib.request.Request(
             url,
@@ -617,36 +826,68 @@ class PinnedArealSGLangActivationWorker(ProductionActivationWorker):
         try:
             value = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ArealProductionWorkerError("AReaL service response is invalid") from exc
+            raise ArealProductionWorkerError(
+                "AReaL service response is invalid"
+            ) from exc
         _require(isinstance(value, Mapping), "AReaL service response is not an object")
         return value
 
-    def _health(self) -> Mapping[str, object]:
-        health = self._http_json("GET", f"{self._data_proxy_url.rstrip('/')}/health")
-        _require(health.get("status") == "ok", "AReaL data proxy is unhealthy")
+    def _health(self, route: _ArealDataParallelRoute) -> Mapping[str, object]:
+        health = self._http_json("GET", f"{route.data_proxy_url}/health")
+        _require(
+            health.get("status") == "ok",
+            f"AReaL data proxy {route.routed_worker_id} is unhealthy",
+        )
         return health
 
-    def _is_quiesced(self) -> bool:
-        health = self._health()
+    def _all_health(self) -> tuple[Mapping[str, object], ...]:
+        routes = self._require_frozen_routes()
+        health = tuple(self._health(route) for route in routes)
+        _require(
+            len(health) == len(routes),
+            "AReaL DataProxy health coverage differs from the frozen roster",
+        )
+        return health
+
+    def _pause_state_snapshot(self) -> tuple[bool, tuple[bool, ...]]:
+        health = self._all_health()
         executor_paused = bool(self._controller.workflow_executor.is_paused())
-        _require(bool(health.get("paused")) == executor_paused, "dispatcher/backend pause state differs")
+        paused = tuple(item.get("paused") for item in health)
+        _require(
+            all(type(value) is bool for value in paused),
+            "DataProxy pause state is invalid",
+        )
+        return executor_paused, paused
+
+    def _is_quiesced(self) -> bool:
+        executor_paused, paused = self._pause_state_snapshot()
+        _require(
+            all(value is executor_paused for value in paused),
+            "dispatcher/backend pause state differs across DataProxy workers",
+        )
         return executor_paused
 
     def _observe_version(self, expected: int) -> None:
-        health = self._health()
+        health = self._all_health()
+        versions = tuple(item.get("version") for item in health)
         _require(
-            self._controller.get_version() == expected and health.get("version") == expected,
-            "live AReaL Policy version differs",
+            type(expected) is int
+            and type(self._controller.get_version()) is int
+            and self._controller.get_version() == expected
+            and all(
+                type(version) is int and version == expected for version in versions
+            ),
+            "live AReaL Policy version differs across DataProxy workers",
         )
 
-    def _dump_live_parameters(self) -> str:
-        path = self._root / f"live-parameters-{uuid4().hex}.pt"
+    def _dump_live_parameters(self, route: _ArealDataParallelRoute) -> str:
+        path = self._root / (f"live-parameters-dp-{route.index:05d}-{uuid4().hex}.pt")
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(descriptor)
         inode = path.stat().st_ino
         response = self._http_json(
             "POST",
-            f"{self._inference_url}/awex/debug/get_parameters",
+            f"{route.inference_url}/awex/debug/get_parameters",
             {"save_path": str(path), "names": None},
         )
         _require(response.get("status") == "ok", "SGLang parameter dump failed")
@@ -674,30 +915,129 @@ class PinnedArealSGLangActivationWorker(ProductionActivationWorker):
 
     def _verify_live_policy(self, release_id: str) -> None:
         expected = self._targets[release_id]
+        routes = self._require_frozen_routes()
+        digests = tuple(self._dump_live_parameters(route) for route in routes)
         _require(
-            self._dump_live_parameters() == expected.serving_parameter_sha256,
-            "live SGLang parameters differ from the AReaL serving export",
+            len(digests) == len(routes)
+            and all(digest == expected.serving_parameter_sha256 for digest in digests),
+            "live SGLang parameters differ across workers or from the AReaL serving export",
         )
+
+    def _post_every_data_proxy(
+        self,
+        endpoint: str,
+        body: Mapping[str, object],
+        *,
+        response_validator: Callable[[Mapping[str, object]], bool],
+    ) -> None:
+        routes = self._require_frozen_routes()
+        errors: list[BaseException] = []
+        for route in routes:
+            try:
+                response = self._http_json(
+                    "POST",
+                    f"{route.data_proxy_url}{endpoint}",
+                    body,
+                )
+                _require(
+                    response_validator(response),
+                    f"AReaL DataProxy {route.routed_worker_id} rejected {endpoint}",
+                )
+            except ArealProductionWorkerError as exc:
+                errors.append(exc)
+        if errors:
+            raise ArealProductionWorkerError(
+                f"AReaL DataProxy operation {endpoint} failed on "
+                f"{len(errors)} of {len(routes)} workers"
+            ) from errors[0]
+
+    def _set_all_versions(self, version: int) -> None:
+        controller_error: BaseException | None = None
+        try:
+            self._controller.set_version(version)
+        except RuntimeError as exc:
+            # The fixed controller raises only when its own broadcast fails on every
+            # worker.  Direct per-worker repair below is still required either way.
+            controller_error = exc
+        try:
+            self._post_every_data_proxy(
+                "/set_version",
+                {"version": version},
+                response_validator=lambda response: (
+                    response.get("status") == "ok"
+                    and response.get("version") == version
+                ),
+            )
+            self._observe_version(version)
+        except ArealProductionWorkerError:
+            if controller_error is not None:
+                raise ArealProductionWorkerError(
+                    "AReaL controller and direct per-worker version sync both failed"
+                ) from controller_error
+            raise
+
+    def _install_serving_export(self, release_id: str) -> None:
+        expected = self._targets[release_id]
+        routes = self._require_frozen_routes()
+        errors: list[BaseException] = []
+        for route in routes:
+            try:
+                response = self._http_json(
+                    "POST",
+                    f"{route.inference_url}/update_weights_from_disk",
+                    {
+                        "model_path": expected.serving_export_path,
+                        "abort_all_requests": True,
+                    },
+                )
+                _require(
+                    response.get("success") is True or response.get("status") == "ok",
+                    f"SGLang worker {route.routed_worker_id} rejected the serving export",
+                )
+            except ArealProductionWorkerError as exc:
+                errors.append(exc)
+        if errors:
+            raise ArealProductionWorkerError(
+                "SGLang serving export install failed on "
+                f"{len(errors)} of {len(routes)} workers"
+            ) from errors[0]
+
+    def _verify_installed_policy(self, release_id: str) -> None:
+        expected = self._targets[release_id]
+        self._set_all_versions(expected.policy_engine_version)
+        self._verify_live_policy(release_id)
+        self._observe_version(expected.policy_engine_version)
 
     def _load_harness(self, release_id: str) -> None:
         spec = self._harness_specs[release_id]
         path = require_within_configured_root(spec.path)
-        _require(path.is_file() and not path.is_symlink(), "Harness checkpoint is missing")
-        _require(_file_sha256(path) == spec.checkpoint_sha256, "Harness checkpoint hash differs")
+        _require(
+            path.is_file() and not path.is_symlink(), "Harness checkpoint is missing"
+        )
+        _require(
+            _file_sha256(path) == spec.checkpoint_sha256,
+            "Harness checkpoint hash differs",
+        )
         try:
             from jphrl.harness.torch_learning import (
                 load_torch_harness_checkpoint,
                 load_torch_harness_rollout_checkpoint,
             )
         except ModuleNotFoundError as exc:  # pragma: no cover
-            raise ArealProductionWorkerError("Torch Harness loader is unavailable") from exc
+            raise ArealProductionWorkerError(
+                "Torch Harness loader is unavailable"
+            ) from exc
         if spec.kind == "candidate_pt":
-            policy, _optimizer, _record = load_torch_harness_checkpoint(path, map_location="cpu")
+            policy, _optimizer, _record = load_torch_harness_checkpoint(
+                path, map_location="cpu"
+            )
         else:
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                raise ArealProductionWorkerError("Harness rollout checkpoint is invalid") from exc
+                raise ArealProductionWorkerError(
+                    "Harness rollout checkpoint is invalid"
+                ) from exc
             _require(isinstance(raw, Mapping), "Harness rollout checkpoint is invalid")
             policy = load_torch_harness_rollout_checkpoint(raw)
         self._harness_policy = policy
@@ -705,33 +1045,47 @@ class PinnedArealSGLangActivationWorker(ProductionActivationWorker):
 
     def quiesce(self) -> None:
         _require(not self._closed, "production worker is closed")
-        if self._is_quiesced():
+        executor_paused, paused = self._pause_state_snapshot()
+        if executor_paused and all(paused):
             return
         self._controller.pause()
-        self._controller.pause_generation()
+        self._post_every_data_proxy(
+            "/pause_generation",
+            {},
+            response_validator=lambda response: (
+                response.get("status") == "ok" and response.get("paused") is True
+            ),
+        )
         _require(self._is_quiesced(), "AReaL rollout worker did not quiesce")
 
     def install_policy(self, target: ProductionReleaseTarget) -> None:
         _require(self._is_quiesced(), "Policy install requires a quiesced worker")
         expected = self._targets.get(target.release_id)
-        _require(expected is not None, "Policy target is outside the serving export pair")
+        _require(
+            expected is not None, "Policy target is outside the serving export pair"
+        )
         _require(
             target.policy_checkpoint_sha256 == expected.serving_parameter_sha256
             and target.policy_engine_version == expected.policy_engine_version,
             "Policy target differs from serving-export lineage",
         )
-        response = self._http_json(
-            "POST",
-            f"{self._inference_url}/update_weights_from_disk",
-            {"model_path": expected.serving_export_path, "abort_all_requests": True},
-        )
-        _require(
-            response.get("success") is True or response.get("status") == "ok",
-            "SGLang rejected the serving export",
-        )
-        self._controller.set_version(target.policy_engine_version)
-        self._verify_live_policy(target.release_id)
-        self._observe_version(target.policy_engine_version)
+        previous_release_id = self._policy_release_id
+        try:
+            self._install_serving_export(target.release_id)
+            self._verify_installed_policy(target.release_id)
+        except ArealProductionWorkerError as install_error:
+            if target.release_id == previous_release_id:
+                raise
+            try:
+                self._install_serving_export(previous_release_id)
+                self._verify_installed_policy(previous_release_id)
+            except ArealProductionWorkerError as rollback_error:
+                raise ArealProductionWorkerError(
+                    "multi-worker Policy install failed and immediate rollback was incomplete"
+                ) from rollback_error
+            raise ArealProductionWorkerError(
+                "multi-worker Policy install failed; the prior release was restored"
+            ) from install_error
         self._policy_release_id = target.release_id
 
     def install_harness(self, target: ProductionReleaseTarget) -> None:
@@ -775,9 +1129,16 @@ class PinnedArealSGLangActivationWorker(ProductionActivationWorker):
 
     def resume(self) -> None:
         _require(not self._closed, "production worker is closed")
-        if not self._is_quiesced():
+        executor_paused, paused = self._pause_state_snapshot()
+        if not executor_paused and not any(paused):
             return
-        self._controller.continue_generation()
+        self._post_every_data_proxy(
+            "/continue_generation",
+            {},
+            response_validator=lambda response: (
+                response.get("status") == "ok" and response.get("paused") is False
+            ),
+        )
         self._controller.resume()
         _require(not self._is_quiesced(), "AReaL rollout worker did not resume")
 
@@ -810,7 +1171,9 @@ class PinnedArealSGLangActivationWorker(ProductionActivationWorker):
         try:
             self._controller.destroy()
         except BaseException as exc:
-            raise ArealProductionWorkerError("AReaL controller destruction failed") from exc
+            raise ArealProductionWorkerError(
+                "AReaL controller destruction failed"
+            ) from exc
         _require(
             bool(getattr(self._controller, "_destroyed", False))
             and not tuple(getattr(self._controller, "workers", ()))
@@ -837,7 +1200,7 @@ def launch_pinned_areal_sglang_activation_worker(
     recorded_mem_fraction_static: float,
     request_timeout_seconds: float = 120.0,
 ) -> PinnedArealSGLangActivationWorker:
-    """Launch the pinned single-GPU controller and transfer cleanup ownership.
+    """Launch the pinned one- or four-replica controller and transfer ownership.
 
     The caller supplies an in-memory AReaL config (including its admin key), but
     neither this function nor the worker serializes that config.  The parent HF
@@ -857,20 +1220,42 @@ def launch_pinned_areal_sglang_activation_worker(
         and type(scheduler).__name__ == "LocalScheduler",
         "M0 production launch requires pinned AReaL LocalScheduler",
     )
+    try:
+        from areal.api.alloc_mode import ModelAllocation
+    except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover
+        raise ArealProductionWorkerError(
+            "pinned AReaL ModelAllocation is unavailable"
+        ) from exc
+    try:
+        allocation = ModelAllocation.from_str(
+            str(getattr(controller_config, "backend", ""))
+        )
+    except (TypeError, ValueError) as exc:
+        raise ArealProductionWorkerError(
+            "production rollout allocation is invalid"
+        ) from exc
+    parallel = allocation.parallel
+    _require(
+        allocation.backend == "sglang"
+        and parallel.dp_size in {1, 4}
+        and parallel.tp_size == 1
+        and parallel.pp_size == 1,
+        "production rollout must use exactly sglang:d1 or sglang:d4",
+    )
     fraction = server_args.get("mem_fraction_static")
     _require(
         isinstance(fraction, (int, float))
         and not isinstance(fraction, bool)
         and float(fraction) == float(recorded_mem_fraction_static)
-        and 0.28 <= float(fraction) <= 0.30,
-        "production SGLang memory fraction differs from the recorded 24-26 GiB envelope",
+        and 0.0 < float(fraction) <= 0.95,
+        "production SGLang memory fraction is invalid or differs from the record",
     )
     parent_path = exports.parent.serving_export_path
     _require(
         server_args.get("model_path") == parent_path
         and getattr(controller_config, "model", None) == parent_path
         and getattr(controller_config, "tokenizer_path", None) == parent_path
-        and str(getattr(controller_config, "backend", "")).startswith("sglang:d1"),
+        and allocation.parallel.dp_size in {1, 4},
         "production SGLang launch does not use the exact parent serving export",
     )
     try:

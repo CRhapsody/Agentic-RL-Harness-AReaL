@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -672,6 +672,7 @@ def materialize_areal_ppo_update_tensors(
     actor: object,
     active_joint_version: JointVersion,
     device: str | Any,
+    sample_indices: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Run native advantage preparation, then inject audited S advantages.
 
@@ -683,6 +684,23 @@ def materialize_areal_ppo_update_tensors(
         record,
         active_joint_version=active_joint_version,
     )
+    if sample_indices is None:
+        selected_indices = tuple(range(len(validated.samples)))
+    else:
+        _require(
+            isinstance(sample_indices, Sequence)
+            and not isinstance(sample_indices, (str, bytes, bytearray)),
+            "AReaL PPO sample indices must be a sequence",
+        )
+        selected_indices = tuple(sample_indices)
+        _require(
+            bool(selected_indices)
+            and all(type(index) is int for index in selected_indices)
+            and len(set(selected_indices)) == len(selected_indices)
+            and all(0 <= index < len(validated.samples) for index in selected_indices),
+            "AReaL PPO sample indices are empty, duplicated, or out of range",
+        )
+    selected_samples = tuple(validated.samples[index] for index in selected_indices)
     try:
         import torch
     except ModuleNotFoundError as exc:  # pragma: no cover - local dependency gate
@@ -714,7 +732,7 @@ def materialize_areal_ppo_update_tensors(
         "returns": torch.float32,
     }
     rollout_batch: list[dict[str, Any]] = []
-    for sample in validated.samples:
+    for sample in selected_samples:
         rollout_tensors = sample["rollout_tensor_dict"]
         rollout_batch.append(
             {
@@ -728,16 +746,16 @@ def materialize_areal_ppo_update_tensors(
         )
     native_batch = compute_advantages(rollout_batch)
     _require(
-        isinstance(native_batch, list) and len(native_batch) == len(validated.samples),
+        isinstance(native_batch, list) and len(native_batch) == len(selected_samples),
         "AReaL compute_advantages returned an invalid batch",
     )
     prepared: list[dict[str, Any]] = []
-    for index, (native, sample) in enumerate(
-        zip(native_batch, validated.samples, strict=True)
+    for global_index, native, sample in zip(
+        selected_indices, native_batch, selected_samples, strict=True
     ):
         _require(
             isinstance(native, dict),
-            f"AReaL compute_advantages sample {index} is not a tensor dict",
+            f"AReaL compute_advantages sample {global_index} is not a tensor dict",
         )
         expected = {
             field: torch.tensor(value, dtype=expected_dtypes[field], device=device)
@@ -756,7 +774,7 @@ def materialize_areal_ppo_update_tensors(
             target = expected[field]
             _require(
                 isinstance(actual, torch.Tensor) and actual.shape == target.shape,
-                f"native AReaL {field} shape differs from S sample {index}",
+                f"native AReaL {field} shape differs from S sample {global_index}",
             )
             if actual.dtype.is_floating_point or target.dtype.is_floating_point:
                 matches = torch.allclose(
@@ -769,7 +787,7 @@ def materialize_areal_ppo_update_tensors(
                 matches = torch.equal(actual, target)
             _require(
                 bool(matches),
-                f"native AReaL {field} differs from audited S sample {index}",
+                f"native AReaL {field} differs from audited S sample {global_index}",
             )
         _require(
             isinstance(native.get("kl_rewards"), torch.Tensor)

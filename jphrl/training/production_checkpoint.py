@@ -13,6 +13,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
+from typing import Any
 
 from jphrl.paths import (
     configured_root,
@@ -21,14 +22,21 @@ from jphrl.paths import (
 )
 from jphrl.trajectory.schema import JointVersion
 
-from .areal_policy_candidate import checkpoint_manifest
+from .areal_policy_candidate import (
+    AREAL_POLICY_CANDIDATE_SCHEMA,
+    checkpoint_manifest,
+)
 from .joint_step import validate_joint_candidate_bundle
 
-CHECKPOINT_SCHEMA_VERSION = "jph.production-joint-checkpoint.v1"
+CHECKPOINT_SCHEMA_VERSION = "jph.production-joint-checkpoint.v2"
 RANK_STATE_SCHEMA_VERSION = "jph.production-rank-runtime-state.v1"
+POLICY_RANK_STATE_SCHEMA_VERSION = "jph.production-policy-rank-state.v1"
 SCHEDULER_SCHEMA_VERSION = "jph.production-lr-scheduler-state.v1"
 CURSOR_SCHEMA_VERSION = "jph.production-runtime-cursor.v1"
 RECOVERY_EVIDENCE_SCHEMA_VERSION = "jph.production-joint-recovery-evidence.v2"
+DISTRIBUTED_RECOVERY_EVIDENCE_SCHEMA_VERSION = (
+    "jph.production-distributed-joint-recovery-evidence.v1"
+)
 DRY_LOAD_PROBE_SCHEMA_VERSION = "jph.production-joint-dry-load-probe.v1"
 
 _LIVE_EXACT_RECOVERY_TOKEN = object()
@@ -50,6 +58,8 @@ _CHECKPOINT_EVIDENCE = {
     "harness_checkpoint_with_optimizer_referenced": True,
     "lr_scheduler_state_saved": True,
     "all_rank_rng_state_saved": True,
+    "all_actor_ranks_bound_to_policy_candidate": True,
+    "component_transaction_bound": True,
     "cursor_state_saved": True,
     "dry_load_probe_passed": False,
     "continuous_next_step_verified": False,
@@ -383,6 +393,141 @@ class RankRuntimeState:
         return record
 
 
+@dataclass(frozen=True)
+class PolicyRankCheckpointState:
+    """One actor rank's binding to the same unpublished T candidate."""
+
+    rank: int
+    local_rank: int
+    world_size: int
+    device: str
+    hostname: str
+    physical_gpu_id: str
+    cuda_visible_devices: str
+    transaction_id: str
+    source_joint_credit_sha256: str
+    policy_candidate_receipt_sha256: str
+    parent_dcp_manifest_sha256: str
+    candidate_dcp_manifest_sha256: str
+    actor_public_version: int
+    actor_reserved_version: int
+    optimizer_step_before: int
+    optimizer_step_after: int
+    lr_scheduler_state_after_sha256: str
+
+    def to_record(self) -> dict[str, object]:
+        record = {
+            "schema_version": POLICY_RANK_STATE_SCHEMA_VERSION,
+            **asdict(self),
+        }
+        _validate_policy_rank_state_record(record)
+        return record
+
+
+@dataclass(frozen=True)
+class PolicySchedulerCheckpointState:
+    """JSON-safe scheduler state aggregated from the owning actor worker."""
+
+    owner_rank: int
+    scheduler_class: str
+    state: Mapping[str, object]
+
+    def to_record(self) -> dict[str, object]:
+        _require(
+            type(self.owner_rank) is int and self.owner_rank >= 0,
+            "Policy scheduler owner rank is invalid",
+        )
+        _require(
+            isinstance(self.scheduler_class, str) and bool(self.scheduler_class),
+            "Policy scheduler class is missing",
+        )
+        state = _to_json_state(dict(self.state))
+        _assert_no_secrets(state, "lr_scheduler")
+        record = {
+            "schema_version": SCHEDULER_SCHEMA_VERSION,
+            "owner_rank": self.owner_rank,
+            "scheduler_class": self.scheduler_class,
+            "state": state,
+            "state_sha256": _sha256(state),
+        }
+        _canonical_json(record)
+        return record
+
+
+def _validate_policy_rank_state_record(record: Mapping[str, object]) -> None:
+    _require(
+        set(record)
+        == {"schema_version"} | set(PolicyRankCheckpointState.__dataclass_fields__),
+        "Policy rank checkpoint state field set differs",
+    )
+    _require(
+        record.get("schema_version") == POLICY_RANK_STATE_SCHEMA_VERSION,
+        "Policy rank checkpoint state schema differs",
+    )
+    rank = record.get("rank")
+    local_rank = record.get("local_rank")
+    world_size = record.get("world_size")
+    _require(
+        type(rank) is int
+        and type(local_rank) is int
+        and type(world_size) is int
+        and world_size > 0
+        and 0 <= rank < world_size
+        and 0 <= local_rank < world_size,
+        "Policy rank checkpoint identity is invalid",
+    )
+    _require(
+        all(
+            isinstance(record.get(field), str) and bool(record[field])
+            for field in (
+                "device",
+                "hostname",
+                "physical_gpu_id",
+                "cuda_visible_devices",
+                "transaction_id",
+            )
+        ),
+        "Policy rank runtime identity is missing",
+    )
+    _require(
+        record.get("cuda_visible_devices") == record.get("physical_gpu_id")
+        and "," not in str(record["cuda_visible_devices"])
+        and str(record["cuda_visible_devices"]).strip()
+        == record["cuda_visible_devices"],
+        "Policy rank must expose exactly its recorded physical GPU",
+    )
+    _require(
+        all(
+            _is_sha256(record.get(field))
+            for field in (
+                "source_joint_credit_sha256",
+                "policy_candidate_receipt_sha256",
+                "parent_dcp_manifest_sha256",
+                "candidate_dcp_manifest_sha256",
+                "lr_scheduler_state_after_sha256",
+            )
+        )
+        and record["parent_dcp_manifest_sha256"]
+        != record["candidate_dcp_manifest_sha256"],
+        "Policy rank checkpoint digests are invalid",
+    )
+    public_version = record.get("actor_public_version")
+    reserved_version = record.get("actor_reserved_version")
+    step_before = record.get("optimizer_step_before")
+    step_after = record.get("optimizer_step_after")
+    _require(
+        type(public_version) is int
+        and public_version >= 0
+        and reserved_version == public_version + 1
+        and type(step_before) is int
+        and step_before >= 0
+        and step_after == step_before + 1,
+        "Policy rank version or optimizer step is invalid",
+    )
+    _assert_no_secrets(record, "policy_rank_state")
+    _canonical_json(record)
+
+
 def _to_json_state(value: object) -> object:
     if isinstance(value, tuple):
         return [_to_json_state(item) for item in value]
@@ -609,6 +754,20 @@ def _real_areal_actor(actor: object) -> bool:
     return type(actor) is FSDPPPOActor
 
 
+def _real_areal_distributed_controller(controller: object) -> bool:
+    try:
+        from .areal_distributed_policy import JPHPPOActorController
+    except (ImportError, ModuleNotFoundError):
+        return False
+    if type(controller) is not JPHPPOActorController:
+        return False
+    try:
+        controller._require_controller_topology()
+    except (AttributeError, RuntimeError, ValueError):
+        return False
+    return True
+
+
 def _real_harness_policy(policy: object) -> bool:
     try:
         from jphrl.harness.torch_learning import TorchHarnessPolicy
@@ -634,6 +793,286 @@ def _extract_component_records(
     return policy, harness
 
 
+def _policy_rank_expectation(
+    *,
+    bundle_record: Mapping[str, object],
+    policy_receipt: Mapping[str, object],
+    bundle: Any,
+) -> dict[str, object]:
+    if policy_receipt.get("schema_version") == (
+        "jph.areal-distributed-policy-candidate.v1"
+    ):
+        from .areal_distributed_policy import (
+            validate_distributed_policy_candidate,
+        )
+
+        try:
+            audit = validate_distributed_policy_candidate(
+                policy_receipt,
+                require_checkpoints=True,
+            )
+        except (ValueError, RuntimeError, KeyError, TypeError) as exc:
+            raise ProductionCheckpointError(str(exc)) from exc
+        receipts = _exact(
+            bundle_record.get("receipts"),
+            {"policy", "policy_sha256", "harness", "harness_sha256"},
+            "joint bundle receipts",
+        )
+        remote = policy_receipt["optimizer"]["remote_optimizer_receipt"]
+        rank_receipts = remote["rank_receipts"]
+        rank_zero = rank_receipts[0]
+        checkpoints = policy_receipt["checkpoints"]
+        _require(
+            audit.transaction_id == bundle.macro_step_id
+            and audit.source_joint_credit_sha256
+            == bundle.source_joint_credit_sha256
+            and receipts.get("policy_sha256") == audit.record_sha256
+            and policy_receipt.get("record_sha256") == audit.record_sha256
+            and isinstance(rank_receipts, list)
+            and len(rank_receipts) == 4,
+            "distributed Policy rank binding differs from the V macro transaction",
+        )
+        return {
+            "transaction_id": audit.transaction_id,
+            "source_joint_credit_sha256": audit.source_joint_credit_sha256,
+            "policy_candidate_receipt_sha256": audit.record_sha256,
+            "parent_dcp_manifest_sha256": checkpoints["parent_manifest"][
+                "manifest_sha256"
+            ],
+            "candidate_dcp_manifest_sha256": checkpoints[
+                "candidate_manifest"
+            ]["manifest_sha256"],
+            "actor_public_version": audit.parent_engine_version,
+            "actor_reserved_version": audit.reserved_candidate_engine_version,
+            "optimizer_step_before": rank_zero["optimizer_step_before"],
+            "optimizer_step_after": rank_zero["optimizer_step_after"],
+            "lr_scheduler_state_after_sha256": rank_zero[
+                "lr_scheduler_state_after_sha256"
+            ],
+        }
+    _require(
+        policy_receipt.get("schema_version") == AREAL_POLICY_CANDIDATE_SCHEMA,
+        "W requires the hardened T v2 Policy candidate",
+    )
+    transaction = _exact(
+        policy_receipt.get("transaction"),
+        {
+            "transaction_id",
+            "episode_id",
+            "source_admission_sha256",
+            "source_joint_credit_sha256",
+            "trainable_token_count",
+        },
+        "Policy candidate transaction",
+    )
+    optimizer = _exact(
+        policy_receipt.get("optimizer"),
+        {"actor_type", "optimizer_type", "config", "stats", "lr_scheduler"},
+        "Policy candidate optimizer",
+    )
+    stats = _exact(
+        optimizer.get("stats"),
+        {
+            "grad_norm",
+            "grad_norm_count",
+            "learning_rate",
+            "learning_rate_count",
+            "optimizer_step_after",
+            "optimizer_step_before",
+            "update_successful",
+            "update_successful_count",
+        },
+        "Policy candidate optimizer stats",
+    )
+    scheduler = _exact(
+        optimizer.get("lr_scheduler"),
+        {"state_before_sha256", "state_after_sha256", "step_completed"},
+        "Policy candidate lr scheduler",
+    )
+    checkpoints = _exact(
+        policy_receipt.get("checkpoints"),
+        {"parent_path", "parent_manifest", "candidate_path", "candidate_manifest"},
+        "Policy candidate checkpoints",
+    )
+    parent_manifest = _exact(
+        checkpoints.get("parent_manifest"),
+        {"files", "manifest_sha256"},
+        "Policy parent DCP manifest",
+    )
+    candidate_manifest = _exact(
+        checkpoints.get("candidate_manifest"),
+        {"files", "manifest_sha256"},
+        "Policy candidate DCP manifest",
+    )
+    receipts = _exact(
+        bundle_record.get("receipts"),
+        {"policy", "policy_sha256", "harness", "harness_sha256"},
+        "joint bundle receipts",
+    )
+    _require(
+        transaction.get("transaction_id") == bundle.macro_step_id
+        and transaction.get("source_joint_credit_sha256")
+        == bundle.source_joint_credit_sha256
+        and receipts.get("policy_sha256") == policy_receipt.get("record_sha256")
+        and _is_sha256(receipts.get("policy_sha256")),
+        "Policy rank binding differs from the V macro transaction",
+    )
+    return {
+        "transaction_id": transaction["transaction_id"],
+        "source_joint_credit_sha256": transaction["source_joint_credit_sha256"],
+        "policy_candidate_receipt_sha256": receipts["policy_sha256"],
+        "parent_dcp_manifest_sha256": parent_manifest["manifest_sha256"],
+        "candidate_dcp_manifest_sha256": candidate_manifest["manifest_sha256"],
+        "actor_public_version": bundle.policy_engine_version,
+        "actor_reserved_version": bundle.candidate_policy_engine_version,
+        "optimizer_step_before": stats["optimizer_step_before"],
+        "optimizer_step_after": stats["optimizer_step_after"],
+        "lr_scheduler_state_after_sha256": scheduler["state_after_sha256"],
+    }
+
+
+def _policy_rank_state_from_runtime(
+    *,
+    runtime: RankRuntimeState,
+    world_size: int,
+    expectation: Mapping[str, object],
+) -> PolicyRankCheckpointState:
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", runtime.device).strip()
+    _require(
+        bool(visible_devices) and "," not in visible_devices,
+        "single-rank Policy worker must expose exactly one physical device",
+    )
+    return PolicyRankCheckpointState(
+        rank=runtime.rank,
+        local_rank=runtime.local_rank,
+        world_size=world_size,
+        device=runtime.device,
+        hostname=runtime.hostname,
+        physical_gpu_id=visible_devices,
+        cuda_visible_devices=visible_devices,
+        **dict(expectation),
+    )
+
+
+def distributed_policy_checkpoint_inputs(
+    live_policy_candidate: object,
+    *,
+    harness_policy: object | None,
+) -> tuple[
+    tuple[RankRuntimeState, ...],
+    tuple[PolicyRankCheckpointState, ...],
+    PolicySchedulerCheckpointState,
+]:
+    """Convert worker-authenticated T state into the exact four-rank W inputs."""
+
+    from .areal_distributed_policy import (
+        require_live_remote_policy_candidate,
+        validate_distributed_policy_candidate,
+    )
+
+    try:
+        live = require_live_remote_policy_candidate(live_policy_candidate)
+        audit = validate_distributed_policy_candidate(
+            live.receipt,
+            require_checkpoints=True,
+        )
+    except (ValueError, RuntimeError, KeyError, TypeError) as exc:
+        raise ProductionCheckpointError(str(exc)) from exc
+    remote = live.receipt["optimizer"]["remote_optimizer_receipt"]
+    rank_receipts = remote["rank_receipts"]
+    checkpoints = live.receipt["checkpoints"]
+    runtime_fields = set(RankRuntimeState.__dataclass_fields__)
+    runtime_states: list[RankRuntimeState] = []
+    policy_states: list[PolicyRankCheckpointState] = []
+    harness_generator_state: list[int] | None = None
+    if harness_policy is not None:
+        generator = getattr(harness_policy, "_generator", None)
+        get_state = getattr(generator, "get_state", None)
+        _require(
+            callable(get_state),
+            "distributed W Harness candidate generator is unavailable",
+        )
+        state = get_state()
+        _require(
+            hasattr(state, "cpu") and hasattr(state, "tolist"),
+            "distributed W Harness generator state is invalid",
+        )
+        harness_generator_state = state.cpu().tolist()
+    for rank, (worker_state, rank_receipt) in enumerate(
+        zip(live.worker_states, rank_receipts)
+    ):
+        raw_runtime = worker_state["rank_runtime_state"]
+        _require(
+            isinstance(raw_runtime, Mapping)
+            and set(raw_runtime) == {"schema_version"} | runtime_fields,
+            f"distributed W rank {rank} runtime record differs",
+        )
+        runtime = RankRuntimeState(
+            **{
+                field: deepcopy(raw_runtime[field])
+                for field in runtime_fields
+            }
+        )
+        if rank == 0 and harness_generator_state is not None:
+            runtime = RankRuntimeState(
+                rank=runtime.rank,
+                local_rank=runtime.local_rank,
+                device=runtime.device,
+                hostname=runtime.hostname,
+                python_random_state=runtime.python_random_state,
+                numpy_rng=runtime.numpy_rng,
+                torch_rng=runtime.torch_rng,
+                harness_generator_state=deepcopy(harness_generator_state),
+            )
+        runtime.to_record()
+        _require(runtime.rank == rank, "distributed W runtime rank is crossed")
+        runtime_states.append(runtime)
+        policy_states.append(
+            PolicyRankCheckpointState(
+                rank=rank,
+                local_rank=runtime.local_rank,
+                world_size=4,
+                device=runtime.device,
+                hostname=runtime.hostname,
+                physical_gpu_id=str(rank_receipt["physical_gpu_id"]),
+                cuda_visible_devices=str(
+                    rank_receipt["runtime_state"]["cuda_visible_devices"]
+                ),
+                transaction_id=audit.transaction_id,
+                source_joint_credit_sha256=audit.source_joint_credit_sha256,
+                policy_candidate_receipt_sha256=audit.record_sha256,
+                parent_dcp_manifest_sha256=checkpoints["parent_manifest"][
+                    "manifest_sha256"
+                ],
+                candidate_dcp_manifest_sha256=checkpoints[
+                    "candidate_manifest"
+                ]["manifest_sha256"],
+                actor_public_version=audit.parent_engine_version,
+                actor_reserved_version=audit.reserved_candidate_engine_version,
+                optimizer_step_before=rank_receipt["optimizer_step_before"],
+                optimizer_step_after=rank_receipt["optimizer_step_after"],
+                lr_scheduler_state_after_sha256=rank_receipt[
+                    "lr_scheduler_state_after_sha256"
+                ],
+            )
+        )
+    scheduler_class = live.worker_states[0]["rank0_lr_scheduler_class"]
+    scheduler_state = live.worker_states[0]["rank0_lr_scheduler_state_after"]
+    _require(
+        isinstance(scheduler_class, str)
+        and bool(scheduler_class)
+        and isinstance(scheduler_state, Mapping),
+        "distributed W rank-zero scheduler export is incomplete",
+    )
+    scheduler = PolicySchedulerCheckpointState(
+        owner_rank=0,
+        scheduler_class=scheduler_class,
+        state=deepcopy(dict(scheduler_state)),
+    )
+    scheduler.to_record()
+    return tuple(runtime_states), tuple(policy_states), scheduler
+
+
 @dataclass(frozen=True)
 class ValidatedProductionCheckpoint:
     manifest_path: str
@@ -650,6 +1089,7 @@ class ValidatedProductionCheckpoint:
     dataloader_cursor_state: RuntimeCursorState
     actor_public_version: int
     actor_reserved_version: int
+    policy_rank_state_count: int
     real_areal_checkpoint: bool
     real_harness_checkpoint: bool
     exact_joint_recovery: bool
@@ -665,9 +1105,12 @@ def save_production_joint_checkpoint(
     harness_policy: object | None,
     topology: RuntimeTopology,
     rank_states: Sequence[RankRuntimeState],
+    policy_rank_states: Sequence[PolicyRankCheckpointState] | None = None,
+    policy_scheduler_state: PolicySchedulerCheckpointState | None = None,
     macro_step: int,
     rollout_cursor: int | RuntimeCursorState,
     dataloader_cursor: int | RuntimeCursorState,
+    live_policy_candidate: object | None = None,
 ) -> Path:
     """Atomically save the missing state around real V component checkpoints."""
 
@@ -695,6 +1138,28 @@ def save_production_joint_checkpoint(
         "production cursor roles differ",
     )
     _assert_no_secrets(joint_candidate_bundle)
+    if live_policy_candidate is not None:
+        live_runtime, live_policy_states, live_scheduler = (
+            distributed_policy_checkpoint_inputs(
+                live_policy_candidate,
+                harness_policy=harness_policy,
+            )
+        )
+        _require(
+            all(type(state) is RankRuntimeState for state in rank_states)
+            and tuple(state.to_record() for state in rank_states)
+            == tuple(state.to_record() for state in live_runtime)
+            and policy_rank_states is not None
+            and all(
+                type(state) is PolicyRankCheckpointState
+                for state in policy_rank_states
+            )
+            and tuple(state.to_record() for state in policy_rank_states)
+            == tuple(state.to_record() for state in live_policy_states)
+            and policy_scheduler_state is not None
+            and policy_scheduler_state.to_record() == live_scheduler.to_record(),
+            "distributed W checkpoint inputs differ from the live four-rank candidate",
+        )
     try:
         bundle = validate_joint_candidate_bundle(
             joint_candidate_bundle,
@@ -707,7 +1172,8 @@ def save_production_joint_checkpoint(
     except (ValueError, RuntimeError, KeyError, TypeError, AttributeError) as exc:
         raise ProductionCheckpointError(str(exc)) from exc
     _require(
-        len(rank_states) == topology.world_size,
+        len(rank_states) == topology.world_size
+        and all(type(state) is RankRuntimeState for state in rank_states),
         "rank RNG count differs from topology",
     )
     ordered_states = sorted(rank_states, key=lambda state: state.rank)
@@ -716,12 +1182,77 @@ def save_production_joint_checkpoint(
         "rank RNG states are not contiguous",
     )
     for state in ordered_states:
+        state.to_record()
         _require(
             state.device == topology.rank_to_device[state.rank],
             "rank RNG device differs from topology",
         )
+    _require(
+        all(
+            state.harness_generator_state is None
+            for state in ordered_states
+            if state.rank != 0
+        ),
+        "Harness generator state must be owned only by rank zero",
+    )
 
     policy_receipt, harness_receipt = _extract_component_records(joint_candidate_bundle)
+    expectation = _policy_rank_expectation(
+        bundle_record=joint_candidate_bundle,
+        policy_receipt=policy_receipt,
+        bundle=bundle,
+    )
+    if policy_rank_states is None:
+        _require(
+            topology.world_size == 1,
+            "multi-rank W requires one Policy checkpoint state from every actor rank",
+        )
+        policy_rank_states = (
+            _policy_rank_state_from_runtime(
+                runtime=ordered_states[0],
+                world_size=topology.world_size,
+                expectation=expectation,
+            ),
+        )
+    _require(
+        len(policy_rank_states) == topology.world_size
+        and all(
+            type(state) is PolicyRankCheckpointState for state in policy_rank_states
+        ),
+        "Policy rank checkpoint count differs from topology",
+    )
+    ordered_policy_states = sorted(policy_rank_states, key=lambda state: state.rank)
+    _require(
+        [state.rank for state in ordered_policy_states]
+        == list(range(topology.world_size)),
+        "Policy rank checkpoint states are not contiguous",
+    )
+    for policy_state, runtime_state in zip(ordered_policy_states, ordered_states):
+        record = policy_state.to_record()
+        _require(
+            policy_state.world_size == topology.world_size
+            and (
+                policy_state.rank,
+                policy_state.local_rank,
+                policy_state.device,
+                policy_state.hostname,
+            )
+            == (
+                runtime_state.rank,
+                runtime_state.local_rank,
+                runtime_state.device,
+                runtime_state.hostname,
+            )
+            and all(record.get(field) == value for field, value in expectation.items()),
+            "Policy rank checkpoint state differs from T or runtime identity",
+        )
+    _require(
+        len(
+            {(state.hostname, state.physical_gpu_id) for state in ordered_policy_states}
+        )
+        == topology.world_size,
+        "Policy actor ranks collide on one physical GPU",
+    )
     policy_checkpoints = _exact(
         policy_receipt.get("checkpoints"),
         {"parent_path", "parent_manifest", "candidate_path", "candidate_manifest"},
@@ -747,7 +1278,29 @@ def save_production_joint_checkpoint(
         public_version == bundle.policy_engine_version,
         "actor public version differs from V parent",
     )
-    scheduler_record = _scheduler_state(actor)
+    if policy_scheduler_state is None:
+        _require(
+            topology.world_size == 1,
+            "multi-rank W requires scheduler state aggregated from an actor worker",
+        )
+        local_scheduler = _scheduler_state(actor)
+        policy_scheduler_state = PolicySchedulerCheckpointState(
+            owner_rank=0,
+            scheduler_class=str(local_scheduler["scheduler_class"]),
+            state=local_scheduler["state"],
+        )
+    _require(
+        type(policy_scheduler_state) is PolicySchedulerCheckpointState
+        and policy_scheduler_state.owner_rank == 0
+        and policy_scheduler_state.owner_rank < topology.world_size,
+        "Policy scheduler worker state is invalid",
+    )
+    scheduler_record = policy_scheduler_state.to_record()
+    _require(
+        scheduler_record["state_sha256"]
+        == expectation["lr_scheduler_state_after_sha256"],
+        "W scheduler state differs from the T candidate",
+    )
 
     target, temporary = _prepare_target(checkpoint_root, project_root)
     try:
@@ -762,10 +1315,32 @@ def save_production_joint_checkpoint(
                     "rank": state.rank,
                     "local_rank": state.local_rank,
                     "device": state.device,
+                    "hostname": state.hostname,
                     "file": _file_reference(
                         path,
                         root=temporary,
                         schema_version=RANK_STATE_SCHEMA_VERSION,
+                    ),
+                }
+            )
+        policy_state_dir = temporary / "policy-rank-state"
+        policy_state_dir.mkdir(mode=0o700)
+        policy_rank_references: list[dict[str, object]] = []
+        for state in ordered_policy_states:
+            path = policy_state_dir / f"rank-{state.rank:05d}.json"
+            _write_json(path, state.to_record())
+            policy_rank_references.append(
+                {
+                    "rank": state.rank,
+                    "local_rank": state.local_rank,
+                    "device": state.device,
+                    "hostname": state.hostname,
+                    "physical_gpu_id": state.physical_gpu_id,
+                    "cuda_visible_devices": state.cuda_visible_devices,
+                    "file": _file_reference(
+                        path,
+                        root=temporary,
+                        schema_version=POLICY_RANK_STATE_SCHEMA_VERSION,
                     ),
                 }
             )
@@ -777,16 +1352,48 @@ def save_production_joint_checkpoint(
             schema_version=SCHEDULER_SCHEMA_VERSION,
         )
         harness_reference = _external_file_reference(harness_path)
-        real_areal = _real_areal_actor(actor)
+        real_single_areal = _real_areal_actor(actor) and topology.world_size == 1
+        real_distributed_areal = (
+            live_policy_candidate is not None
+            and topology
+            == RuntimeTopology(
+                world_size=4,
+                data_parallel_size=4,
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                rank_to_device=topology.rank_to_device,
+            )
+            and _real_areal_distributed_controller(actor)
+        )
+        real_areal = real_single_areal or real_distributed_areal
         real_harness = _real_harness_policy(harness_policy)
+        if real_single_areal:
+            _require(
+                _policy_optimizer_step(actor) == expectation["optimizer_step_after"],
+                "real AReaL optimizer step differs from the T candidate",
+            )
+        if real_areal:
+            _require(
+                all(
+                    state.torch_rng.get("available") is True
+                    and (
+                        not state.device.startswith("cuda")
+                        or bool(state.torch_rng.get("cuda_states"))
+                    )
+                    for state in ordered_states
+                ),
+                "real AReaL rank RNG state is incomplete",
+            )
         if real_harness:
             from jphrl.harness.torch_learning import (
                 load_torch_harness_checkpoint,
             )
 
-            loaded_policy, loaded_optimizer, _ = load_torch_harness_checkpoint(
-                harness_path,
-                map_location="cpu",
+            loaded_policy, loaded_optimizer, loaded_checkpoint = (
+                load_torch_harness_checkpoint(
+                    harness_path,
+                    map_location="cpu",
+                )
             )
             _require(
                 getattr(harness_policy, "version", None)
@@ -798,6 +1405,10 @@ def save_production_joint_checkpoint(
                 and loaded_policy.parameter_digest == harness_policy.parameter_digest
                 and bool(loaded_optimizer.state),
                 "real Harness checkpoint dry load differs from candidate",
+            )
+            _require(
+                loaded_checkpoint["source"]["transaction_id"] == bundle.macro_step_id,
+                "Harness checkpoint transaction differs from V",
             )
             rank_zero_generator = ordered_states[0].harness_generator_state
             current_generator = harness_policy._generator.get_state().cpu().tolist()
@@ -833,6 +1444,8 @@ def save_production_joint_checkpoint(
                 "candidate_dcp_path": policy_checkpoints["candidate_path"],
                 "candidate_dcp_manifest": policy_checkpoints["candidate_manifest"],
                 "dcp_with_optimizer": True,
+                "fsdp_world_size": topology.world_size,
+                "rank_checkpoint_states": policy_rank_references,
                 "lr_scheduler": scheduler_reference,
             },
             "harness": {
@@ -844,6 +1457,7 @@ def save_production_joint_checkpoint(
                 "real_torch_harness_policy": real_harness,
                 "behavior_version": bundle.parent_joint_version.harness_controller,
                 "candidate_version": bundle.candidate_joint_version.harness_controller,
+                "transaction_id": bundle.macro_step_id,
                 "checkpoint": harness_reference,
                 "checkpoint_schema_version": harness_receipt.get("schema_version"),
                 "checkpoint_contains_optimizer": True,
@@ -1012,6 +1626,12 @@ def validate_production_joint_checkpoint(
         == identity.get("source_joint_credit_sha256"),
         "checkpoint differs from its V bundle",
     )
+    policy_receipt, _harness_receipt = _extract_component_records(bundle_record)
+    policy_rank_expectation = _policy_rank_expectation(
+        bundle_record=bundle_record,
+        policy_receipt=policy_receipt,
+        bundle=bundle,
+    )
     cursors = _exact(
         record.get("cursors"),
         {"rollout", "dataloader"},
@@ -1035,6 +1655,8 @@ def validate_production_joint_checkpoint(
             "candidate_dcp_path",
             "candidate_dcp_manifest",
             "dcp_with_optimizer",
+            "fsdp_world_size",
+            "rank_checkpoint_states",
             "lr_scheduler",
         },
         "checkpoint Policy state",
@@ -1044,7 +1666,8 @@ def validate_production_joint_checkpoint(
         and policy.get("actor_public_version") == bundle.policy_engine_version
         and policy.get("actor_reserved_version")
         == bundle.candidate_policy_engine_version
-        and policy.get("dcp_with_optimizer") is True,
+        and policy.get("dcp_with_optimizer") is True
+        and policy.get("fsdp_world_size") == topology.world_size,
         "checkpoint Policy version or optimizer reference differs",
     )
     for kind in ("parent", "candidate"):
@@ -1059,6 +1682,73 @@ def validate_production_joint_checkpoint(
                 checkpoint_manifest(dcp_path) == dcp_manifest,
                 f"Policy {kind} DCP manifest mismatch",
             )
+    policy_rank_references = policy.get("rank_checkpoint_states")
+    _require(
+        isinstance(policy_rank_references, list)
+        and len(policy_rank_references) == topology.world_size,
+        "Policy rank checkpoint count differs from topology",
+    )
+    seen_policy_ranks: set[int] = set()
+    physical_gpu_owners: set[tuple[str, str]] = set()
+    for item in policy_rank_references:
+        item = _exact(
+            item,
+            {
+                "rank",
+                "local_rank",
+                "device",
+                "hostname",
+                "physical_gpu_id",
+                "cuda_visible_devices",
+                "file",
+            },
+            "Policy rank checkpoint reference",
+        )
+        rank = item.get("rank")
+        _require(
+            type(rank) is int
+            and 0 <= rank < topology.world_size
+            and rank not in seen_policy_ranks,
+            "Policy rank checkpoint identity is invalid",
+        )
+        seen_policy_ranks.add(rank)
+        rank_path = _validate_file_reference(
+            item.get("file"),
+            checkpoint_root=root,
+            expected_schema=POLICY_RANK_STATE_SCHEMA_VERSION,
+        )
+        state = _read_json(rank_path)
+        _validate_policy_rank_state_record(state)
+        _require(
+            state.get("world_size") == topology.world_size
+            and state.get("device") == topology.rank_to_device[rank]
+            and all(
+                state.get(field) == value
+                for field, value in policy_rank_expectation.items()
+            )
+            and all(
+                state.get(field) == item.get(field)
+                for field in (
+                    "rank",
+                    "local_rank",
+                    "device",
+                    "hostname",
+                    "physical_gpu_id",
+                    "cuda_visible_devices",
+                )
+            ),
+            "Policy rank checkpoint file differs from T or topology",
+        )
+        owner = (str(state["hostname"]), str(state["physical_gpu_id"]))
+        _require(
+            owner not in physical_gpu_owners,
+            "Policy actor ranks collide on one physical GPU",
+        )
+        physical_gpu_owners.add(owner)
+    _require(
+        seen_policy_ranks == set(range(topology.world_size)),
+        "Policy rank checkpoint coverage is incomplete",
+    )
     scheduler_path = _validate_file_reference(
         policy.get("lr_scheduler"),
         checkpoint_root=root,
@@ -1066,10 +1756,23 @@ def validate_production_joint_checkpoint(
     )
     scheduler = _read_json(scheduler_path)
     _require(
-        set(scheduler) == {"schema_version", "scheduler_class", "state", "state_sha256"}
+        set(scheduler)
+        == {
+            "schema_version",
+            "owner_rank",
+            "scheduler_class",
+            "state",
+            "state_sha256",
+        }
         and scheduler.get("schema_version") == SCHEDULER_SCHEMA_VERSION
+        and scheduler.get("owner_rank") == 0
         and scheduler.get("state_sha256") == _sha256(scheduler.get("state")),
         "lr scheduler state differs from schema or hash",
+    )
+    _require(
+        scheduler.get("state_sha256")
+        == policy_rank_expectation["lr_scheduler_state_after_sha256"],
+        "W scheduler state differs from the T candidate",
     )
     harness = _exact(
         record.get("harness"),
@@ -1078,6 +1781,7 @@ def validate_production_joint_checkpoint(
             "policy_class",
             "behavior_version",
             "candidate_version",
+            "transaction_id",
             "checkpoint",
             "checkpoint_schema_version",
             "checkpoint_contains_optimizer",
@@ -1089,15 +1793,38 @@ def validate_production_joint_checkpoint(
         type(harness.get("real_torch_harness_policy")) is bool
         and harness.get("behavior_version") == parent_version.harness_controller
         and harness.get("candidate_version") == candidate_version.harness_controller
+        and harness.get("transaction_id") == bundle.macro_step_id
+        and harness.get("checkpoint_schema_version")
+        == _harness_receipt.get("schema_version")
+        and harness.get("checkpoint_schema_version")
+        in {
+            "jph.torch-harness-candidate.v2",
+            "jph.torch-harness-multi-s-candidate.v1",
+        }
         and harness.get("checkpoint_contains_optimizer") is True
         and harness.get("checkpoint_contains_generator") is True,
         "Harness checkpoint version or optimizer reference differs",
     )
     if policy["real_areal_fsdp_actor"]:
-        _require(
-            policy.get("actor_class") == "areal.engine.fsdp_engine.FSDPPPOActor",
-            "real Policy checkpoint actor class differs",
-        )
+        if topology.world_size == 1:
+            _require(
+                policy.get("actor_class")
+                == "areal.engine.fsdp_engine.FSDPPPOActor",
+                "real Policy checkpoint actor class differs",
+            )
+        else:
+            _require(
+                topology.world_size == 4
+                and topology.data_parallel_size == 4
+                and topology.tensor_parallel_size == 1
+                and topology.pipeline_parallel_size == 1
+                and policy.get("actor_class")
+                == (
+                    "jphrl.training.areal_distributed_policy."
+                    "JPHPPOActorController"
+                ),
+                "real distributed Policy checkpoint controller/topology differs",
+            )
     if harness["real_torch_harness_policy"]:
         _require(
             harness.get("policy_class")
@@ -1155,9 +1882,12 @@ def validate_production_joint_checkpoint(
         "checkpoint rank RNG count differs from topology",
     )
     seen: set[int] = set()
+    harness_generator_ranks: set[int] = set()
     for item in rank_states:
         item = _exact(
-            item, {"rank", "local_rank", "device", "file"}, "rank RNG reference"
+            item,
+            {"rank", "local_rank", "device", "hostname", "file"},
+            "rank RNG reference",
         )
         rank = item.get("rank")
         _require(
@@ -1179,12 +1909,21 @@ def validate_production_joint_checkpoint(
         _require(
             state.get("rank") == rank
             and state.get("local_rank") == item.get("local_rank")
-            and state.get("device") == item.get("device"),
+            and state.get("device") == item.get("device")
+            and state.get("hostname") == item.get("hostname"),
             "rank RNG file identity differs",
         )
+        if state.get("harness_generator_state") is not None:
+            harness_generator_ranks.add(rank)
     _require(
         seen == set(range(topology.world_size)),
         "checkpoint rank RNG coverage is incomplete",
+    )
+    _require(
+        harness_generator_ranks <= {0}
+        and rng.get("harness_generator_saved_on_rank_zero")
+        is (0 in harness_generator_ranks),
+        "Harness generator ownership differs from rank-zero contract",
     )
     _require(
         all(
@@ -1217,6 +1956,7 @@ def validate_production_joint_checkpoint(
         dataloader_cursor_state=dataloader_cursor_state,
         actor_public_version=int(policy["actor_public_version"]),
         actor_reserved_version=int(policy["actor_reserved_version"]),
+        policy_rank_state_count=len(policy_rank_references),
         real_areal_checkpoint=bool(policy["real_areal_fsdp_actor"]),
         real_harness_checkpoint=bool(harness["real_torch_harness_policy"]),
         exact_joint_recovery=False,
@@ -1551,7 +2291,7 @@ def _require_real_harness_optimizer(policy: object, optimizer: object) -> None:
         len(policy_parameters) == len(optimizer_parameters)
         and all(
             left is right
-            for left, right in zip(policy_parameters, optimizer_parameters, strict=True)
+            for left, right in zip(policy_parameters, optimizer_parameters)
         ),
         "Harness Adam optimizer is not bound to the restored policy",
     )
@@ -1710,7 +2450,13 @@ def _saved_optimizer_steps(
     manifest_record = _read_json(Path(checkpoint.manifest_path))
     receipts = manifest_record["joint_candidate_bundle"]["receipts"]
     try:
-        policy_step = receipts["policy"]["optimizer"]["stats"]["optimizer_step_after"]
+        policy_optimizer = receipts["policy"]["optimizer"]
+        if "remote_optimizer_receipt" in policy_optimizer:
+            policy_step = policy_optimizer["remote_optimizer_receipt"][
+                "rank_receipts"
+            ][0]["optimizer_step_after"]
+        else:
+            policy_step = policy_optimizer["stats"]["optimizer_step_after"]
         harness_step = receipts["harness"]["optimizer_step_after"]
     except (KeyError, TypeError) as exc:
         raise ProductionCheckpointError(
@@ -1951,10 +2697,6 @@ def verify_exact_joint_recovery(
         restore_rng=True,
         require_real_components=True,
     )
-    _require(
-        first.audit.topology.world_size == 1 and rank == 0,
-        "multi-rank exact recovery requires aggregated per-rank continuation evidence",
-    )
     saved_policy_step, saved_harness_step = _saved_optimizer_steps(first.audit)
     uninterrupted = _execute_live_continuation(
         first,
@@ -2092,10 +2834,6 @@ def validate_exact_joint_recovery_evidence(
         "exact recovery evidence requires real AReaL and Harness checkpoints",
     )
     _require(
-        checkpoint.topology.world_size == 1,
-        "multi-rank exact recovery requires aggregated per-rank continuation evidence",
-    )
-    _require(
         checkpoint.rollout_cursor_state.live_exact_eligible
         and checkpoint.dataloader_cursor_state.live_exact_eligible,
         "legacy integer cursors cannot support persisted exact recovery evidence",
@@ -2160,13 +2898,799 @@ def validate_exact_joint_recovery_evidence(
     }
 
 
+def _load_distributed_harness_candidate(
+    checkpoint: ValidatedProductionCheckpoint,
+) -> tuple[object, object]:
+    manifest = _read_json(Path(checkpoint.manifest_path))
+    try:
+        from jphrl.harness.torch_learning import load_torch_harness_checkpoint
+    except ModuleNotFoundError as exc:
+        raise ProductionCheckpointError("Torch Harness loader is unavailable") from exc
+    policy, optimizer, _record = load_torch_harness_checkpoint(
+        manifest["harness"]["checkpoint"]["path"],
+        map_location="cpu",
+    )
+    _require_real_harness_optimizer(policy, optimizer)
+    _require(
+        policy.version == checkpoint.candidate_joint_version.harness_controller,
+        "distributed W restored Harness version differs from V",
+    )
+    rank_zero_reference = next(
+        item for item in manifest["rng"]["rank_states"] if item["rank"] == 0
+    )
+    rank_zero = _read_json(
+        Path(checkpoint.manifest_path).parent
+        / rank_zero_reference["file"]["path"]
+    )
+    saved_generator = rank_zero["harness_generator_state"]
+    _require(
+        isinstance(saved_generator, list)
+        and policy._generator.get_state().cpu().tolist() == saved_generator,
+        "distributed W Harness generator differs from rank-zero checkpoint",
+    )
+    return policy, optimizer
+
+
+def _assert_live_harness_matches_checkpoint(
+    checkpoint: ValidatedProductionCheckpoint,
+    *,
+    policy: object,
+    optimizer: object,
+) -> None:
+    _require_real_harness_optimizer(policy, optimizer)
+    restored_policy, restored_optimizer = _load_distributed_harness_candidate(
+        checkpoint
+    )
+    _require(
+        policy.version == restored_policy.version
+        and policy.parameter_digest == restored_policy.parameter_digest
+        and policy.update_step == restored_policy.update_step
+        and policy.sample_count == restored_policy.sample_count
+        and policy.training == restored_policy.training
+        and _sha256(_to_json_state(optimizer.state_dict()))
+        == _sha256(_to_json_state(restored_optimizer.state_dict()))
+        and policy._generator.get_state().cpu().tolist()
+        == restored_policy._generator.get_state().cpu().tolist(),
+        "live Harness candidate differs from its W checkpoint",
+    )
+
+
+def _execute_distributed_harness_continuation(
+    *,
+    policy: object,
+    optimizer: object,
+    saved_optimizer_step: int,
+    run_harness_optimizer_step: Callable[[object, object], object],
+) -> dict[str, object]:
+    _require_real_harness_optimizer(policy, optimizer)
+    optimizer_step_before = _harness_optimizer_step(policy, optimizer)
+    _require(
+        optimizer_step_before == saved_optimizer_step,
+        "distributed W Harness optimizer differs from V",
+    )
+    parameter_digest_before = policy.parameter_digest
+    generator_state_before_sha256 = _sha256(
+        policy._generator.get_state().cpu().tolist()
+    )
+    result = run_harness_optimizer_step(policy, optimizer)
+    _require(
+        result is None,
+        "distributed W Harness callback must not self-report recovery evidence",
+    )
+    _require(
+        policy.update_step == optimizer_step_before,
+        "distributed W Harness callback must leave version advancement to W",
+    )
+    optimizer_step_after = _optimizer_step_from_state(
+        optimizer.state,
+        "Harness Adam optimizer",
+    )
+    _require(
+        optimizer_step_after == optimizer_step_before + 1,
+        "distributed W Harness optimizer did not advance exactly once",
+    )
+    policy.update_step = optimizer_step_after
+    parameter_digest_after = policy.parameter_digest
+    _require(
+        parameter_digest_after != parameter_digest_before,
+        "distributed W Harness optimizer did not change parameters",
+    )
+    record: dict[str, object] = {
+        "parameter_digest_before": parameter_digest_before,
+        "parameter_digest_after": parameter_digest_after,
+        "optimizer_state_sha256": _sha256(
+            _to_json_state(optimizer.state_dict())
+        ),
+        "generator_state_before_sha256": generator_state_before_sha256,
+        "generator_state_after_sha256": _sha256(
+            policy._generator.get_state().cpu().tolist()
+        ),
+        "optimizer_step_before": optimizer_step_before,
+        "optimizer_step_after": optimizer_step_after,
+        "sample_count": policy.sample_count,
+        "training": policy.training,
+    }
+    _canonical_json(record)
+    return record
+
+
+def _distributed_continuation_branch_record(
+    *,
+    checkpoint: ValidatedProductionCheckpoint,
+    branch_id: str,
+    restore_receipt: Mapping[str, object],
+    policy_continuation: Mapping[str, object],
+    harness_continuation: Mapping[str, object],
+) -> dict[str, object]:
+    rollout_cursor = _cursor_advance_record(checkpoint.rollout_cursor_state)
+    dataloader_cursor = _cursor_advance_record(checkpoint.dataloader_cursor_state)
+    continuation_digest = _sha256(
+        {
+            "policy_continuation_state_sha256": policy_continuation[
+                "continuation_state_sha256"
+            ],
+            "harness_continuation": harness_continuation,
+            "rollout_cursor": rollout_cursor,
+            "dataloader_cursor": dataloader_cursor,
+        }
+    )
+    return {
+        "branch_id": branch_id,
+        "policy_restore_receipt": deepcopy(dict(restore_receipt)),
+        "policy_continuation_receipt": deepcopy(dict(policy_continuation)),
+        "harness_continuation": deepcopy(dict(harness_continuation)),
+        "rollout_cursor": rollout_cursor,
+        "dataloader_cursor": dataloader_cursor,
+        "continuation_digest": continuation_digest,
+    }
+
+
+@dataclass(frozen=True, init=False)
+class LiveExactDistributedJointRecovery:
+    """Live-only authority minted by a real four-rank W execution."""
+
+    _record: dict[str, object] = dataclass_field(repr=False)
+    _checkpoint: ValidatedProductionCheckpoint = dataclass_field(repr=False)
+    _live_policy_candidate: object = dataclass_field(repr=False)
+    _final_harness_policy: object = dataclass_field(repr=False)
+    _final_harness_optimizer: object = dataclass_field(repr=False)
+    _token: object = dataclass_field(repr=False)
+
+    @classmethod
+    def _create(
+        cls,
+        *,
+        record: Mapping[str, object],
+        checkpoint: ValidatedProductionCheckpoint,
+        live_policy_candidate: object,
+        final_harness_policy: object,
+        final_harness_optimizer: object,
+        token: object,
+    ) -> LiveExactDistributedJointRecovery:
+        _require(token is _LIVE_EXACT_RECOVERY_TOKEN, "live recovery token is invalid")
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_record", deepcopy(dict(record)))
+        object.__setattr__(instance, "_checkpoint", checkpoint)
+        object.__setattr__(instance, "_live_policy_candidate", live_policy_candidate)
+        object.__setattr__(instance, "_final_harness_policy", final_harness_policy)
+        object.__setattr__(instance, "_final_harness_optimizer", final_harness_optimizer)
+        object.__setattr__(instance, "_token", token)
+        return instance
+
+    @property
+    def record(self) -> dict[str, object]:
+        return deepcopy(self._record)
+
+    @property
+    def record_sha256(self) -> str:
+        return str(self._record["record_sha256"])
+
+    @property
+    def checkpoint_manifest_sha256(self) -> str:
+        return self._checkpoint.record_sha256
+
+    @property
+    def candidate_joint_version(self) -> JointVersion:
+        return self._checkpoint.candidate_joint_version
+
+    @property
+    def macro_step_id(self) -> str:
+        return self._checkpoint.macro_step_id
+
+    @property
+    def restored_harness_policy(self) -> object:
+        return self._final_harness_policy
+
+    @property
+    def restored_harness_optimizer(self) -> object:
+        return self._final_harness_optimizer
+
+    @property
+    def live_policy_candidate(self) -> object:
+        return self._live_policy_candidate
+
+    @property
+    def exact_joint_recovery(self) -> bool:
+        return self._token is _LIVE_EXACT_RECOVERY_TOKEN
+
+
+def verify_exact_distributed_joint_recovery(
+    manifest_path: str | Path,
+    *,
+    controller: object,
+    live_policy_candidate: object,
+    harness_policy: object,
+    harness_optimizer: object,
+    current_topology: RuntimeTopology,
+    run_harness_optimizer_step: Callable[[object, object], object],
+) -> LiveExactDistributedJointRecovery:
+    """Execute uninterrupted/recovered fsdp:d4+Harness continuation branches."""
+
+    _require(
+        _real_areal_distributed_controller(controller),
+        "distributed exact recovery requires the real project fsdp:d4 controller",
+    )
+    from .areal_distributed_policy import (
+        JPH_AREAL_DISTRIBUTED_ACTOR_CLASS,
+        JPH_AREAL_DISTRIBUTED_CONTROLLER_CLASS,
+        require_live_remote_policy_candidate,
+        validate_distributed_policy_candidate,
+    )
+
+    live = require_live_remote_policy_candidate(live_policy_candidate)
+    candidate_audit = validate_distributed_policy_candidate(
+        live.receipt,
+        require_checkpoints=True,
+    )
+    checkpoint = validate_production_joint_checkpoint(
+        manifest_path,
+        current_topology=current_topology,
+        require_component_files=True,
+    )
+    _require(
+        checkpoint.real_areal_checkpoint
+        and checkpoint.real_harness_checkpoint
+        and checkpoint.topology.world_size == 4
+        and checkpoint.topology.data_parallel_size == 4
+        and checkpoint.policy_rank_state_count == 4,
+        "distributed exact recovery requires a real four-rank joint checkpoint",
+    )
+    manifest = _read_json(Path(checkpoint.manifest_path))
+    policy_receipt = manifest["joint_candidate_bundle"]["receipts"]["policy"]
+    _require(
+        policy_receipt == live.receipt
+        and candidate_audit.record_sha256 == policy_receipt["record_sha256"]
+        and candidate_audit.transaction_id == checkpoint.macro_step_id,
+        "distributed exact recovery live candidate differs from V/W",
+    )
+    _assert_live_harness_matches_checkpoint(
+        checkpoint,
+        policy=harness_policy,
+        optimizer=harness_optimizer,
+    )
+    saved_policy_step, saved_harness_step = _saved_optimizer_steps(checkpoint)
+
+    def _branch(
+        branch_id: str,
+        branch_harness_policy: object,
+        branch_harness_optimizer: object,
+    ) -> dict[str, object]:
+        if branch_id == "uninterrupted":
+            restore_receipt = controller.attest_m0_live_policy_candidate_for_w(
+                live
+            )
+        else:
+            restore_receipt = controller.restore_m0_policy_candidate_for_w(
+                live,
+                branch_id=branch_id,
+            )
+        policy_continuation = controller.run_m0_policy_recovery_continuation(
+            live,
+            restore_receipt=restore_receipt,
+            branch_id=branch_id,
+        )
+        _require(
+            policy_continuation["rank_receipts"][0]["optimizer_step_before"]
+            == saved_policy_step
+            and policy_continuation["rank_receipts"][0]["optimizer_step_after"]
+            == saved_policy_step + 1,
+            "distributed W Policy continuation optimizer step differs from V",
+        )
+        harness_continuation = _execute_distributed_harness_continuation(
+            policy=branch_harness_policy,
+            optimizer=branch_harness_optimizer,
+            saved_optimizer_step=saved_harness_step,
+            run_harness_optimizer_step=run_harness_optimizer_step,
+        )
+        return _distributed_continuation_branch_record(
+            checkpoint=checkpoint,
+            branch_id=branch_id,
+            restore_receipt=restore_receipt,
+            policy_continuation=policy_continuation,
+            harness_continuation=harness_continuation,
+        )
+
+    uninterrupted = _branch(
+        "uninterrupted",
+        harness_policy,
+        harness_optimizer,
+    )
+    recovered_policy, recovered_optimizer = _load_distributed_harness_candidate(
+        checkpoint
+    )
+    recovered = _branch(
+        "recovered",
+        recovered_policy,
+        recovered_optimizer,
+    )
+    _require(
+        uninterrupted["continuation_digest"] == recovered["continuation_digest"]
+        and uninterrupted["policy_continuation_receipt"][
+            "continuation_state_sha256"
+        ]
+        == recovered["policy_continuation_receipt"][
+            "continuation_state_sha256"
+        ]
+        and _canonical_json(uninterrupted["harness_continuation"])
+        == _canonical_json(recovered["harness_continuation"]),
+        "distributed recovered continuation differs from uninterrupted execution",
+    )
+    final_restore = controller.restore_m0_policy_candidate_for_w(
+        live,
+        branch_id="final-restore",
+    )
+    final_policy, final_optimizer = _load_distributed_harness_candidate(checkpoint)
+    _require(
+        final_restore["rank_receipts"][0]["optimizer_step"] == saved_policy_step
+        and _harness_optimizer_step(final_policy, final_optimizer)
+        == saved_harness_step,
+        "distributed W final restore differs from V candidate",
+    )
+    record: dict[str, object] = {
+        "schema_version": DISTRIBUTED_RECOVERY_EVIDENCE_SCHEMA_VERSION,
+        "checkpoint_manifest_sha256": checkpoint.record_sha256,
+        "policy_candidate_sha256": candidate_audit.record_sha256,
+        "controller_class": JPH_AREAL_DISTRIBUTED_CONTROLLER_CLASS,
+        "worker_actor_class": JPH_AREAL_DISTRIBUTED_ACTOR_CLASS,
+        "harness_policy_class": (
+            "jphrl.harness.torch_learning.TorchHarnessPolicy"
+        ),
+        "harness_optimizer_class": "torch.optim.adam.Adam",
+        "uninterrupted": uninterrupted,
+        "recovered": recovered,
+        "final_restore_receipt": final_restore,
+        "continuation_digest": uninterrupted["continuation_digest"],
+        "evidence_scope": {
+            "four_rank_live_candidate_attested": True,
+            "four_rank_collective_restore_observed": True,
+            "candidate_dcp_optimizer_loaded": True,
+            "all_rank_scheduler_rng_restored": True,
+            "real_harness_optimizer_rng_restored": True,
+            "uninterrupted_recovered_digest_equal": True,
+            "persisted_record_regrants_live_exact": False,
+            "exact_joint_recovery": True,
+        },
+    }
+    record["record_sha256"] = _record_sha256(record)
+    validate_exact_distributed_joint_recovery_evidence(
+        record,
+        manifest=manifest_path,
+        current_topology=current_topology,
+    )
+    return LiveExactDistributedJointRecovery._create(
+        record=record,
+        checkpoint=checkpoint,
+        live_policy_candidate=live,
+        final_harness_policy=final_policy,
+        final_harness_optimizer=final_optimizer,
+        token=_LIVE_EXACT_RECOVERY_TOKEN,
+    )
+
+
+def _validate_distributed_harness_continuation(
+    value: object,
+    *,
+    saved_optimizer_step: int,
+) -> Mapping[str, object]:
+    record = _exact(
+        value,
+        {
+            "parameter_digest_before",
+            "parameter_digest_after",
+            "optimizer_state_sha256",
+            "generator_state_before_sha256",
+            "generator_state_after_sha256",
+            "optimizer_step_before",
+            "optimizer_step_after",
+            "sample_count",
+            "training",
+        },
+        "distributed Harness continuation",
+    )
+    _require(
+        all(
+            _is_sha256(record.get(field))
+            for field in (
+                "parameter_digest_before",
+                "parameter_digest_after",
+                "optimizer_state_sha256",
+                "generator_state_before_sha256",
+                "generator_state_after_sha256",
+            )
+        )
+        and record["parameter_digest_before"]
+        != record["parameter_digest_after"]
+        and record.get("optimizer_step_before") == saved_optimizer_step
+        and record.get("optimizer_step_after") == saved_optimizer_step + 1
+        and type(record.get("sample_count")) is int
+        and record["sample_count"] >= 0
+        and type(record.get("training")) is bool,
+        "distributed Harness continuation state is invalid",
+    )
+    return record
+
+
+def validate_exact_distributed_joint_recovery_evidence(
+    record: Mapping[str, object],
+    *,
+    manifest: str | Path,
+    current_topology: RuntimeTopology | None = None,
+) -> dict[str, object]:
+    """Validate persisted four-rank W integrity without granting live authority."""
+
+    _require(
+        set(record)
+        == {
+            "schema_version",
+            "checkpoint_manifest_sha256",
+            "policy_candidate_sha256",
+            "controller_class",
+            "worker_actor_class",
+            "harness_policy_class",
+            "harness_optimizer_class",
+            "uninterrupted",
+            "recovered",
+            "final_restore_receipt",
+            "continuation_digest",
+            "evidence_scope",
+            "record_sha256",
+        }
+        and record.get("schema_version")
+        == DISTRIBUTED_RECOVERY_EVIDENCE_SCHEMA_VERSION
+        and record.get("record_sha256") == _record_sha256(record),
+        "distributed exact recovery evidence schema or digest differs",
+    )
+    checkpoint = validate_production_joint_checkpoint(
+        manifest,
+        current_topology=current_topology,
+        require_component_files=True,
+    )
+    _require(
+        checkpoint.real_areal_checkpoint
+        and checkpoint.real_harness_checkpoint
+        and checkpoint.topology.world_size == 4
+        and checkpoint.policy_rank_state_count == 4
+        and record.get("checkpoint_manifest_sha256") == checkpoint.record_sha256,
+        "distributed exact evidence requires the real four-rank checkpoint",
+    )
+    manifest_record = _read_json(Path(checkpoint.manifest_path))
+    policy_receipt = manifest_record["joint_candidate_bundle"]["receipts"][
+        "policy"
+    ]
+    _require(
+        record.get("policy_candidate_sha256")
+        == policy_receipt["record_sha256"]
+        and record.get("controller_class")
+        == (
+            "jphrl.training.areal_distributed_policy.JPHPPOActorController"
+        )
+        and record.get("worker_actor_class")
+        == "jphrl.training.areal_distributed_policy.JPHFSDPPPOActor"
+        and record.get("harness_policy_class")
+        == "jphrl.harness.torch_learning.TorchHarnessPolicy"
+        and record.get("harness_optimizer_class") == "torch.optim.adam.Adam",
+        "distributed exact recovery component identity differs",
+    )
+    saved_policy_step, saved_harness_step = _saved_optimizer_steps(checkpoint)
+    candidate_dcp_manifest_sha256 = policy_receipt["checkpoints"][
+        "candidate_manifest"
+    ]["manifest_sha256"]
+
+    def _restore_receipt(
+        value: object,
+        branch_id: str,
+    ) -> Mapping[str, object]:
+        restore = _exact(
+            value,
+            {
+                "schema_version",
+                "branch_id",
+                "transaction_id",
+                "policy_candidate_sha256",
+                "restore_state_sha256",
+                "rank_receipts",
+                "evidence_scope",
+                "record_sha256",
+            },
+            f"distributed {branch_id} Policy state receipt",
+        )
+        load_observed = branch_id != "uninterrupted"
+        expected_rank_scope = {
+            "live_candidate_state_attested": not load_observed,
+            "candidate_dcp_loaded": load_observed,
+            "optimizer_state_loaded": load_observed,
+            "lr_scheduler_state_loaded": load_observed,
+            "rank_rng_state_loaded": load_observed,
+            "rank_scheduler_rng_state_attested": True,
+            "continuation_executed": False,
+            "exact_joint_recovery": False,
+        }
+        expected_aggregate_scope = {
+            "all_four_actor_ranks_participated": True,
+            **expected_rank_scope,
+        }
+        ranks = restore.get("rank_receipts")
+        _require(
+            restore.get("schema_version")
+            == "jph.m0-distributed-policy-restore.v1"
+            and restore.get("branch_id") == branch_id
+            and restore.get("transaction_id") == checkpoint.macro_step_id
+            and restore.get("policy_candidate_sha256")
+            == record.get("policy_candidate_sha256")
+            and _is_sha256(restore.get("restore_state_sha256"))
+            and restore.get("evidence_scope") == expected_aggregate_scope
+            and restore.get("record_sha256") == _record_sha256(restore)
+            and isinstance(ranks, list)
+            and len(ranks) == 4,
+            f"distributed {branch_id} Policy state receipt is invalid",
+        )
+        for rank, item in enumerate(ranks):
+            rank_record = _exact(
+                item,
+                {
+                    "schema_version",
+                    "branch_id",
+                    "transaction_id",
+                    "policy_candidate_sha256",
+                    "worker_rank",
+                    "world_size",
+                    "engine_name",
+                    "physical_gpu_id",
+                    "candidate_dcp_manifest_sha256",
+                    "optimizer_step",
+                    "lr_scheduler_state_sha256",
+                    "runtime_rng_state_sha256",
+                    "actor_public_version",
+                    "evidence_scope",
+                    "record_sha256",
+                },
+                f"distributed {branch_id} Policy rank {rank} state receipt",
+            )
+            _require(
+                rank_record.get("schema_version")
+                == "jph.m0-distributed-policy-restore-rank.v1"
+                and rank_record.get("branch_id") == branch_id
+                and rank_record.get("transaction_id") == checkpoint.macro_step_id
+                and rank_record.get("policy_candidate_sha256")
+                == record.get("policy_candidate_sha256")
+                and rank_record.get("worker_rank") == rank
+                and rank_record.get("world_size") == 4
+                and rank_record.get("engine_name") == f"actor/{rank}"
+                and rank_record.get("candidate_dcp_manifest_sha256")
+                == candidate_dcp_manifest_sha256
+                and rank_record.get("optimizer_step") == saved_policy_step
+                and _is_sha256(rank_record.get("lr_scheduler_state_sha256"))
+                and _is_sha256(rank_record.get("runtime_rng_state_sha256"))
+                and rank_record.get("evidence_scope") == expected_rank_scope
+                and rank_record.get("record_sha256")
+                == _record_sha256(rank_record),
+                f"distributed {branch_id} Policy rank {rank} state differs",
+            )
+        normalized = [
+            {
+                key: deepcopy(value)
+                for key, value in rank_record.items()
+                if key not in {"schema_version", "branch_id", "record_sha256"}
+            }
+            for rank_record in ranks
+        ]
+        _require(
+            restore.get("restore_state_sha256") == _sha256(normalized),
+            f"distributed {branch_id} Policy state digest differs",
+        )
+        return restore
+
+    def _branch(value: object, branch_id: str) -> Mapping[str, object]:
+        branch = _exact(
+            value,
+            {
+                "branch_id",
+                "policy_restore_receipt",
+                "policy_continuation_receipt",
+                "harness_continuation",
+                "rollout_cursor",
+                "dataloader_cursor",
+                "continuation_digest",
+            },
+            f"distributed {branch_id} branch",
+        )
+        restore = _restore_receipt(
+            branch["policy_restore_receipt"],
+            branch_id,
+        )
+        continuation = branch["policy_continuation_receipt"]
+        continuation_rank_scope = {
+            "bound_pre_batch_sources_reused": True,
+            "diagnostic_policy_optimizer_step_observed": True,
+            "continuation_dcp_with_optimizer_observed": True,
+            "exact_joint_recovery": False,
+        }
+        continuation_scope = {
+            "all_four_actor_ranks_continued": True,
+            **continuation_rank_scope,
+        }
+        _require(
+            branch.get("branch_id") == branch_id
+            and isinstance(continuation, Mapping)
+            and continuation.get("schema_version")
+            == "jph.m0-distributed-policy-continuation.v1"
+            and continuation.get("branch_id") == branch_id
+            and continuation.get("transaction_id") == checkpoint.macro_step_id
+            and continuation.get("policy_candidate_sha256")
+            == record.get("policy_candidate_sha256")
+            and continuation.get("restore_receipt_sha256")
+            == restore.get("record_sha256")
+            and continuation.get("evidence_scope") == continuation_scope
+            and continuation.get("record_sha256")
+            == _record_sha256(continuation)
+            and isinstance(continuation.get("rank_receipts"), list)
+            and len(continuation["rank_receipts"]) == 4
+            and _is_sha256(continuation.get("continuation_state_sha256"))
+            and all(
+                isinstance(item, Mapping)
+                and item.get("schema_version")
+                == "jph.m0-distributed-policy-continuation-rank.v1"
+                and item.get("branch_id") == branch_id
+                and item.get("transaction_id") == checkpoint.macro_step_id
+                and item.get("policy_candidate_sha256")
+                == record.get("policy_candidate_sha256")
+                and item.get("restore_receipt_sha256")
+                == restore.get("record_sha256")
+                and item.get("worker_rank") == rank
+                and item.get("world_size") == 4
+                and item.get("engine_name") == f"actor/{rank}"
+                and item.get("candidate_dcp_manifest_sha256")
+                == candidate_dcp_manifest_sha256
+                and item.get("record_sha256") == _record_sha256(item)
+                and item.get("optimizer_step_before") == saved_policy_step
+                and item.get("optimizer_step_after") == saved_policy_step + 1
+                and item.get("evidence_scope") == continuation_rank_scope
+                for rank, item in enumerate(continuation["rank_receipts"])
+            ),
+            f"distributed {branch_id} Policy branch is invalid",
+        )
+        normalized_continuation = [
+            {
+                key: deepcopy(item_value)
+                for key, item_value in item.items()
+                if key
+                not in {
+                    "schema_version",
+                    "branch_id",
+                    "restore_receipt_sha256",
+                    "record_sha256",
+                }
+            }
+            for item in continuation["rank_receipts"]
+        ]
+        _require(
+            continuation.get("continuation_state_sha256")
+            == _sha256(normalized_continuation),
+            f"distributed {branch_id} Policy continuation digest differs",
+        )
+        harness = _validate_distributed_harness_continuation(
+            branch["harness_continuation"],
+            saved_optimizer_step=saved_harness_step,
+        )
+        rollout = _validate_cursor_advance(
+            branch["rollout_cursor"],
+            cursor=checkpoint.rollout_cursor_state,
+            label=f"distributed {branch_id} rollout cursor",
+        )
+        dataloader = _validate_cursor_advance(
+            branch["dataloader_cursor"],
+            cursor=checkpoint.dataloader_cursor_state,
+            label=f"distributed {branch_id} dataloader cursor",
+        )
+        digest = _sha256(
+            {
+                "policy_continuation_state_sha256": continuation[
+                    "continuation_state_sha256"
+                ],
+                "harness_continuation": harness,
+                "rollout_cursor": rollout,
+                "dataloader_cursor": dataloader,
+            }
+        )
+        _require(
+            branch.get("continuation_digest") == digest,
+            f"distributed {branch_id} continuation digest differs",
+        )
+        return branch
+
+    uninterrupted = _branch(record.get("uninterrupted"), "uninterrupted")
+    recovered = _branch(record.get("recovered"), "recovered")
+    final_restore = _restore_receipt(
+        record.get("final_restore_receipt"),
+        "final-restore",
+    )
+    _require(
+        uninterrupted["continuation_digest"]
+        == recovered["continuation_digest"]
+        == record.get("continuation_digest")
+        and _canonical_json(uninterrupted["harness_continuation"])
+        == _canonical_json(recovered["harness_continuation"])
+        and uninterrupted["policy_continuation_receipt"][
+            "continuation_state_sha256"
+        ]
+        == recovered["policy_continuation_receipt"][
+            "continuation_state_sha256"
+        ]
+        and final_restore.get("branch_id") == "final-restore",
+        "distributed uninterrupted/recovered/final restore evidence differs",
+    )
+    expected_scope = {
+        "four_rank_live_candidate_attested": True,
+        "four_rank_collective_restore_observed": True,
+        "candidate_dcp_optimizer_loaded": True,
+        "all_rank_scheduler_rng_restored": True,
+        "real_harness_optimizer_rng_restored": True,
+        "uninterrupted_recovered_digest_equal": True,
+        "persisted_record_regrants_live_exact": False,
+        "exact_joint_recovery": True,
+    }
+    _require(
+        record.get("evidence_scope") == expected_scope,
+        "distributed exact recovery evidence scope differs",
+    )
+    return {
+        "ok": True,
+        "integrity_valid": True,
+        "checkpoint_manifest_sha256": checkpoint.record_sha256,
+        "persisted_exact_claim": True,
+        "live_exact_joint_recovery": False,
+        "exact_joint_recovery": False,
+        "record_sha256": record["record_sha256"],
+    }
+
+
 def require_live_exact_joint_recovery(
     value: object,
     *,
     manifest: str | Path | None = None,
     current_topology: RuntimeTopology | None = None,
-) -> LiveExactJointRecovery:
+) -> LiveExactJointRecovery | LiveExactDistributedJointRecovery:
     """Require the in-memory capability emitted by the live two-branch run."""
+
+    if type(value) is LiveExactDistributedJointRecovery:
+        _require(
+            getattr(value, "_token", None) is _LIVE_EXACT_RECOVERY_TOKEN,
+            "live exact joint recovery capability is required",
+        )
+        manifest_path = manifest or value._checkpoint.manifest_path
+        audit = validate_exact_distributed_joint_recovery_evidence(
+            value._record,
+            manifest=manifest_path,
+            current_topology=current_topology,
+        )
+        _require(
+            audit["integrity_valid"] is True
+            and audit["exact_joint_recovery"] is False
+            and value._checkpoint.record_sha256
+            == audit["checkpoint_manifest_sha256"],
+            "live distributed exact recovery differs from persisted integrity",
+        )
+        return value
 
     _require(
         type(value) is LiveExactJointRecovery
@@ -2191,7 +3715,12 @@ def require_live_exact_joint_recovery(
 __all__ = [
     "CHECKPOINT_SCHEMA_VERSION",
     "CURSOR_SCHEMA_VERSION",
+    "DISTRIBUTED_RECOVERY_EVIDENCE_SCHEMA_VERSION",
+    "POLICY_RANK_STATE_SCHEMA_VERSION",
+    "LiveExactDistributedJointRecovery",
     "LiveExactJointRecovery",
+    "PolicyRankCheckpointState",
+    "PolicySchedulerCheckpointState",
     "ProductionCheckpointError",
     "RankRuntimeState",
     "RestoredProductionCheckpoint",
@@ -2199,11 +3728,14 @@ __all__ = [
     "RuntimeTopology",
     "ValidatedProductionCheckpoint",
     "capture_rank_runtime_state",
+    "distributed_policy_checkpoint_inputs",
     "dry_load_production_joint_checkpoint",
     "require_live_exact_joint_recovery",
     "restore_production_joint_checkpoint",
     "save_production_joint_checkpoint",
     "validate_exact_joint_recovery_evidence",
+    "validate_exact_distributed_joint_recovery_evidence",
     "validate_production_joint_checkpoint",
     "verify_exact_joint_recovery",
+    "verify_exact_distributed_joint_recovery",
 ]

@@ -34,8 +34,6 @@ EXPECTED_SGLANG_VERSION="0.5.10.post1"
 MODEL_REPORT="${JPH_ROOT}/artifacts/bootstrap/qwen2.5-1.5b-snapshot.json"
 DATASET_REPORT="${JPH_ROOT}/artifacts/bootstrap/gsm8k-snapshot.json"
 CUDA_TOOLKIT_ROOT="${JPH_CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.6}"
-MAX_USED_MEMORY_MIB="${JPH_BRIDGE_MAX_USED_MEMORY_MIB:-10240}"
-MIN_FREE_MEMORY_MIB="${JPH_BRIDGE_MIN_FREE_MEMORY_MIB:-65536}"
 BRIDGE_RUN_KIND="${JPH_BRIDGE_RUN_KIND:-formal-v1}"
 TASK_COUNT="${JPH_AREAL_JOINT_BRIDGE_TASKS:-4}"
 TASK_OFFSET="${JPH_AREAL_JOINT_BRIDGE_TASK_OFFSET:-0}"
@@ -48,8 +46,6 @@ HARNESS_HIDDEN_SIZE="${JPH_HARNESS_HIDDEN_SIZE:-32}"
 RLVR_FROZEN_ESTIMATOR_TEMPLATE_PATH="${JPH_RLVR_FROZEN_ESTIMATOR_TEMPLATE_PATH:-}"
 RLVR_RUNNER_ADMISSION_MODE=""
 SGLANG_MEM_FRACTION_STATIC="0.35"
-MAX_NEW_GPU_MEMORY_MIB=30720
-REQUIRE_EMPTY_COMPUTE_PROCESSES=false
 
 if [[ ! "${TASK_COUNT}" =~ ^[1-8]$ ]]; then
   echo "JPH_AREAL_JOINT_BRIDGE_TASKS must be an integer from 1 through 8" >&2
@@ -128,13 +124,9 @@ case "${BRIDGE_RUN_KIND}" in
     esac
     ARTIFACT_GROUP="m0-torch-joint-rollout"
     RLVR_RUNNER_ADMISSION_MODE="m0-torch-joint-v1"
-    # The first shared-GPU M0 task must keep the SGLang static allocation in
-    # the audited 24--26 GiB envelope on an 80 GiB A100.  Do not inherit the
-    # older 0.35 bridge setting merely because the surrounding launch path is
-    # shared.
+    # Keep the previously reproduced 0.29 SGLang allocation as this run kind's
+    # default.  It is a model/runtime setting, not a project GPU-memory limit.
     SGLANG_MEM_FRACTION_STATIC="0.29"
-    MAX_NEW_GPU_MEMORY_MIB=26624
-    REQUIRE_EMPTY_COMPUTE_PROCESSES=true
     ;;
   logprob-mechanism-screen-v1)
     if [[ "${TASK_COUNT}" != 4 || "${TASK_OFFSET}" != 32 ]]; then
@@ -300,10 +292,6 @@ if [[ ! "${GPU_MEMORY_USED}" =~ ^[0-9]+$ ]] || [[ ! "${GPU_MEMORY_FREE}" =~ ^[0-
   echo "Cannot read GPU ${GPU_ID} memory state" >&2
   exit 3
 fi
-if ((GPU_MEMORY_USED > MAX_USED_MEMORY_MIB || GPU_MEMORY_FREE < MIN_FREE_MEMORY_MIB)); then
-  echo "GPU ${GPU_ID} lacks headroom: used=${GPU_MEMORY_USED}MiB free=${GPU_MEMORY_FREE}MiB" >&2
-  exit 3
-fi
 GPU_MEMORY_USED_AT_LAUNCH="${GPU_MEMORY_USED}"
 GPU_MEMORY_FREE_AT_LAUNCH="${GPU_MEMORY_FREE}"
 GPU_PROCESS_SNAPSHOT="$({
@@ -311,11 +299,6 @@ GPU_PROCESS_SNAPSHOT="$({
     --query-compute-apps=pid,process_name,used_memory \
     --format=csv,noheader,nounits
 } 2>&1)"
-if [[ "${REQUIRE_EMPTY_COMPUTE_PROCESSES}" == true ]] \
-  && [[ -n "${GPU_PROCESS_SNAPSHOT}" ]]; then
-  echo "GPU ${GPU_ID} has an existing compute process; M0 will wait for an idle card" >&2
-  exit 3
-fi
 GPU_UUID="$(
   nvidia-smi -i "${GPU_ID}" --query-gpu=uuid --format=csv,noheader,nounits \
     | tr -d '\r' | head -n 1
@@ -351,8 +334,6 @@ AUDIT_PATH="${RUN_ROOT}/audit.json"
 NAME_RESOLVE_ROOT="${JPH_ROOT}/runtime/name_resolve/joint-bridge-${RUN_ID}"
 LOG_PATH="${RUN_ROOT}/run.log"
 MEMORY_SAMPLES="${RUN_ROOT}/gpu-memory.csv"
-MEMORY_BREACH="${RUN_ROOT}/gpu-memory-breach.txt"
-WATCHDOG_TARGET="${RUN_ROOT}/watchdog-target-pgid.txt"
 RUN_ADMIN_API_KEY="$(
   "${AREAL_VENV}/bin/python" -c \
     'import secrets; print("jph-bridge-" + secrets.token_urlsafe(32))'
@@ -394,7 +375,6 @@ audit_gpu_memory() {
     --output "${RUN_ROOT}/gpu-memory-audit.json" \
     --physical-gpu-id "${GPU_ID}" \
     --baseline-used-mib "${GPU_MEMORY_USED_AT_LAUNCH}" \
-    --max-new-memory-mib "${MAX_NEW_GPU_MEMORY_MIB}" \
     --run-kind "${BRIDGE_RUN_KIND}" \
     --project-commit "${PROJECT_COMMIT}" \
     >> "${LOG_PATH}"
@@ -426,7 +406,6 @@ stop_run_session() {
       kill -KILL ${run_pids} >/dev/null 2>&1 || true
     fi
   fi
-  rm -f "${WATCHDOG_TARGET}"
 }
 redact_and_check_secret() {
   if ! JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
@@ -506,19 +485,9 @@ GPU_PROCESS_SNAPSHOT_AT_LAUNCH="$({
     --query-compute-apps=pid,process_name,used_memory \
     --format=csv,noheader,nounits
 } 2>&1)"
-if [[ "${REQUIRE_EMPTY_COMPUTE_PROCESSES}" == true ]] \
-  && [[ -n "${GPU_PROCESS_SNAPSHOT_AT_LAUNCH}" ]]; then
-  echo "GPU ${GPU_ID} gained a compute process before launch; M0 remains fail closed" >&2
-  exit 3
-fi
 if [[ ! "${GPU_MEMORY_USED_AT_LAUNCH}" =~ ^[0-9]+$ ]] \
   || [[ ! "${GPU_MEMORY_FREE_AT_LAUNCH}" =~ ^[0-9]+$ ]]; then
   echo "Cannot reread GPU ${GPU_ID} memory state immediately before launch" >&2
-  exit 3
-fi
-if ((GPU_MEMORY_USED_AT_LAUNCH > MAX_USED_MEMORY_MIB \
-  || GPU_MEMORY_FREE_AT_LAUNCH < MIN_FREE_MEMORY_MIB)); then
-  echo "GPU ${GPU_ID} headroom changed before launch: used=${GPU_MEMORY_USED_AT_LAUNCH}MiB free=${GPU_MEMORY_FREE_AT_LAUNCH}MiB" >&2
   exit 3
 fi
 echo "gpu_memory_at_launch=used:${GPU_MEMORY_USED_AT_LAUNCH}MiB,free:${GPU_MEMORY_FREE_AT_LAUNCH}MiB" | tee -a "${LOG_PATH}"
@@ -529,7 +498,6 @@ else
   echo "gpu_compute_processes_at_launch=none" | tee -a "${LOG_PATH}"
 fi
 cd "${AREAL_REPO}"
-rm -f "${MEMORY_BREACH}" "${WATCHDOG_TARGET}"
 CUDA_VISIBLE_DEVICES="${GPU_ID}" \
 HF_HUB_OFFLINE=1 \
 HF_DATASETS_OFFLINE=1 \
@@ -592,8 +560,6 @@ JPH_EXPECTED_POLICY_VERSION=0 \
   sglang.max_running_requests=1 \
   > >(tee -a "${LOG_PATH}") 2>&1 &
 RUN_COMMAND_SESSION_ID="$!"
-printf '%s\n' "${RUN_COMMAND_SESSION_ID}" > "${WATCHDOG_TARGET}"
-chmod 600 "${WATCHDOG_TARGET}"
 (
   while true; do
     if IFS=, read -r sampled_used_mib sampled_free_mib < <(
@@ -604,27 +570,6 @@ chmod 600 "${WATCHDOG_TARGET}"
       printf '%s,%s,%s\n' \
         "$(date -u +%s)" "${sampled_used_mib}" "${sampled_free_mib}" \
         >> "${MEMORY_SAMPLES}"
-      if [[ "${sampled_used_mib}" =~ ^[0-9]+$ ]] \
-        && ((sampled_used_mib - GPU_MEMORY_USED_AT_LAUNCH > MAX_NEW_GPU_MEMORY_MIB)); then
-        printf 'used=%s baseline=%s delta=%s limit=%s\n' \
-          "${sampled_used_mib}" \
-          "${GPU_MEMORY_USED_AT_LAUNCH}" \
-          "$((sampled_used_mib - GPU_MEMORY_USED_AT_LAUNCH))" \
-          "${MAX_NEW_GPU_MEMORY_MIB}" > "${MEMORY_BREACH}"
-        chmod 600 "${MEMORY_BREACH}"
-        target_session="$(tr -d ' ' < "${WATCHDOG_TARGET}" 2>/dev/null || true)"
-        if [[ "${target_session}" =~ ^[0-9]+$ ]]; then
-          target_pids="$(
-            ps -eo pid=,sid= \
-              | awk -v sid="${target_session}" '$2 == sid {print $1}' \
-              | tr '\n' ' '
-          )"
-          if [[ -n "${target_pids// /}" ]]; then
-            kill -TERM ${target_pids} >/dev/null 2>&1 || true
-          fi
-        fi
-        exit 4
-      fi
     else
       printf '%s,ERROR,ERROR\n' "$(date -u +%s)" >> "${MEMORY_SAMPLES}"
     fi
@@ -633,14 +578,9 @@ chmod 600 "${WATCHDOG_TARGET}"
 ) &
 GPU_MEMORY_MONITOR_PID="$!"
 if ! wait "${RUN_COMMAND_SESSION_ID}"; then
-  if [[ -f "${MEMORY_BREACH}" ]]; then
-    echo "Bridge run was stopped by the GPU memory watchdog" >&2
-  else
-    echo "AReaL bridge rollout process failed" >&2
-  fi
+  echo "AReaL bridge rollout process failed" >&2
   exit 4
 fi
-rm -f "${WATCHDOG_TARGET}"
 assert_no_run_gpu_processes
 
 if [[ -n "${SECRET_REDACTOR_PID}" ]]; then
@@ -697,16 +637,6 @@ if [[ ! "${GPU_MEMORY_USED_BEFORE_VERIFY}" =~ ^[0-9]+$ ]] \
   echo "Cannot reread GPU ${GPU_ID} immediately before bridge verification" >&2
   exit 3
 fi
-if ((GPU_MEMORY_USED_BEFORE_VERIFY > MAX_USED_MEMORY_MIB \
-  || GPU_MEMORY_FREE_BEFORE_VERIFY < MIN_FREE_MEMORY_MIB)); then
-  echo "GPU ${GPU_ID} lacks headroom before bridge verification: used=${GPU_MEMORY_USED_BEFORE_VERIFY}MiB free=${GPU_MEMORY_FREE_BEFORE_VERIFY}MiB" >&2
-  exit 3
-fi
-if [[ "${REQUIRE_EMPTY_COMPUTE_PROCESSES}" == true ]] \
-  && [[ -n "${GPU_PROCESS_SNAPSHOT_BEFORE_VERIFY}" ]]; then
-  echo "GPU ${GPU_ID} gained a compute process before M0 verification" >&2
-  exit 3
-fi
 echo "gpu_memory_before_verify=used:${GPU_MEMORY_USED_BEFORE_VERIFY}MiB,free:${GPU_MEMORY_FREE_BEFORE_VERIFY}MiB" \
   | tee -a "${LOG_PATH}"
 
@@ -733,17 +663,10 @@ JPH_AREAL_ADMIN_API_KEY="${RUN_ADMIN_API_KEY}" \
   --output "${AUDIT_PATH}" \
   > >(tee -a "${LOG_PATH}") 2>&1 &
 RUN_COMMAND_SESSION_ID="$!"
-printf '%s\n' "${RUN_COMMAND_SESSION_ID}" > "${WATCHDOG_TARGET}"
-chmod 600 "${WATCHDOG_TARGET}"
 if ! wait "${RUN_COMMAND_SESSION_ID}"; then
-  if [[ -f "${MEMORY_BREACH}" ]]; then
-    echo "Bridge verification was stopped by the GPU memory watchdog" >&2
-  else
-    echo "AReaL bridge verification process failed" >&2
-  fi
+  echo "AReaL bridge verification process failed" >&2
   exit 4
 fi
-rm -f "${WATCHDOG_TARGET}"
 assert_no_run_gpu_processes
 
 stop_gpu_monitors
